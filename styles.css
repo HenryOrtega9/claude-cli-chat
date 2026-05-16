@@ -1,0 +1,1561 @@
+/* ============================================================
+   claude-cli-chat plugin styles
+   Class-name conventions match Claudian's (.claudian-*) so the
+   user's existing CSS snippets continue to work alongside this.
+   All colors come from Obsidian CSS vars; brand orange is exposed
+   as --claudian-brand for tweaking.
+   ============================================================ */
+
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .view-content {
+  padding: 0;
+  background: var(--background-secondary);
+  /* Lock the outer pane so scrollIntoView (used by our chat auto-scroll) can't
+     escape past our messages wrapper and shove the header/tab bar out of view. */
+  overflow: hidden;
+}
+
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-container {
+  --claudian-brand: #D97757;
+  --claudian-brand-rgb: 217, 119, 87;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+  font-family: var(--font-text);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+}
+
+/* ---- Header ----------------------------------------------- */
+.claudian-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 8px 12px;
+  /* Anchor the header at the top of the chat view and prevent flex pressure
+     from collapsing it as content grows. Sticky + z-index keeps it visually
+     above any tall content that scrolls inside the messages wrapper. */
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--background-secondary);
+}
+.claudian-title-slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.claudian-logo,
+.claudian-logo img {
+  width: 16px;
+  height: 16px;
+  display: inline-block;
+}
+.claudian-title-text {
+  margin: 0;
+  font-family: var(--font-interface);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-header-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+.claudian-header-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--text-faint);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 120ms ease, background 120ms ease;
+}
+.claudian-header-btn:hover {
+  color: var(--claudian-brand);
+  background: rgba(var(--claudian-brand-rgb), 0.1);
+}
+
+/* ---- Tab bar ---------------------------------------------- */
+.claudian-input-nav-row {
+  padding: 0 12px 6px 12px;
+  /* Pinned directly under the header — same `flex-shrink: 0` + sticky combo
+     so it never slides as content grows. */
+  flex-shrink: 0;
+  position: sticky;
+  top: 36px;
+  z-index: 2;
+  background: var(--background-secondary);
+}
+.claudian-tab-bar-container {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.claudian-tab-badges {
+  display: flex;
+  gap: 4px;
+}
+.claudian-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1.5px solid var(--background-modifier-border);
+  border-radius: 5px;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--font-interface);
+  font-size: 12px;
+  font-weight: 500;
+  user-select: none;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+.claudian-tab-badge:hover {
+  color: var(--text-normal);
+}
+.claudian-tab-badge-active {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+.claudian-tab-badge-streaming {
+  border-color: var(--claudian-brand);
+}
+.claudian-tab-badge-attention {
+  border-color: var(--text-error, #dc3545);
+  animation: claudian-attention-pulse 1.4s ease-in-out infinite;
+}
+.claudian-tab-badge-new {
+  color: var(--text-faint);
+}
+.claudian-tab-badge-new:hover {
+  color: var(--claudian-brand);
+}
+@keyframes claudian-attention-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 53, 69, 0); }
+  50% { box-shadow: 0 0 0 3px rgba(220, 53, 69, 0.18); }
+}
+
+/* ---- Tab content container -------------------------------- */
+.claudian-tab-content-container {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.claudian-tab-content {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Anchor for the absolutely-positioned .claudian-welcome child. */
+  position: relative;
+}
+
+/* ---- Messages --------------------------------------------- */
+.claudian-messages-wrapper {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 14px 12px 14px;
+  display: flex;
+  flex-direction: column;
+}
+.claudian-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* Invisible end-of-list marker used as the scroll-into-view target and as
+   the IntersectionObserver subject for stickiness detection. */
+.claudian-bottom-sentinel {
+  width: 1px;
+  height: 1px;
+  flex: 0 0 1px;
+  pointer-events: none;
+}
+
+/* ---- In-conversation search bar -------------------------- */
+.claudian-search-bar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 -14px 8px -14px;
+  padding: 6px 12px;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-family: var(--font-interface);
+  font-size: 13px;
+}
+.claudian-search-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+  width: 14px;
+  height: 14px;
+}
+.claudian-search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-normal);
+  font: inherit;
+}
+.claudian-search-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  font-size: 11px;
+  padding: 0 4px;
+}
+.claudian-search-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--text-faint);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.claudian-search-btn:hover {
+  color: var(--claudian-brand);
+  background: rgba(var(--claudian-brand-rgb), 0.1);
+}
+mark.claudian-search-mark {
+  background: rgba(var(--claudian-brand-rgb), 0.35);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+mark.claudian-search-mark.is-active {
+  background: var(--claudian-brand);
+  color: white;
+}
+
+/* ---- Environment snippet picker + editor ----------------- */
+.claudian-snippet-pick-primary {
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-snippet-pick-applied-tag {
+  color: var(--claudian-brand);
+  font-weight: 500;
+}
+.claudian-snippet-pick-secondary {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.claudian-snippet-pick-prompt {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-style: italic;
+  margin-top: 2px;
+}
+/* Settings editor block for one snippet. Each Setting row is the row width
+   of the settings tab; the editor box gives them a shared bordered container. */
+.claudian-snippet-editor {
+  margin: 12px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+/* ---- Subagent (Task tool) summary ------------------------ */
+.claudian-subagent-summary {
+  margin: 4px 0 6px 22px;
+  padding: 6px 10px;
+  background: rgba(var(--claudian-brand-rgb), 0.06);
+  border-left: 2px solid var(--claudian-brand);
+  border-radius: 4px;
+}
+.claudian-subagent-description {
+  font-family: var(--font-text);
+  font-size: 13px;
+  color: var(--text-normal);
+}
+
+/* ---- Inline diff rendering ------------------------------- */
+.claudian-diff {
+  margin: 6px 0 6px 22px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+}
+.claudian-diff-file {
+  color: var(--text-muted);
+  font-weight: 500;
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+.claudian-diff-hunk-label {
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 4px 0 2px 0;
+}
+.claudian-diff-block {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  overflow: hidden;
+  max-height: 360px;
+  overflow-y: auto;
+  background: var(--background-primary);
+}
+.claudian-diff-line {
+  display: flex;
+  gap: 6px;
+  padding: 1px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+}
+.claudian-diff-marker {
+  flex-shrink: 0;
+  width: 10px;
+  font-weight: 700;
+  user-select: none;
+}
+.claudian-diff-text {
+  flex: 1;
+  min-width: 0;
+}
+.claudian-diff-del {
+  background: rgba(220, 53, 69, 0.12);
+  color: var(--text-normal);
+}
+.claudian-diff-del .claudian-diff-marker { color: #dc3545; }
+.claudian-diff-add {
+  background: rgba(107, 203, 119, 0.12);
+  color: var(--text-normal);
+}
+.claudian-diff-add .claudian-diff-marker { color: #6bcb77; }
+.claudian-diff-ctx { color: var(--text-muted); }
+.claudian-diff-truncated {
+  padding: 4px 8px;
+  text-align: center;
+  font-style: italic;
+  color: var(--text-faint);
+  background: var(--background-secondary);
+  border-top: 1px solid var(--background-modifier-border);
+}
+/* Tighter margins inside the approval card so the diff doesn't shove the
+   action buttons too far down. */
+.claudian-ask-approval-info .claudian-diff {
+  margin: 6px 0;
+}
+
+/* ---- MCP manager modal ----------------------------------- */
+/* Sized to fit inside the active pane rather than expanding past it.
+   The modal's outer Obsidian frame handles overall positioning; we just
+   constrain our own content. */
+.claudian-mcp-modal {
+  width: min(520px, 88vw);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.claudian-mcp-intro p {
+  margin: 0 0 12px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.claudian-mcp-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 12px 0;
+  flex-wrap: wrap;
+}
+.claudian-mcp-header-row h3 {
+  margin: 0;
+  flex: 1 1 100%;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+/* Compact buttons in the header row so they don't push the title to a new
+   line on narrow panes. */
+.claudian-mcp-header-row button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.claudian-mcp-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-faint);
+  font-style: italic;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 8px;
+}
+.claudian-mcp-server-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Cap the list height so a vault with many MCP servers doesn't push the
+     modal past the viewport. Inner scroll keeps the modal compact. */
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.claudian-mcp-server-row {
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  overflow: hidden;
+}
+.claudian-mcp-server-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.claudian-mcp-server-name {
+  font-weight: 600;
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+  font-size: 13px;
+}
+.claudian-mcp-server-type {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+}
+/* Paths can be very long — let them wrap inside the row, but keep them
+   readable with a slightly smaller monospace size. */
+.claudian-mcp-server-summary {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+.claudian-mcp-server-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.claudian-mcp-server-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.claudian-mcp-edit-modal {
+  width: min(520px, 88vw);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.claudian-mcp-edit-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* ---- Conversation title bar ------------------------------ */
+.claudian-title-bar {
+  flex-shrink: 0;
+  padding: 4px 16px 8px 16px;
+}
+.claudian-title-text {
+  display: inline-block;
+  max-width: 100%;
+  font-family: var(--font-interface);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-normal);
+  cursor: text;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border-radius: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 100ms ease;
+}
+.claudian-title-text:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.08);
+}
+.claudian-title-text.is-placeholder {
+  color: var(--text-faint);
+  font-weight: 500;
+  font-style: italic;
+}
+.claudian-title-input {
+  width: 100%;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font: inherit;
+  font-family: var(--font-interface);
+  font-size: 14px;
+  font-weight: 600;
+  outline: none;
+}
+.claudian-title-input:focus {
+  border-color: var(--claudian-brand);
+}
+
+/* ---- File-pill bar (Active + pinned Obsidian files) ------ */
+/* Row of pills shown above the input box. The currently-active file always
+   appears; previously-pinned files persist as pills until explicitly
+   unpinned. Click a pill to toggle its pinned state — pinned ones light up
+   brand-orange, unpinned stay neutral. */
+.claudian-file-pill-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 18px 6px 18px;
+  flex-shrink: 0;
+}
+.claudian-file-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  max-width: 220px;
+  transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+}
+.claudian-file-pill:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.12);
+  color: var(--text-normal);
+}
+.claudian-file-pill.is-pinned {
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  border-color: rgba(var(--claudian-brand-rgb), 0.45);
+  color: var(--claudian-brand);
+}
+.claudian-file-pill.is-pinned:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.28);
+}
+.claudian-file-pill-icon {
+  display: inline-flex;
+  width: 12px;
+  height: 12px;
+  color: inherit;
+  flex-shrink: 0;
+}
+.claudian-file-pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Per-message action toolbar -------------------------- */
+.claudian-message {
+  position: relative;
+}
+.claudian-message-actions {
+  position: absolute;
+  top: -8px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  padding: 2px 4px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease;
+}
+.claudian-message:hover .claudian-message-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+.claudian-message-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--text-faint);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.claudian-message-action:hover {
+  color: var(--claudian-brand);
+  background: rgba(var(--claudian-brand-rgb), 0.1);
+}
+/* User-message bubbles are right-aligned; keep their toolbar inside the
+   bubble's right edge by flipping the horizontal anchor. */
+.claudian-message-user .claudian-message-actions {
+  right: 8px;
+}
+
+/* ---- Welcome state ---------------------------------------- */
+/* Anchor the wrapper so the welcome can absolute-position inside it. */
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-messages-wrapper {
+  position: relative;
+}
+/* Welcome is positioned absolutely against the stable .claudian-tab-content
+   parent (not the messages-wrapper, whose height shifts when the pinned-file
+   pill row appears/disappears). padding-bottom reserves the input region so
+   the flex centerline lands above the input area, matching the visual center
+   of the messages region. Locked: doesn't move when the pill bar toggles. */
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-welcome {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  padding: 0 0 168px 0;
+  min-height: 0;
+}
+/* Suppress any third-party pseudo-element logos (e.g. the user's
+   claudian-icon.css snippet adds `.claudian-welcome::before` for Claudian,
+   which leaks into our shared class name). The plugin renders its own logo
+   via the .claudian-welcome-logo img element. */
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-welcome::before,
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-welcome::after {
+  content: none !important;
+  display: none !important;
+}
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-welcome-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-welcome-logo img {
+  width: 56px;
+  height: 56px;
+  opacity: 0.9;
+}
+.workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-welcome-greeting {
+  font-family: 'Copernicus', 'Tiempos Headline', 'Tiempos', Georgia, 'Times New Roman', serif;
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  color: var(--text-muted);
+}
+
+/* ---- Message bubbles -------------------------------------- */
+/* Each message lives inside a wrapper so out-of-bubble affordances (the
+   selection flag) can sit above the bubble while preserving the bubble's
+   per-role alignment. The wrapper is the actual flex child of
+   .claudian-messages; alignment lives here, not on the bubble. */
+.claudian-message-wrapper {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+}
+.claudian-message-wrapper-user {
+  align-self: flex-end;
+  align-items: flex-end;
+  max-width: 85%;
+}
+.claudian-message-wrapper-assistant {
+  align-self: stretch;
+  align-items: stretch;
+  width: 100%;
+}
+
+/* Selection-source flag — small pill that sits above a user bubble naming
+   the file + line range the user attached when they sent the message. */
+.claudian-selection-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 10px;
+  margin-bottom: 4px;
+  background: rgba(var(--claudian-brand-rgb), 0.14);
+  border: 1px solid rgba(var(--claudian-brand-rgb), 0.34);
+  border-radius: 999px;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-selection-flag-icon {
+  display: inline-flex;
+  width: 11px;
+  height: 11px;
+  color: var(--claudian-brand);
+  flex-shrink: 0;
+}
+.claudian-selection-flag-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.claudian-message {
+  max-width: 100%;
+  padding: 10px 14px;
+  border-radius: 12px;
+  line-height: 1.5;
+  word-wrap: break-word;
+  user-select: text;
+}
+.claudian-message-user {
+  /* align-self now lives on .claudian-message-wrapper-user; keep this
+     selector for the bubble's visual treatment only. */
+  background: rgba(0, 0, 0, 0.3);
+  border-end-end-radius: 4px;
+}
+.claudian-message-assistant {
+  width: 100%;
+  background: transparent;
+  border-end-start-radius: 4px;
+  padding-left: 0;
+  padding-right: 0;
+}
+.claudian-message-content {
+  font-size: var(--font-text-size, 14px);
+}
+.claudian-message-content p:first-child { margin-top: 0; }
+.claudian-message-content p:last-child { margin-bottom: 0; }
+.claudian-message-content pre {
+  background: var(--background-primary-alt);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+.claudian-message-content code {
+  font-size: 13px;
+}
+
+/* ---- Tool calls ------------------------------------------- */
+.claudian-tool-call {
+  margin: 8px 0;
+}
+.claudian-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.claudian-tool-header:hover .claudian-tool-name {
+  color: var(--claudian-brand);
+}
+.claudian-tool-icon {
+  color: var(--claudian-brand);
+  display: inline-flex;
+}
+.claudian-tool-name {
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-normal);
+  transition: color 100ms ease;
+}
+.claudian-tool-status {
+  margin-left: auto;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.claudian-tool-status.status-pending { color: var(--text-muted); }
+.claudian-tool-status.status-running { color: var(--claudian-brand); }
+.claudian-tool-status.status-completed { color: var(--text-success, #6bcb77); }
+.claudian-tool-status.status-errored,
+.claudian-tool-status.status-denied { color: var(--text-error, #dc3545); }
+.claudian-tool-chevron {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  color: var(--text-faint);
+  transition: transform 150ms ease;
+  transform: rotate(-90deg);
+}
+.claudian-tool-call.is-expanded .claudian-tool-chevron {
+  transform: rotate(0deg);
+}
+.claudian-tool-content {
+  display: none;
+  padding: 4px 0 4px 14px;
+  margin-left: 7px;
+  border-inline-start: 2px solid var(--background-modifier-border);
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+  /* Long Read/Skill outputs can be thousands of lines — cap the height even
+     when expanded so a single tool block doesn't take over the chat. The user
+     can scroll inside the block to see the rest. */
+  max-height: 320px;
+  overflow-y: auto;
+}
+.claudian-tool-call.is-expanded .claudian-tool-content {
+  display: block;
+}
+.claudian-tool-input {
+  white-space: pre-wrap;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.claudian-tool-result-row {
+  white-space: pre-wrap;
+  color: var(--text-normal);
+  margin-top: 4px;
+}
+.claudian-tool-result-error {
+  color: var(--text-error, #dc3545);
+}
+
+/* ---- TodoWrite list rendering ----------------------------- */
+.claudian-todo-list-container {
+  margin: 6px 0 4px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.claudian-todo-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-family: var(--font-text);
+  font-size: 13px;
+  color: var(--text-normal);
+}
+.claudian-todo-status-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+.claudian-todo-item.status-pending      .claudian-todo-status-icon { color: var(--text-faint); }
+.claudian-todo-item.status-in_progress  .claudian-todo-status-icon { color: var(--claudian-brand); animation: claudian-todo-spin 1.2s linear infinite; }
+.claudian-todo-item.status-completed    .claudian-todo-status-icon { color: var(--text-success, #6bcb77); }
+.claudian-todo-item.status-cancelled    .claudian-todo-status-icon { color: var(--text-faint); }
+.claudian-todo-item.status-pending      .claudian-todo-text { color: var(--text-muted); }
+.claudian-todo-item.status-in_progress  .claudian-todo-text { color: var(--text-normal); font-weight: 500; }
+.claudian-todo-item.status-completed    .claudian-todo-text { color: var(--text-muted); text-decoration: line-through; }
+.claudian-todo-item.status-cancelled    .claudian-todo-text { color: var(--text-faint); text-decoration: line-through; }
+@keyframes claudian-todo-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ---- Approval area ---------------------------------------- */
+.claudian-approval-area {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 14px;
+  flex-shrink: 0;
+}
+.claudian-ask-approval-info {
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+  margin-bottom: 6px;
+}
+.claudian-ask-approval-tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.claudian-ask-approval-icon {
+  color: var(--claudian-brand);
+  display: inline-flex;
+}
+.claudian-ask-approval-tool-name {
+  font-family: var(--font-monospace);
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-ask-approval-reason {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.claudian-ask-approval-blocked-path,
+.claudian-ask-approval-desc {
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-normal);
+  background: var(--background-primary-alt);
+  border-radius: 4px;
+  padding: 6px 8px;
+  word-break: break-all;
+  margin-bottom: 6px;
+}
+.claudian-ask-approval-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.claudian-approval-btn {
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--background-modifier-border);
+}
+.claudian-approval-btn-allow {
+  background: var(--claudian-brand);
+  color: white;
+  border-color: var(--claudian-brand);
+}
+.claudian-approval-btn-allow:hover { filter: brightness(1.08); }
+.claudian-approval-btn-deny {
+  background: transparent;
+  color: var(--text-muted);
+}
+.claudian-approval-btn-deny:hover {
+  color: var(--text-error, #dc3545);
+  border-color: var(--text-error, #dc3545);
+}
+
+/* ---- Input box -------------------------------------------- */
+.claudian-input-container {
+  padding: 6px 14px 28px 14px;
+  flex-shrink: 0;
+}
+.claudian-input-wrapper {
+  display: flex;
+  flex-direction: column;
+  min-height: 100px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+  transition: border-color 120ms ease;
+}
+.claudian-input-wrapper:focus-within {
+  border-color: rgba(var(--claudian-brand-rgb), 0.55);
+}
+.claudian-context-row {
+  display: none;
+}
+.claudian-context-row.has-content {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px 0 10px;
+}
+.claudian-context-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary-alt);
+  font-size: 12px;
+  color: var(--text-muted);
+  user-select: none;
+}
+.claudian-context-chip-icon {
+  display: inline-flex;
+  color: var(--claudian-brand);
+}
+.claudian-context-chip-icon svg {
+  width: 12px;
+  height: 12px;
+}
+.claudian-context-chip-label {
+  font-family: var(--font-monospace);
+}
+/* Selection chip: brand-tinted background so it stands out from image
+   attachment chips and reads as "from your editor". */
+.claudian-context-chip-selection {
+  background: rgba(var(--claudian-brand-rgb), 0.12);
+  border-color: rgba(var(--claudian-brand-rgb), 0.4);
+  color: var(--text-normal);
+}
+.claudian-context-chip-selection .claudian-context-chip-label {
+  font-family: var(--font-interface);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-context-chip-remove {
+  display: inline-flex;
+  cursor: pointer;
+  color: var(--text-faint);
+  padding-left: 2px;
+}
+.claudian-context-chip-remove:hover {
+  color: var(--text-error, #dc3545);
+}
+.claudian-context-chip-remove svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ---- Message attachments (image thumbnails inline in bubbles) ----------- */
+.claudian-message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.claudian-message-attachment {
+  max-width: 240px;
+  max-height: 180px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  object-fit: cover;
+}
+
+/* ---- Remote Control pairing card ---------------------------------------- */
+.claudian-remote-card {
+  margin: 8px 14px 14px 14px;
+  padding: 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+}
+.claudian-remote-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.claudian-remote-icon {
+  color: var(--claudian-brand);
+  display: inline-flex;
+}
+.claudian-remote-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.claudian-remote-title {
+  font-weight: 600;
+  color: var(--text-normal);
+  font-size: 14px;
+}
+.claudian-remote-status {
+  margin-left: auto;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--background-secondary);
+}
+.claudian-remote-status.status-starting,
+.claudian-remote-status.status-waiting {
+  color: var(--claudian-brand);
+}
+.claudian-remote-status.status-ready {
+  color: var(--text-success, #6bcb77);
+}
+.claudian-remote-status.status-exited,
+.claudian-remote-status.status-error {
+  color: var(--text-error, #dc3545);
+}
+.claudian-remote-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.claudian-remote-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.claudian-remote-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--background-secondary);
+  border-radius: 6px;
+}
+.claudian-remote-url {
+  flex: 1;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--claudian-brand);
+  word-break: break-all;
+  text-decoration: none;
+}
+.claudian-remote-url:hover {
+  text-decoration: underline;
+}
+.claudian-remote-copy {
+  display: inline-flex;
+  cursor: pointer;
+  color: var(--text-faint);
+}
+.claudian-remote-copy:hover {
+  color: var(--claudian-brand);
+}
+.claudian-remote-copy svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-remote-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.claudian-remote-disconnect {
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--background-modifier-border);
+  background: transparent;
+  color: var(--text-muted);
+}
+.claudian-remote-disconnect:hover {
+  color: var(--text-error, #dc3545);
+  border-color: var(--text-error, #dc3545);
+}
+
+/* ---- History modal -------------------------------------------------------- */
+.claudian-history-modal {
+  --claudian-brand: #D97757;
+  --claudian-brand-rgb: 217, 119, 87;
+}
+.claudian-history-modal .claudian-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.claudian-history-empty {
+  padding: 16px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.claudian-history-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.claudian-history-row:hover {
+  border-color: var(--claudian-brand);
+  background: rgba(var(--claudian-brand-rgb), 0.05);
+}
+.claudian-history-main {
+  flex: 1;
+  min-width: 0;
+}
+.claudian-history-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-normal);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.claudian-history-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.claudian-history-action {
+  display: inline-flex;
+  color: var(--text-faint);
+}
+.claudian-history-row:hover .claudian-history-action {
+  color: var(--claudian-brand);
+}
+.claudian-input {
+  width: 100%;
+  flex: 1 1 0;
+  min-height: 56px;
+  padding: 10px 12px;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--text-normal);
+  font: inherit;
+  font-size: var(--font-text-size, 14px);
+  line-height: 1.5;
+  /* Match the wrapper's top corners so any hover/focus background painted
+     by Obsidian's default form styles doesn't square-clip past the wrapper. */
+  border-radius: 12px 12px 0 0;
+  box-shadow: none;
+}
+.claudian-input:hover,
+.claudian-input:focus,
+.claudian-input:active {
+  background: transparent;
+  box-shadow: none;
+}
+.claudian-input::placeholder {
+  color: var(--text-faint);
+}
+.claudian-input-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 8px 8px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.claudian-input-toolbar-spacer { flex: 1; }
+
+/* ---- Toolbar pills (model / effort) ----------------------- */
+.claudian-input-wrapper { position: relative; }
+.claudian-toolbar-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-family: var(--font-interface);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease;
+}
+.claudian-toolbar-pill:hover { background: rgba(var(--claudian-brand-rgb), 0.1); }
+.claudian-toolbar-pill-label {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.claudian-toolbar-pill-value {
+  color: var(--claudian-brand);
+  font-weight: 600;
+}
+
+/* ---- Popups (model + effort) ------------------------------ */
+.claudian-popup {
+  position: absolute;
+  z-index: 50;
+  min-width: 140px;
+  padding: 6px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-family: var(--font-interface);
+  font-size: 13px;
+}
+.claudian-popup-header {
+  padding: 4px 8px 6px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.claudian-popup-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--text-normal);
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+.claudian-popup-row:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.12);
+}
+.claudian-popup-row.is-selected {
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+  font-weight: 600;
+}
+.claudian-popup-row-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+}
+.claudian-popup-row-icon img {
+  width: 14px;
+  height: 14px;
+}
+.claudian-popup-effort .claudian-popup-row {
+  justify-content: flex-start;
+}
+
+/* Mode popup uses stacked rows: label on top, description in muted text below. */
+.claudian-popup-row-stacked {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+.claudian-popup-row-sublabel {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.claudian-popup-row.is-selected .claudian-popup-row-sublabel {
+  color: var(--text-muted);
+}
+
+/* Mode pill warning tones. The pill stays orange in Normal + Accept Edits;
+   Plan goes blue (purposeful), Auto goes amber, Bypass goes red (dangerous). */
+.claudian-mode-pill.mode-plan .claudian-toolbar-pill-value { color: #5b8def; }
+.claudian-mode-pill.mode-auto .claudian-toolbar-pill-value { color: #e0a83a; }
+.claudian-mode-pill.mode-bypass .claudian-toolbar-pill-value { color: #dc3545; }
+
+/* ---- Context window indicators --------------------------- */
+/* Hover-revealed "Nk / Mk" tooltip on the donut pill. Sits inside
+   .claudian-input-wrapper (position: relative). pointer-events: none ensures
+   the tooltip can't intercept the cursor while it's transitioning over the
+   pill, which would cause hover flicker. */
+.claudian-context-window-chip {
+  position: absolute;
+  bottom: 48px;
+  right: 12px;
+  z-index: 5;
+  padding: 3px 10px;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  white-space: nowrap;
+}
+/* Donut + percentage pill inside the toolbar. */
+.claudian-usage-pill {
+  cursor: default;
+  color: var(--claudian-brand);
+}
+.claudian-usage-pill:hover { background: transparent; }
+.claudian-usage-donut {
+  display: inline-block;
+  vertical-align: middle;
+}
+.claudian-usage-percent {
+  font-variant-numeric: tabular-nums;
+}
+.claudian-usage-pill.warn { color: #e0a83a; }
+.claudian-usage-pill.danger { color: #dc3545; }
+
+/* ---- @ / slash suggestion popup -------------------------- */
+/* Floats ABOVE the entire input-wrapper so it never overlaps the textarea.
+   `bottom: 100%` anchors the popup's bottom edge at the wrapper's top, and
+   it grows upward from there into the messages area. Keyboard-driven (arrows
+   + Enter), with mouse fallback. */
+.claudian-suggestion-popup {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  margin-bottom: 6px;
+  z-index: 5;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  font-family: var(--font-interface);
+  font-size: 13px;
+}
+.claudian-suggestion-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-normal);
+}
+.claudian-suggestion-row:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.12);
+}
+.claudian-suggestion-row.is-active {
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+}
+.claudian-suggestion-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.claudian-suggestion-row.is-active .claudian-suggestion-icon {
+  color: var(--claudian-brand);
+}
+.claudian-suggestion-labels {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.claudian-suggestion-primary {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-suggestion-secondary {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-suggestion-row.is-active .claudian-suggestion-secondary {
+  color: var(--text-muted);
+}
+.claudian-suggestion-slash .claudian-suggestion-primary {
+  font-family: var(--font-monospace);
+}
+.claudian-send-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  color: white;
+  background: var(--claudian-brand);
+  cursor: pointer;
+  transition: filter 120ms ease, opacity 120ms ease;
+}
+.claudian-send-button:hover { filter: brightness(1.1); }
+.claudian-send-button.is-disabled { opacity: 0.45; cursor: default; }
+
+/* ---- Assistant "Thought for Ns" subline ------------------- */
+.claudian-thought-duration {
+  margin-top: 4px;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  color: var(--text-faint);
+  font-style: italic;
+  letter-spacing: 0.01em;
+}
+
+/* ---- Thinking block (collapsible) ------------------------- */
+.claudian-thinking-block {
+  margin: 6px 0 10px 0;
+  border-left: 2px solid var(--background-modifier-border);
+  padding-left: 10px;
+}
+.claudian-thinking-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-family: var(--font-interface);
+  font-size: 12px;
+  user-select: none;
+  padding: 2px 0;
+}
+.claudian-thinking-header:hover { color: var(--text-normal); }
+.claudian-thinking-chevron {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  transition: transform 150ms ease;
+  transform: rotate(-90deg);
+}
+.claudian-thinking-block.is-open .claudian-thinking-chevron {
+  transform: rotate(0deg);
+}
+.claudian-thinking-label {
+  font-weight: 500;
+}
+.claudian-thinking-pulse {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--claudian-brand);
+  animation: claudian-status-pulse 1.2s ease-in-out infinite;
+}
+.claudian-thinking-body {
+  display: none;
+  margin-top: 6px;
+  padding: 6px 8px 6px 0;
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+  line-height: 1.5;
+  /* Cap the expanded thinking trace so a long reasoning chain doesn't push
+     the chat UI down. Same pattern as the inline diff renderer. */
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.claudian-thinking-block.is-open .claudian-thinking-body {
+  display: block;
+}
+
+/* ---- Status indicator ------------------------------------- */
+.claudian-status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 18px 6px 18px;
+  padding: 4px 10px;
+  width: fit-content;
+  font-size: 12px;
+  font-family: var(--font-interface);
+  color: var(--text-muted);
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  opacity: 0.85;
+}
+.claudian-status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--claudian-brand);
+  animation: claudian-status-pulse 1.2s ease-in-out infinite;
+}
+.claudian-status-indicator.is-retrying .claudian-status-dot {
+  background: #e0a83a;
+}
+.claudian-status-label {
+  font-weight: 500;
+  color: var(--text-normal);
+}
+.claudian-status-detail {
+  color: var(--text-faint);
+}
+@keyframes claudian-status-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+}
