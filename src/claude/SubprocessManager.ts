@@ -1,8 +1,27 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, execSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StreamJsonParser } from "./StreamJsonParser";
 import { InputWriter } from "./InputWriter";
 import type { StreamEvent, ControlRequestEvent, ContentBlock } from "./Events";
+import { RemoteControlSession } from "./RemoteControlSession";
 import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from "../settings";
+
+/* Returns PIDs of every running process whose command line matches
+   `claude --remote-control`. Used by the settings UI to count live remote
+   sessions and by killAllRemoteAndOrphans() to sweep up anything the
+   in-process registry doesn't know about (e.g. survivors of a prior plugin
+   instance that exited before this cleanup logic landed). */
+export function findRemoteControlPids(): number[] {
+  try {
+    const out = execSync('pgrep -f "claude --remote-control"', { encoding: "utf8" }).trim();
+    if (!out) return [];
+    return out
+      .split("\n")
+      .map(s => parseInt(s.trim(), 10))
+      .filter(n => Number.isFinite(n));
+  } catch {
+    return [];
+  }
+}
 
 export type TabMode = "local" | "remote-control";
 
@@ -214,6 +233,7 @@ export class TabSession {
    calls .kill(), and the view subscribes to .onEvent() per tab for rendering. */
 export class SubprocessManager {
   private sessions = new Map<string, TabSession>();
+  private remoteSessions = new Map<string, RemoteControlSession>();
 
   spawn(tabId: string, opts: SpawnOptions): TabSession {
     const existing = this.sessions.get(tabId);
@@ -235,10 +255,55 @@ export class SubprocessManager {
     return Array.from(this.sessions.values());
   }
 
+  /* Track a remote-control session by tab id so it gets reaped on plugin
+     unload (killAll) and counted in the settings panel. The caller still
+     owns the session reference; we just hold a weak handle here for cleanup.
+     If a session was already registered for this tab, dispose the prior one
+     first so re-registration doesn't leak. */
+  registerRemote(tabId: string, session: RemoteControlSession): void {
+    const prior = this.remoteSessions.get(tabId);
+    if (prior && prior !== session) void prior.dispose();
+    this.remoteSessions.set(tabId, session);
+    session.onExit(() => {
+      if (this.remoteSessions.get(tabId) === session) this.remoteSessions.delete(tabId);
+    });
+  }
+
+  unregisterRemote(tabId: string): void {
+    this.remoteSessions.delete(tabId);
+  }
+
+  listRemote(): RemoteControlSession[] {
+    return Array.from(this.remoteSessions.values());
+  }
+
   async killAll(): Promise<void> {
-    const work = Array.from(this.sessions.values()).map(s => s.dispose());
+    const local = Array.from(this.sessions.values()).map(s => s.dispose());
+    const remote = Array.from(this.remoteSessions.values()).map(s => s.dispose());
     this.sessions.clear();
+    this.remoteSessions.clear();
+    await Promise.all([...local, ...remote]);
+  }
+
+  /* Settings-panel-driven nuke. Disposes every tracked remote session,
+     then signals any leftover PIDs the registry doesn't know about
+     (orphans from prior plugin instances, dropped tab refs, etc.).
+     Returns counts so the UI can confirm what happened. */
+  async killAllRemoteAndOrphans(): Promise<{ tracked: number; orphans: number }> {
+    const tracked = this.remoteSessions.size;
+    const work = Array.from(this.remoteSessions.values()).map(s => s.dispose());
+    this.remoteSessions.clear();
     await Promise.all(work);
+    let orphans = 0;
+    for (const pid of findRemoteControlPids()) {
+      try {
+        process.kill(pid, "SIGTERM");
+        orphans++;
+      } catch {
+        /* already gone or permission denied — ignore */
+      }
+    }
+    return { tracked, orphans };
   }
 }
 

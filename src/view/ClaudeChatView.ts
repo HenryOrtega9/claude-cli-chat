@@ -81,7 +81,11 @@ export class ClaudeChatView extends ItemView {
   }
 
   async onClose() {
-    for (const tab of this.tabs) tab.destroy();
+    /* Await every tab's destroy() so any in-flight SIGTERM → process-exit
+       handshake completes before Obsidian moves on. Without the await, the
+       plugin can unload while `claude --remote-control` children are still
+       in the middle of shutting down, leaking them as PPID=1 orphans. */
+    await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs = [];
   }
 

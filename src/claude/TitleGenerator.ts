@@ -18,7 +18,11 @@ import { autodetectClaudePath } from "../settings";
 
 export type TitleGenOptions = {
   userMessage: string;
-  assistantResponse: string;
+  /* Optional. When present, included in the prompt for richer topic signal.
+     When absent (parallel-fire mode — title-gen kicked off at submit, before
+     the assistant has streamed), the prompt asks Haiku to title from the
+     user's question alone. */
+  assistantResponse?: string;
   /* Path to the `claude` binary. Empty falls back to PATH lookup. */
   claudePath?: string;
   /* Model alias (e.g. "haiku" or "claude-haiku-4-5-20251001"). */
@@ -47,23 +51,34 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
   const truncatedUser = opts.userMessage.length > 300
     ? opts.userMessage.slice(0, 300) + "…"
     : opts.userMessage;
-  const truncatedResponse = opts.assistantResponse.length > 400
+  const truncatedResponse = opts.assistantResponse && opts.assistantResponse.length > 400
     ? opts.assistantResponse.slice(0, 400) + "…"
-    : opts.assistantResponse;
+    : opts.assistantResponse ?? "";
 
   /* Strong framing so the model treats the snippet as DATA, not as a real
      conversation directed at it. XML-style tags + a trailing "Title:"
-     priming cue land Haiku reliably on a single short title. */
-  const prompt =
-    "The transcript below is a chat I had with another AI. Output only a 3-6 word title summarizing the topic.\n" +
-    "\n" +
-    "<transcript>\n" +
-    `[my message]\n${truncatedUser}\n` +
-    "\n" +
-    `[the AI's reply]\n${truncatedResponse}\n` +
-    "</transcript>\n" +
-    "\n" +
-    "Title:";
+     priming cue land Haiku reliably on a single short title.
+
+     Two prompt shapes depending on whether we have an assistant response
+     yet. Parallel-fire mode (no response) uses the user-only shape so the
+     title can start generating the moment the user submits. */
+  const prompt = truncatedResponse
+    ? "The transcript below is a chat I had with another AI. Output only a 3-6 word title summarizing the topic.\n" +
+      "\n" +
+      "<transcript>\n" +
+      `[my message]\n${truncatedUser}\n` +
+      "\n" +
+      `[the AI's reply]\n${truncatedResponse}\n` +
+      "</transcript>\n" +
+      "\n" +
+      "Title:"
+    : "The message below is the opening message of a chat I just started with another AI. Output only a 3-6 word title describing the topic the user is asking about.\n" +
+      "\n" +
+      "<message>\n" +
+      `${truncatedUser}\n` +
+      "</message>\n" +
+      "\n" +
+      "Title:";
 
   /* PATH enrichment matches SubprocessManager so the binary resolves from a
      Finder-launched Obsidian even when the shell PATH wasn't inherited. */

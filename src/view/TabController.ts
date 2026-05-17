@@ -137,18 +137,11 @@ export class TabController {
       onDecide: (requestId, decision) => this.handleApproval(requestId, decision),
     });
     this.statusIndicator = new StatusIndicator(this.root);
-    this.activeFileIndicator = new ActiveFileIndicator(
-      this.root,
-      this.app,
-      this.state.pinnedFilePaths ?? [],
-      {
-        onPinChange: paths => {
-          this.state.pinnedFilePaths = paths;
-          this.state.updatedAt = Date.now();
-          this.onStateChangeCb();
-        },
-      }
-    );
+    /* Reparent the pill into the message list so it trails the last assistant
+       block (tool call, text, thinking, etc.) and scrolls with chat content
+       instead of floating above the input box. Renderer keeps it positioned
+       just before the bottom sentinel on every layout pass. */
+    this.renderer.setTailEl(this.statusIndicator.rootEl);
     this.inputBox = new InputBox(
       this.root,
       this.plugin.settings,
@@ -167,6 +160,23 @@ export class TabController {
         permissionMode: (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode,
       }
     );
+    /* Mount the active-file pill bar inside the input wrapper (above the
+       textarea) instead of letting it float above the entire input box.
+       Parent is this.root only to satisfy the constructor; the next line
+       reparents to the wrapper. */
+    this.activeFileIndicator = new ActiveFileIndicator(
+      this.root,
+      this.app,
+      this.state.pinnedFilePaths ?? [],
+      {
+        onPinChange: paths => {
+          this.state.pinnedFilePaths = paths;
+          this.state.updatedAt = Date.now();
+          this.onStateChangeCb();
+        },
+      }
+    );
+    this.inputBox.mountTopBar(this.activeFileIndicator.root);
 
     this.pairingCard = new RemotePairingCard(this.root, {
       onDisconnect: () => void this.switchMode("local"),
@@ -185,15 +195,22 @@ export class TabController {
 
   show() { this.root.style.display = ""; }
   hide() { this.root.style.display = "none"; }
-  destroy() {
-    void this.session?.dispose();
-    void this.remoteSession?.dispose();
+  async destroy(): Promise<void> {
+    /* Unregister BEFORE disposing so the manager's onExit callback doesn't
+       race against our own teardown. The dispose() promises we await below
+       guarantee the SIGTERM has been sent and the process has exited (or
+       been SIGKILLed after the 1.5-2s timeout). */
+    if (this.remoteSession) this.plugin.subprocessManager.unregisterRemote(this.state.id);
+    const work: Promise<void>[] = [];
+    if (this.session) work.push(this.session.dispose());
+    if (this.remoteSession) work.push(this.remoteSession.dispose());
     this.jsonlTailer?.stop();
     this.statusIndicator.destroy();
     this.activeFileIndicator.destroy();
     this.selectionTracker.destroy();
     this.renderer.destroy();
     this.root.remove();
+    await Promise.all(work);
   }
 
   async switchMode(mode: TabMode): Promise<void> {
@@ -209,6 +226,7 @@ export class TabController {
       }
     } else {
       if (this.remoteSession) {
+        this.plugin.subprocessManager.unregisterRemote(this.state.id);
         await this.remoteSession.dispose();
         this.remoteSession = null;
       }
@@ -243,6 +261,10 @@ export class TabController {
       sessionName,
       claudePath: this.plugin.settings.claudePath || undefined,
     });
+    /* Register with the central manager so it gets reaped on plugin
+       unload even if this TabController's destroy() never runs (e.g.
+       Obsidian quits hard, plugin disabled while view is gone). */
+    this.plugin.subprocessManager.registerRemote(this.state.id, this.remoteSession);
 
     this.remoteSession.onStatus(s => {
       this.pairingCard.setStatus(s);
@@ -329,15 +351,27 @@ export class TabController {
         this.clear();
         new Notice("Cleared chat — next message starts a new Claude session.");
         return true;
-      case "/help":
+      case "/help": {
+        const skills = this.state.availableSkills ?? [];
+        const allSlash = this.state.availableSlashCommands ?? [];
+        const builtins = allSlash.filter(s => !skills.includes(s));
+        const skillsLine = skills.length > 0 ? `Skills (${skills.length}): ${skills.join(", ")}` : "Skills: (none discovered yet — send a message to spawn a session)";
+        const builtinsLine = builtins.length > 0 ? `Slash commands: ${builtins.map(s => "/" + s).join(", ")}` : "";
         new Notice(
-          "Plugin slash commands:\n" +
-          "  /clear — reset this tab to a fresh session\n" +
-          "  /help — show this help\n" +
-          "Use the model / effort / mode pills (and Shift+Tab) for runtime switches.",
-          8000
+          [
+            "Plugin commands:",
+            "  /clear — reset this tab to a fresh session",
+            "  /help — show this help",
+            "",
+            skillsLine,
+            builtinsLine,
+            "",
+            "Pick Opus Plan in the model pill for Anthropic's opusplan alias (Opus while in plan mode, Sonnet otherwise). Shift+Tab cycles permission modes.",
+          ].filter(Boolean).join("\n"),
+          12000
         );
         return true;
+      }
       default:
         return false;
     }
@@ -357,6 +391,10 @@ export class TabController {
     this.state.title = "New chat";
     this.state.busy = false;
     this.state.updatedAt = Date.now();
+    /* Drop cached skill / slash lists so the suggestion popup doesn't
+       advertise commands until the new subprocess re-announces them. */
+    this.state.availableSkills = undefined;
+    this.state.availableSlashCommands = undefined;
     this.titleGenerationStarted = false;
     this.refreshTitleBar();
     this.toolToMessage.clear();
@@ -368,6 +406,7 @@ export class TabController {
     this.statusIndicator.hide();
     this.inputBox.setBusy(false);
     this.inputBox.setUsage(undefined);
+    this.inputBox.setActiveSubModel(undefined);
     this.updateWelcomeVisibility();
     this.onStateChangeCb();
   }
@@ -433,14 +472,24 @@ export class TabController {
     });
     this.session = this.plugin.subprocessManager.spawn(this.state.id, opts);
     this.session.onEvent(e => this.onEvent(e));
-    this.session.onExit(code => this.onExit(code));
+    this.session.onExit((code, signal) => this.onExit(code, signal));
     this.session.onError(err => this.onErrorRaw(err));
+    /* Buffer the most recent stderr so we can include it in the error bubble
+       when the subprocess dies mid-stream. The CLI usually logs the actual
+       crash reason there (panic trace, model-route failure, etc.). */
+    this.session.onStderr(chunk => {
+      this.lastStderr = (this.lastStderr + chunk).slice(-2000);
+    });
     return this.session;
   }
+
+  /* Last ~2KB of stderr from the active subprocess. Cleared on each spawn. */
+  private lastStderr = "";
 
   private restartSubprocess() {
     if (this.session) void this.session.dispose();
     this.session = null;
+    this.lastStderr = "";
   }
 
   private handleModelChange(model: ModelKey) {
@@ -563,6 +612,14 @@ export class TabController {
     this.passStartedAt = Date.now();
     this.onStateChangeCb();
 
+    /* Parallel-fire title generation: kick off the Haiku subprocess the
+       moment we have the user's message, so it runs concurrently with the
+       assistant response instead of waiting for it to complete. Title
+       usually arrives during or right at the end of the response, making
+       the lag invisible. Guarded by maybeGenerateTitle so it no-ops on
+       follow-up turns and when the setting is off. */
+    void this.maybeGenerateTitle();
+
     const session = this.ensureSession();
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] submit -> session.status=${session.status}`);
@@ -593,6 +650,13 @@ export class TabController {
         if (sys.subtype === "init") {
           const init = sys as SystemInitEvent;
           if (init.session_id) this.state.sessionId = init.session_id;
+          /* Cache the slash-command and skill lists the CLI just announced.
+             Reset on every spawn — when the user switches model / effort /
+             permission mode the subprocess restarts and a new init arrives
+             with the same data (or different, if a plugin's availability
+             depends on permission mode). */
+          if (init.slash_commands) this.state.availableSlashCommands = init.slash_commands;
+          if (init.skills) this.state.availableSkills = init.skills;
         } else if (sys.subtype === "api_retry") {
           const retry = sys as SystemApiRetryEvent;
           this.statusIndicator.setRetrying(retry.attempt, retry.max_retries, retry.retry_delay_ms);
@@ -699,6 +763,10 @@ export class TabController {
           this.toolToMessage.set(block.id, msg.id);
         }
         this.streamingBlocks.set(inner.index, { kind: "tool", toolId: block.id, partialJson: "" });
+        /* Re-arm the gerund spinner. Tool execution is a silent server-side
+           wait — without this the indicator dies on the first text_delta
+           and never returns, leaving a void below the running tool. */
+        this.statusIndicator.setThinking();
         await this.renderer.upsertMessage(msg);
       } else if (block.type === "thinking") {
         const msg = this.getOrCreateStreamingAssistantMessage();
@@ -769,6 +837,12 @@ export class TabController {
        tool turns. Update after each assistant message so the chip reflects
        the most recent API call's actual context size. */
     if (event.message.usage) this.inputBox.setUsage(event.message.usage);
+
+    /* Surface the actual model the CLI resolved for this turn. Always a
+       no-op when the user-selected model isn't opus-plan; for opus-plan
+       this paints the "via Opus" / "via Sonnet" badge so the mid-turn
+       hand-off is visible. */
+    this.inputBox.setActiveSubModel(event.message.model);
 
     /* Text: replace, since streaming deltas may have only accumulated partial
        text and the assistant event is the authoritative final string. */
@@ -867,10 +941,8 @@ export class TabController {
        the displayed token count. handleAssistant updates the indicator
        per-call from the per-message usage, which is the correct source. */
 
-    /* Fire-and-forget title generation after the very first complete turn.
-       Skipped if the title was already set by the user (or by a previous
-       title-gen pass), or if the setting is off. */
-    void this.maybeGenerateTitle();
+    /* Title generation was already kicked off in submit() — it runs in
+       parallel with the assistant response. Nothing to do here. */
   }
 
   private titleGenerationStarted = false;
@@ -878,9 +950,8 @@ export class TabController {
   private async maybeGenerateTitle() {
     if (this.titleGenerationStarted) return;
     if (!this.plugin.settings.autoGenerateTitles) return;
-    /* Only fire on the very first user+assistant pair. After that the title
-       is either the user's choice or a previous title-gen result — don't
-       overwrite. */
+    /* Only fire on the very first turn. After that the title is either the
+       user's choice or a previous title-gen result — don't overwrite. */
     if (this.state.title !== "New chat" && !this.state.title.startsWith("Fork: New chat")) {
       /* If the title was set to the first-message-prefix fallback during
          submit(), regenerate it once with a proper model summary. */
@@ -889,12 +960,17 @@ export class TabController {
       if (!looksLikeFallback) return;
     }
     const firstUser = this.state.messages.find(m => m.role === "user");
+    if (!firstUser) return;
+    /* Parallel-fire: title-gen kicks off from submit() the moment the user
+       message exists, so the assistant response is still streaming (or hasn't
+       started). Pass whatever assistant content is available — usually
+       nothing yet, occasionally a partial response. The TitleGenerator falls
+       back to a user-only prompt when assistantResponse is empty. */
     const firstAssistant = this.state.messages.find(m => m.role === "assistant" && m.content.trim().length > 0);
-    if (!firstUser || !firstAssistant) return;
     this.titleGenerationStarted = true;
     const generated = await generateTitle({
       userMessage: firstUser.content,
-      assistantResponse: firstAssistant.content,
+      assistantResponse: firstAssistant?.content,
       claudePath: this.plugin.settings.claudePath || undefined,
       model: this.plugin.settings.titleGenerationModel || "haiku",
       cwd: this.plugin.getVaultPath(),
@@ -935,14 +1011,27 @@ export class TabController {
     this.onStateChangeCb();
   }
 
-  private onExit(code: number | null) {
+  private onExit(code: number | null, signal?: NodeJS.Signals | null) {
     if (this.userCancelInitiated) {
       /* Esc-cancel exit. Suppress the crash error and drop a soft italic
          system note so the chat doesn't end on a half-finished bubble. */
       void this.renderCancelNote();
       this.userCancelInitiated = false;
     } else if (this.state.busy) {
-      void this.handleError({ type: "error", subtype: "subprocess_exit", message: `Claude exited (code=${code}) before completing the response.` });
+      /* Compose a diagnostic message. `code=null` with a signal means the
+         OS killed the process (SIGTERM/SIGKILL/SIGPIPE etc.) — much more
+         actionable than a bare exit code. Append the tail of stderr when
+         we captured anything, that's where the CLI logs panic traces and
+         model-route failures. */
+      const sigSuffix = signal ? ` signal=${signal}` : "";
+      const stderrSuffix = this.lastStderr.trim()
+        ? `\n\n**stderr (last lines):**\n\`\`\`\n${this.lastStderr.trim().split("\n").slice(-12).join("\n")}\n\`\`\``
+        : "";
+      void this.handleError({
+        type: "error",
+        subtype: "subprocess_exit",
+        message: `Claude exited (code=${code}${sigSuffix}) before completing the response.${stderrSuffix}`,
+      });
     }
     this.state.busy = false;
     this.inputBox.setBusy(false);
@@ -1032,25 +1121,99 @@ export class TabController {
     }));
   }
 
-  /* Slash-command palette. Stream-json mode does NOT intercept slash
-     commands the way the CLI's interactive REPL does — anything not handled
-     plugin-side gets sent to Claude as plain text. So this list only
-     includes commands the plugin handles directly. UI-equivalent actions
-     (model picker, mode pill, history modal, etc.) are easier to discover
-     via their buttons than via a slash. */
+  /* Slash-command palette. Four sources merged:
+
+     1. Plugin-side commands (/clear, /help) — handled in handlePluginSlashCommand
+        before the message ever reaches the subprocess.
+     2. Disk-discovered skills + slash commands (plugin.skillCatalog) — populated
+        at plugin load by scanning ~/.claude, the vault, and installed plugin
+        dirs. Available immediately, before any subprocess spawn.
+     3. Skills the CLI announced on init — supersedes (2) once the first
+        message has been sent and we know exactly what's loaded.
+     4. CLI slash commands announced on init — built-ins (init, review, …) plus
+        anything (1)–(3) didn't already cover.
+
+     Skills get a sparkles icon, CLI commands a terminal icon. Plugin commands
+     and CLI built-ins de-dup against the dynamic lists by name. */
   private querySlashCommands(query: string): Suggestion[] {
-    const commands: Array<{ cmd: string; desc: string; insert?: string }> = [
-      { cmd: "/clear", desc: "Reset this tab — start a fresh Claude session" },
-      { cmd: "/help",  desc: "Show plugin slash-command help" },
+    type Cmd = { cmd: string; desc: string; insert?: string; icon: string };
+    const pluginCmds: Cmd[] = [
+      { cmd: "/clear", desc: "Reset this tab — start a fresh Claude session", icon: "rotate-ccw" },
+      { cmd: "/help",  desc: "Show plugin slash-command help", icon: "circle-help" },
     ];
+
+    const pluginNameSet = new Set(pluginCmds.map(c => c.cmd.slice(1)));
+    const seen = new Set<string>(pluginNameSet);
+
+    /* CLI init takes priority over disk-discovered list when present —
+       it's the ground truth for what's loaded right now. */
+    const initSkills = this.state.availableSkills;
+    const initSlash  = this.state.availableSlashCommands;
+    const catalog = this.plugin.skillCatalog;
+
+    const skillCmds: Cmd[] = [];
+    if (initSkills && initSkills.length > 0) {
+      for (const name of initSkills) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        const fromCatalog = catalog.skills.find(s => s.name === name);
+        skillCmds.push({
+          cmd: `/${name}`,
+          desc: fromCatalog?.description ?? "Skill — auto-invoked via the Skill tool",
+          icon: "sparkles",
+        });
+      }
+    } else {
+      for (const skill of catalog.skills) {
+        if (seen.has(skill.name)) continue;
+        seen.add(skill.name);
+        skillCmds.push({
+          cmd: `/${skill.name}`,
+          desc: skill.description ?? "Skill — auto-invoked via the Skill tool",
+          icon: "sparkles",
+        });
+      }
+    }
+
+    const builtinCmds: Cmd[] = [];
+    if (initSlash && initSlash.length > 0) {
+      for (const name of initSlash) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        const fromCatalog = catalog.commands.find(c => c.name === name);
+        builtinCmds.push({
+          cmd: `/${name}`,
+          desc: fromCatalog?.description ?? "Claude Code slash command",
+          icon: "terminal",
+        });
+      }
+    } else {
+      for (const cmd of catalog.commands) {
+        if (seen.has(cmd.name)) continue;
+        seen.add(cmd.name);
+        builtinCmds.push({
+          cmd: `/${cmd.name}`,
+          desc: cmd.description ?? "Claude Code slash command",
+          icon: "terminal",
+        });
+      }
+    }
+
+    const commands = [...pluginCmds, ...skillCmds, ...builtinCmds];
     const q = query.toLowerCase();
     return commands
-      .filter(c => c.cmd.slice(1).startsWith(q))
+      .filter(c => c.cmd.slice(1).toLowerCase().includes(q))
+      .sort((a, b) => {
+        const ap = a.cmd.slice(1).toLowerCase().startsWith(q) ? 0 : 1;
+        const bp = b.cmd.slice(1).toLowerCase().startsWith(q) ? 0 : 1;
+        return ap - bp;
+      })
+      .slice(0, 50)
       .map(c => ({
         id: c.cmd,
         primary: c.cmd,
         secondary: c.desc,
-        icon: "terminal",
+        icon: c.icon,
         insert: c.insert ?? c.cmd,
       }));
   }

@@ -50,14 +50,32 @@ export type InputBoxCallbacks = {
   onCancel: () => void;
 };
 
+/* Map a raw Anthropic model id ("claude-opus-4-7", "claude-sonnet-4-6",
+   "claude-haiku-4-5-20251001") to the short family label used in the pill
+   "via" badge. Unknown ids return null so the badge stays hidden rather
+   than printing a useless raw id. */
+function friendlySubModelLabel(modelId: string): "Opus" | "Sonnet" | "Haiku" | null {
+  const id = modelId.toLowerCase();
+  if (id.includes("opus")) return "Opus";
+  if (id.includes("sonnet")) return "Sonnet";
+  if (id.includes("haiku")) return "Haiku";
+  return null;
+}
+
 export class InputBox {
   private root: HTMLElement;
   private wrapper: HTMLElement;
   private contextRow: HTMLElement;
   private textarea: HTMLTextAreaElement;
-  private toolbar: HTMLElement;
+  /* Two-row layout: topToolbar frames the input from above with the
+     mode + model pills (the "what's running" pair); bottomToolbar carries
+     effort + usage + send (the "knobs + action" row). Split makes mode
+     read as the primary risk control rather than buried mid-row. */
+  private topToolbar: HTMLElement;
+  private bottomToolbar: HTMLElement;
   private modelPill: HTMLElement;
   private modelPillLabel: HTMLElement;
+  private modelPillVia: HTMLElement;
   private effortPill: HTMLElement;
   private effortPillValue: HTMLElement;
   private modePill: HTMLElement;
@@ -102,6 +120,11 @@ export class InputBox {
     this.root = container.createDiv({ cls: "claudian-input-container" });
     this.wrapper = this.root.createDiv({ cls: "claudian-input-wrapper" });
 
+    /* Top toolbar — mode pill (left) + model pill (right). Created BEFORE
+       the textarea so DOM order matches visual order. mountTopBar still
+       prepends the active-file indicator above this row. */
+    this.topToolbar = this.wrapper.createDiv({ cls: "claudian-input-toolbar claudian-input-toolbar-top" });
+
     this.contextRow = this.wrapper.createDiv({ cls: "claudian-context-row" });
 
     this.textarea = this.wrapper.createEl("textarea", {
@@ -131,52 +154,65 @@ export class InputBox {
     this.usageChip = this.wrapper.createDiv({ cls: "claudian-context-window-chip" });
     this.usageChip.style.display = "none";
 
-    this.toolbar = this.wrapper.createDiv({ cls: "claudian-input-toolbar" });
+    this.bottomToolbar = this.wrapper.createDiv({ cls: "claudian-input-toolbar claudian-input-toolbar-bottom" });
 
-    /* Model pill — orange brand-colored text, click opens a popup with the
-       Claude logo + model labels matching Claudian's selector. */
-    this.modelPill = this.toolbar.createSpan({
+    /* ---- TOP ROW: mode (left) + model (right) ---------------------- */
+
+    /* Permission-mode pill is loud on purpose — it's the runtime control
+       with the highest blast radius (controls whether tools fire). Sits
+       leftmost so the eye lands on it first. Cycle with Shift+Tab from
+       the textarea or click to open a popup with all options. */
+    this.modePill = this.topToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-mode-pill",
+      attr: { "aria-label": "Permission mode (Shift+Tab to cycle)", title: "Permission mode — Shift+Tab to cycle" },
+    });
+    this.modePillValue = this.modePill.createSpan({ cls: "claudian-toolbar-pill-value" });
+    this.modePill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Mode" });
+    this.modePill.addEventListener("click", e => {
+      e.stopPropagation();
+      this.toggleModePopup();
+    });
+
+    this.topToolbar.createDiv({ cls: "claudian-input-toolbar-spacer" });
+
+    /* Model pill — Claude logo popup on click. Sits at the right edge of
+       the top row. The optional "via" badge to the right surfaces the
+       actual model resolved for the most recent assistant turn — only
+       diverges from the pill label when Opus Plan is selected (Opus in
+       plan mode, Sonnet elsewhere). */
+    this.modelPill = this.topToolbar.createSpan({
       cls: "claudian-toolbar-pill claudian-model-pill",
       attr: { "aria-label": "Choose model", title: "Choose model" },
     });
     this.modelPillLabel = this.modelPill.createSpan({ cls: "claudian-toolbar-pill-value" });
+    this.modelPillVia = this.modelPill.createSpan({ cls: "claudian-model-pill-via" });
+    this.modelPillVia.style.display = "none";
     this.modelPill.addEventListener("click", e => {
       e.stopPropagation();
       this.toggleModelPopup();
     });
 
+    /* ---- BOTTOM ROW: effort + usage + spacer + send ---------------- */
+
     /* Effort pill — "Effort: <Value>" with the label muted and value orange. */
-    this.effortPill = this.toolbar.createSpan({
+    this.effortPill = this.bottomToolbar.createSpan({
       cls: "claudian-toolbar-pill claudian-effort-pill",
       attr: { "aria-label": "Reasoning effort", title: "Reasoning effort" },
     });
-    this.effortPill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Effort:" });
+    this.effortPill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Effort" });
     this.effortPillValue = this.effortPill.createSpan({ cls: "claudian-toolbar-pill-value" });
     this.effortPill.addEventListener("click", e => {
       e.stopPropagation();
       this.toggleEffortPopup();
     });
 
-    /* Permission-mode pill — "Mode: <Value>". Cycle with Shift+Tab from the
-       textarea, or click to open a popup with all options. */
-    this.modePill = this.toolbar.createSpan({
-      cls: "claudian-toolbar-pill claudian-mode-pill",
-      attr: { "aria-label": "Permission mode (Shift+Tab to cycle)", title: "Permission mode — Shift+Tab to cycle" },
-    });
-    this.modePill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Mode:" });
-    this.modePillValue = this.modePill.createSpan({ cls: "claudian-toolbar-pill-value" });
-    this.modePill.addEventListener("click", e => {
-      e.stopPropagation();
-      this.toggleModePopup();
-    });
-
     this.refreshModelPill();
     this.refreshEffortPill();
     this.refreshModePill();
 
-    /* Usage donut + percentage — sits inline in the toolbar. Hidden until
-       the first usage snapshot lands. */
-    this.usagePill = this.toolbar.createSpan({
+    /* Usage donut + percentage — inline in the bottom toolbar. Hidden
+       until the first usage snapshot lands. */
+    this.usagePill = this.bottomToolbar.createSpan({
       cls: "claudian-toolbar-pill claudian-usage-pill",
       attr: { "aria-label": "Context window usage", title: "Context window usage" },
     });
@@ -223,9 +259,9 @@ export class InputBox {
       this.usageChip.style.display = "none";
     });
 
-    this.toolbar.createDiv({ cls: "claudian-input-toolbar-spacer" });
+    this.bottomToolbar.createDiv({ cls: "claudian-input-toolbar-spacer" });
 
-    this.sendBtn = this.toolbar.createSpan({
+    this.sendBtn = this.bottomToolbar.createSpan({
       cls: "claudian-send-button",
       attr: { "aria-label": "Send", title: "Send (Enter)" },
     });
@@ -238,13 +274,59 @@ export class InputBox {
     this.sendBtn.toggleClass("is-disabled", busy);
   }
 
+  /* Mounts an external element (e.g. the active-file pill bar) just
+     above the textarea, inside the framed input box but below the top
+     toolbar. Sits between contextRow and the textarea for two reasons:
+     (1) it visually groups with the input itself ("these are the files
+     the upcoming message will reference") rather than reading as part of
+     the toolbar; (2) keeps the mode/model pills as the very first row,
+     which is what the layout decision optimized for. */
+  mountTopBar(el: HTMLElement) {
+    this.wrapper.insertBefore(el, this.contextRow);
+  }
+
   setVisible(visible: boolean) {
     this.root.style.display = visible ? "" : "none";
   }
 
   setModel(model: ModelKey) {
     this.currentModel = model;
+    /* Switching to a non-opus-plan model clears the "via" badge — the badge
+       only carries meaning when the user-selected model is the opusplan alias. */
+    if (model !== "opus-plan") this.clearActiveSubModel();
     this.refreshModelPill();
+  }
+
+  /* Called with the `model` field from each assistant event. When the user
+     picked Opus Plan, the CLI resolves to Opus (in plan mode) or Sonnet
+     (otherwise) and reports the chosen model on every assistant message —
+     surfacing it here makes the mid-turn swap visible.
+
+     For any other selected model the actual model always equals the selected
+     one, so the badge stays hidden to avoid visual noise. */
+  setActiveSubModel(actualModelId: string | undefined) {
+    if (!actualModelId || this.currentModel !== "opus-plan") {
+      this.clearActiveSubModel();
+      return;
+    }
+    const label = friendlySubModelLabel(actualModelId);
+    if (!label) {
+      this.clearActiveSubModel();
+      return;
+    }
+    this.modelPillVia.setText(`→ ${label}`);
+    this.modelPillVia.style.display = "";
+    /* Tone the badge so the swap is obvious at a glance: Opus = brand orange,
+       Sonnet = muted blue. */
+    this.modelPillVia.removeClass("is-opus");
+    this.modelPillVia.removeClass("is-sonnet");
+    if (label === "Opus") this.modelPillVia.addClass("is-opus");
+    else if (label === "Sonnet") this.modelPillVia.addClass("is-sonnet");
+  }
+
+  private clearActiveSubModel() {
+    this.modelPillVia.setText("");
+    this.modelPillVia.style.display = "none";
   }
 
   setEffort(effort: EffortLevel) {
@@ -447,19 +529,55 @@ export class InputBox {
     return popup;
   }
 
-  /* Position the popup so its left edge aligns with the trigger's left edge
-     and it floats just above the toolbar. */
+  /* Position the popup so it sits just above its trigger, growing upward.
+     The vertical anchor is `wrapperBottom - triggerTop`, which places the
+     popup's bottom edge 4px above the trigger's top:
+       - For TOP-row triggers (mode/model), that puts the popup above the
+         wrapper itself, floating into the chat scroll area.
+       - For BOTTOM-row triggers (effort), it puts the popup just above the
+         effort button, overlapping the textarea — close to the click target
+         like a normal dropdown rather than floating against the chat.
+
+     Horizontal anchor flips based on which half of the wrapper the trigger
+     sits in: triggers in the left half pin the popup's LEFT edge to the
+     trigger's left; triggers in the right half pin the popup's RIGHT edge
+     to the trigger's right. Without this flip the model pill (top-right)
+     extends rightward off-screen. */
   private anchorPopup(popup: HTMLElement, trigger: HTMLElement) {
     const triggerRect = trigger.getBoundingClientRect();
     const wrapperRect = this.wrapper.getBoundingClientRect();
     popup.style.position = "absolute";
-    popup.style.left = `${triggerRect.left - wrapperRect.left}px`;
-    /* Place the popup above the toolbar, growing upward. */
-    const bottomOffset = wrapperRect.bottom - triggerRect.top + 4;
-    popup.style.bottom = `${bottomOffset}px`;
 
+    const wrapperMidX = (wrapperRect.left + wrapperRect.right) / 2;
+    const triggerMidX = (triggerRect.left + triggerRect.right) / 2;
+    if (triggerMidX > wrapperMidX) {
+      popup.style.right = `${wrapperRect.right - triggerRect.right}px`;
+      popup.style.left = "";
+    } else {
+      popup.style.left = `${triggerRect.left - wrapperRect.left}px`;
+      popup.style.right = "";
+    }
+
+    popup.style.bottom = `${wrapperRect.bottom - triggerRect.top + 4}px`;
+    popup.style.top = "";
+
+    /* outsideHandler closes the popup when the user clicks anywhere else
+       on the page — EXCEPT on a toolbar pill, which has its own click
+       handler that runs after this one. Letting the pill click bubble
+       through without closing here keeps the toggle behavior correct:
+         - Click the SAME pill again → its toggle handler sees openPopup
+           still set and closes it (true toggle).
+         - Click a DIFFERENT pill → its toggle handler closes this popup
+           and opens the new one in one frame.
+       Without the skip, the mousedown here would close the popup BEFORE
+       the pill's click handler runs, and the click handler would then
+       see openPopup as null and pop the same popup right back open. */
     const outsideHandler = (e: MouseEvent) => {
-      if (!popup.contains(e.target as Node)) this.closePopup();
+      const target = e.target as Node;
+      if (popup.contains(target)) return;
+      const el = e.target as HTMLElement;
+      if (el && typeof el.closest === "function" && el.closest(".claudian-toolbar-pill")) return;
+      this.closePopup();
     };
     const keyHandler = (e: KeyboardEvent) => {
       if (e.key === "Escape") this.closePopup();
@@ -589,10 +707,12 @@ export class InputBox {
     if (!this.suggestion) return;
     const { el, items, activeIndex } = this.suggestion;
     el.empty();
+    let activeRow: HTMLElement | null = null;
     items.forEach((item, i) => {
       const row = el.createDiv({
         cls: "claudian-suggestion-row" + (i === activeIndex ? " is-active" : ""),
       });
+      if (i === activeIndex) activeRow = row;
       if (item.icon) {
         const iconEl = row.createSpan({ cls: "claudian-suggestion-icon" });
         setIcon(iconEl, item.icon);
@@ -611,6 +731,9 @@ export class InputBox {
         this.acceptSuggestion();
       });
     });
+    /* Keep the active row visible when the user arrow-keys past the fold.
+       `nearest` block avoids jumpiness when the row is already on-screen. */
+    if (activeRow) (activeRow as HTMLElement).scrollIntoView({ block: "nearest" });
   }
 
   private moveSuggestion(delta: number) {
@@ -758,6 +881,24 @@ export class InputBox {
   private autoResize() {
     this.textarea.style.height = "auto";
     const max = Math.floor(window.innerHeight * 0.45);
-    this.textarea.style.height = Math.min(this.textarea.scrollHeight, max) + "px";
+    /* Add a 4px buffer so the last wrapped line's descenders (j, g, y, p)
+       have room to clear the textarea's bottom padding. Browsers' textarea
+       scrollHeight is computed against line-height alone — it ignores the
+       extra pixels glyph descenders need below the baseline. Capped
+       against max (45% of viewport) so a very long message still scrolls. */
+    const desired = this.textarea.scrollHeight + 4;
+    const newHeight = Math.min(desired, max);
+    this.textarea.style.height = newHeight + "px";
+    /* Always anchor scroll to the bottom. Two reasons:
+       1. Browsers' textarea scrollHeight can be a few pixels short of
+          what's actually needed (descender-clip bug). Pinning scrollTop
+          to scrollHeight pushes the last line to the bottom of the
+          content area, where the padding-bottom of the textarea frame
+          is always visually present below it — so the gap survives even
+          when our height calculation is a hair too small.
+       2. The user is typing at the end of text in a chat composer, so
+          the caret is at the bottom anyway — keeping the textarea
+          scrolled to the bottom matches caret position. */
+    this.textarea.scrollTop = this.textarea.scrollHeight;
   }
 }

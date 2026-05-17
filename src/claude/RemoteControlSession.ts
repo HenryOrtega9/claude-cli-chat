@@ -48,6 +48,11 @@ if not cmd: sys.exit(2)
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(cmd[0], cmd)
+def _term(signum, frame):
+    try: os.kill(pid, signal.SIGTERM)
+    except OSError: pass
+signal.signal(signal.SIGTERM, _term)
+signal.signal(signal.SIGHUP, _term)
 fcntl.fcntl(0, fcntl.F_SETFL, os.O_NONBLOCK)
 fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK)
 try:

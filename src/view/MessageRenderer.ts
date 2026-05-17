@@ -36,6 +36,10 @@ export class MessageListRenderer {
   private resizeObserver: ResizeObserver | null = null;
   private intersectionObserver: IntersectionObserver | null = null;
   private actionCallbacks: MessageActionCallbacks | null = null;
+  /* Optional element kept positioned immediately before bottomSentinel on
+     every layout pass — used to trail the status pill at the end of the
+     visible message stream. Reference survives reset() so we can re-attach. */
+  private tailEl: HTMLElement | null = null;
 
   constructor(app: App, component: Component, container: HTMLElement) {
     this.app = app;
@@ -93,6 +97,24 @@ export class MessageListRenderer {
     this.toolEls.clear();
     this.thinkingOpenOverride.clear();
     this.stickToBottom = true;
+    /* Container was emptied above; re-insert the tracked tail element so the
+       status pill survives /clear and new-chat resets. */
+    this.pinTail();
+  }
+
+  /* Register an element (typically the status pill) to be kept just before
+     the bottom sentinel on every layout pass. Pass null to detach. */
+  setTailEl(el: HTMLElement | null) {
+    this.tailEl = el;
+    this.pinTail();
+  }
+
+  private pinTail() {
+    if (!this.tailEl) return;
+    if (this.tailEl.parentElement !== this.container ||
+        this.bottomSentinel.previousSibling !== this.tailEl) {
+      this.container.insertBefore(this.tailEl, this.bottomSentinel);
+    }
   }
 
   /* Public hook for callers that want to pin scroll regardless of the user's
@@ -104,14 +126,18 @@ export class MessageListRenderer {
   }
 
   private pinIfSticky() {
-    if (!this.stickToBottom) return;
-    /* Keep the sentinel as the absolute last child — message bubbles get
-       appended via createDiv which appends to the end, so we need to move
-       the sentinel back after them. */
+    /* Trailing-order enforcement runs every layout pass regardless of scroll
+       state: sentinel must be the absolute last child, and the tail (status
+       pill) sits immediately before it. New bubbles are appended via
+       createDiv which lands them at the container end, so without this they
+       would slot in after the sentinel/tail. */
     if (this.bottomSentinel.parentElement !== this.container ||
         this.container.lastChild !== this.bottomSentinel) {
       this.container.appendChild(this.bottomSentinel);
     }
+    this.pinTail();
+
+    if (!this.stickToBottom) return;
     /* scrollIntoView reliably places the sentinel at the visible end of its
        scrollable ancestor. The accompanying CSS rule `view-content { overflow:
        hidden }` keeps it from climbing past our messages wrapper into Obsidian
@@ -142,9 +168,12 @@ export class MessageListRenderer {
       const icon = header.createSpan({ cls: "claudian-tool-icon" });
       setIcon(icon, this.iconForTool(tool.name));
       header.createSpan({ cls: "claudian-tool-name", text: tool.name });
+      /* Inline subject (e.g. "cortex", "Cortex.md", "git status") shown
+         next to the tool name so the row reads as one compact phrase. */
+      header.createSpan({ cls: "claudian-tool-subject" });
+      /* Status surfaces as a tiny right-aligned icon (check / x /
+         loader / shield-off) instead of an uppercase text badge. */
       header.createSpan({ cls: "claudian-tool-status" });
-      const chevron = header.createSpan({ cls: "claudian-tool-chevron" });
-      setIcon(chevron, "chevron-down");
       toolEl.createDiv({ cls: "claudian-tool-content" });
       this.toolEls.set(tool.id, toolEl);
 
@@ -154,10 +183,19 @@ export class MessageListRenderer {
         toolEl!.toggleClass("is-expanded", !toolEl!.hasClass("is-expanded"));
       });
     }
+    const subjectEl = toolEl.querySelector(".claudian-tool-subject") as HTMLElement;
+    const subject = this.subjectForTool(tool);
+    subjectEl.setText(subject ?? "");
+    subjectEl.toggleClass("is-empty", !subject);
+
     const statusEl = toolEl.querySelector(".claudian-tool-status") as HTMLElement;
     statusEl.empty();
+    /* Drop any prior status-* class so the color resets between transitions. */
+    statusEl.className = "claudian-tool-status";
     statusEl.addClass(`status-${tool.status}`);
-    statusEl.setText(this.labelForStatus(tool.status));
+    const statusIcon = this.iconForStatus(tool.status, tool.isError);
+    if (statusIcon) setIcon(statusEl, statusIcon);
+    statusEl.setAttr("aria-label", this.labelForStatus(tool.status));
 
     /* Auto-expand on first sight while running (so the user sees what's about
        to execute) and on error (so they don't have to click to find what
@@ -351,14 +389,40 @@ export class MessageListRenderer {
 
   private async renderContent(el: HTMLElement, msg: ChatMessage) {
     el.empty();
-    if (msg.attachments && msg.attachments.length > 0) {
+    /* Clear any previously rendered out-of-bubble attachments row so a
+       re-render can re-decide placement based on current msg state. */
+    const wrapper = el.closest(".claudian-message-wrapper") as HTMLElement | null;
+    wrapper?.querySelector(":scope > .claudian-message-attachments")?.remove();
+
+    const hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
+    const hasUserText = msg.role === "user" && !!msg.content && msg.content.trim().length > 0;
+    /* User messages with both an image and text: lift the image out of the
+       bubble so the bubble can size itself to the text alone. The wrapper's
+       align-items: flex-end keeps the image right-aligned and tight to its
+       intrinsic width. Image-only user messages stay inside the bubble where
+       the bubble hugs the image nicely. */
+    const liftAttachmentsAboveBubble = hasAttachments && hasUserText;
+
+    if (hasAttachments && !liftAttachmentsAboveBubble) {
       const attRow = el.createDiv({ cls: "claudian-message-attachments" });
-      for (const att of msg.attachments) {
+      for (const att of msg.attachments!) {
         const img = attRow.createEl("img", { cls: "claudian-message-attachment" });
         img.src = `data:${att.mediaType};base64,${att.data}`;
         img.alt = "Pasted image";
       }
     }
+    if (liftAttachmentsAboveBubble && wrapper) {
+      const bubbleRoot = el.parentElement;
+      const attRow = createDiv({ cls: "claudian-message-attachments claudian-message-attachments-above" });
+      for (const att of msg.attachments!) {
+        const img = attRow.createEl("img", { cls: "claudian-message-attachment" });
+        img.src = `data:${att.mediaType};base64,${att.data}`;
+        img.alt = "Pasted image";
+      }
+      if (bubbleRoot) wrapper.insertBefore(attRow, bubbleRoot);
+      else wrapper.appendChild(attRow);
+    }
+
     if (msg.role === "user") {
       if (msg.content) el.createDiv({ cls: "claudian-text-block", text: msg.content });
     } else {
@@ -368,10 +432,49 @@ export class MessageListRenderer {
       const block = el.createDiv({ cls: "claudian-text-block" });
       if (msg.content.trim().length > 0) {
         await MarkdownRenderer.render(this.app, msg.content, block, "", this.component);
+        this.wireInternalLinks(block);
       }
       if (msg.durationMs !== undefined && !msg.streaming && this.passHasVisibleContent(msg)) {
         el.createDiv({ cls: "claudian-thought-duration", text: `Thought for ${this.formatDuration(msg.durationMs)}` });
       }
+    }
+  }
+
+  /* MarkdownRenderer renders `[[Cortex]]` as `<a class="internal-link">`
+     but does NOT wire click behavior — that's normally MarkdownView's job.
+     We attach it ourselves so wikilinks open the target note. Because the
+     chat lives in a sidebar pane, we force `paneType: "tab"` so plain
+     clicks don't replace the sidebar with the file. Hover triggers the
+     "hover-link" event so the Page Preview core plugin shows its tile. */
+  private wireInternalLinks(container: HTMLElement) {
+    const links = container.querySelectorAll<HTMLAnchorElement>("a.internal-link");
+    for (const a of Array.from(links)) {
+      const linkpath = a.getAttribute("data-href") ?? a.getAttribute("href") ?? "";
+      if (!linkpath) continue;
+      a.addEventListener("click", e => {
+        e.preventDefault();
+        e.stopPropagation();
+        /* Mirror Obsidian's modifier rules: Cmd/Ctrl+Shift opens a split,
+           plain click and bare Cmd/Ctrl both open a new tab in the main
+           editor area (sidebar-originated openLeaf("tab") routes there). */
+        const split = (e.metaKey || e.ctrlKey) && e.shiftKey;
+        void this.app.workspace.openLinkText(linkpath, "", split ? "split" : "tab");
+      });
+      a.addEventListener("auxclick", e => {
+        if (e.button !== 1) return;
+        e.preventDefault();
+        void this.app.workspace.openLinkText(linkpath, "", "tab");
+      });
+      a.addEventListener("mouseover", event => {
+        this.app.workspace.trigger("hover-link", {
+          event,
+          source: "claude-cli-chat",
+          hoverParent: this.component,
+          targetEl: a,
+          linktext: linkpath,
+          sourcePath: "",
+        });
+      });
     }
   }
 
@@ -415,13 +518,13 @@ export class MessageListRenderer {
     }
   }
 
-  /* A pass is worth labeling only if it produced something the user can see.
-     Otherwise the bubble would collapse into a stray "Thought for Ns" line
-     with nothing else in it. */
+  /* A pass earns the trailing "Thought for Ns" footer only when there's
+     actual reasoning or prose to label. Tool-only passes (e.g. Skill + Read
+     pre-amble before the model speaks) get nothing — the compact tool rows
+     already convey what happened and the footer would just add height. */
   private passHasVisibleContent(msg: ChatMessage): boolean {
     if (msg.content.trim().length > 0) return true;
     if (msg.thinking && msg.thinking.trim().length > 0) return true;
-    if (msg.toolCalls && msg.toolCalls.length > 0) return true;
     return false;
   }
 
@@ -460,6 +563,49 @@ export class MessageListRenderer {
       case "completed": return "Completed";
       case "errored": return "Error";
     }
+  }
+
+  /* Tiny status glyph rendered on the right side of the compact tool row.
+     Picks a Lucide icon name; null means no icon (the slot collapses). */
+  private iconForStatus(status: ToolCall["status"], isError?: boolean): string | null {
+    if (isError) return "x";
+    switch (status) {
+      case "pending": return "shield-off";
+      case "approved": return "shield-check";
+      case "denied": return "shield-off";
+      case "running": return "loader-circle";
+      case "completed": return "check";
+      case "errored": return "x";
+    }
+  }
+
+  /* Returns the one-token phrase shown next to the tool name (e.g. "Read
+     Cortex.md", "Skill cortex", "Bash git status"). Kept short — long
+     paths and commands are truncated to ~48 chars with an ellipsis so the
+     row stays on a single line in narrow side panes. */
+  private subjectForTool(tool: ToolCall): string | null {
+    const input = tool.input ?? {};
+    const truncate = (s: string, n = 48) => s.length > n ? s.slice(0, n - 1) + "…" : s;
+    const basename = (p: string) => {
+      const trimmed = p.replace(/\/+$/, "");
+      const idx = trimmed.lastIndexOf("/");
+      return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+    };
+    if (tool.name === "Skill" && typeof input.skill === "string") return truncate(input.skill);
+    if (tool.name === "Bash" && typeof input.command === "string") return truncate(input.command.replace(/\s+/g, " ").trim());
+    if (tool.name === "Task" && typeof input.subagent_type === "string") return truncate(input.subagent_type);
+    if (tool.name === "TodoWrite" && Array.isArray((input as { todos?: unknown[] }).todos)) {
+      const n = ((input as { todos?: unknown[] }).todos ?? []).length;
+      return `${n} item${n === 1 ? "" : "s"}`;
+    }
+    if (tool.name === "WebFetch" && typeof input.url === "string") {
+      try { return truncate(new URL(input.url).host); } catch { return truncate(input.url); }
+    }
+    if (tool.name === "WebSearch" && typeof input.query === "string") return truncate(input.query);
+    if (typeof input.file_path === "string") return truncate(basename(input.file_path));
+    if (typeof input.path === "string") return truncate(basename(input.path));
+    if (typeof input.pattern === "string") return truncate(input.pattern);
+    return null;
   }
 
   private previewInput(tool: ToolCall): string | null {

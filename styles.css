@@ -531,6 +531,15 @@ mark.claudian-search-mark.is-active {
   margin: 0 18px 6px 18px;
   flex-shrink: 0;
 }
+/* When the pill bar is mounted inside the input wrapper (the normal case —
+   see InputBox.mountTopBar()), strip the outer margins and use horizontal
+   padding that aligns with the textarea below it. Vertical padding gives
+   the pills room to breathe inside the bordered box without crowding the
+   textarea's first line. */
+.claudian-input-wrapper > .claudian-file-pill-bar {
+  margin: 0;
+  padding: 10px 14px 2px 14px;
+}
 .claudian-file-pill {
   display: inline-flex;
   align-items: center;
@@ -562,10 +571,21 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-file-pill-icon {
   display: inline-flex;
-  width: 12px;
-  height: 12px;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
   color: inherit;
   flex-shrink: 0;
+}
+/* Force the Lucide SVG injected by setIcon() to fill the icon span as a
+   block. Without this it inherits `vertical-align: baseline`, which sinks
+   the glyph below the optical center of the text even though the parent
+   span is flex-centered. */
+.claudian-file-pill-icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 .claudian-file-pill-label {
   overflow: hidden;
@@ -579,8 +599,12 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-message-actions {
   position: absolute;
-  top: -8px;
-  right: 4px;
+  /* Anchored just below the bubble so the fork/copy controls sit cleanly
+     under the last line of the response — matches the ChatGPT / Claude.ai
+     convention and reads as "act on what you just read". `top: 100%`
+     plus a small gap keeps the pill from overlapping the message body. */
+  top: calc(100% + 2px);
+  left: 0;
   display: flex;
   gap: 2px;
   padding: 2px 4px;
@@ -589,12 +613,39 @@ mark.claudian-search-mark.is-active {
   border-radius: 6px;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
   opacity: 0;
-  pointer-events: none;
-  transition: opacity 100ms ease;
+  visibility: hidden;
+  /* Hover-intent grace period: when the trigger un-matches, hold the pill
+     fully visible and clickable for 280ms before starting the 150ms fade.
+     Visibility flips at 430ms so the pill stays hoverable through the entire
+     fade. This gives the cursor time to traverse the 2px gap (and any bubble
+     bottom-padding) without the pill vanishing mid-path. Reveal uses 0s
+     delays so the pill snaps in the moment the cursor enters content. */
+  transition: opacity 150ms ease 280ms, visibility 0s linear 430ms;
+  z-index: 1;
 }
-.claudian-message:hover .claudian-message-actions {
+/* User bubbles are solid pills — any-hover triggers the toolbar. */
+.claudian-message-user:hover .claudian-message-actions {
   opacity: 1;
-  pointer-events: auto;
+  visibility: visible;
+  transition: opacity 100ms ease 0s, visibility 0s linear 0s;
+}
+/* Assistant bubbles stretch full width and often hold small tool rows with
+   lots of empty space around them. Triggering on the bubble itself meant
+   hovering the gap between two tool calls would light up the toolbar from
+   nowhere. Scope the trigger to actual content children: a real text block,
+   tool row, thinking block, attachment row, or the toolbar itself (so the
+   pill stays visible while the cursor moves toward its buttons). */
+.claudian-message-assistant:has(
+  > .claudian-message-content > .claudian-text-block:not(:empty):hover,
+  > .claudian-message-content > .claudian-thinking-block:hover,
+  > .claudian-message-content > .claudian-tool-call:hover,
+  > .claudian-message-content > .claudian-message-attachments:hover,
+  > .claudian-message-content > .claudian-thought-duration:hover,
+  > .claudian-message-actions:hover
+) .claudian-message-actions {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 100ms ease 0s, visibility 0s linear 0s;
 }
 .claudian-message-action {
   display: inline-flex;
@@ -610,10 +661,12 @@ mark.claudian-search-mark.is-active {
   color: var(--claudian-brand);
   background: rgba(var(--claudian-brand-rgb), 0.1);
 }
-/* User-message bubbles are right-aligned; keep their toolbar inside the
-   bubble's right edge by flipping the horizontal anchor. */
+/* User-message bubbles are right-aligned; flip the toolbar's horizontal
+   anchor so it tucks under the bubble's right edge instead of overhanging
+   the left side. */
 .claudian-message-user .claudian-message-actions {
-  right: 8px;
+  left: auto;
+  right: 4px;
 }
 
 /* ---- Welcome state ---------------------------------------- */
@@ -735,8 +788,14 @@ mark.claudian-search-mark.is-active {
   width: 100%;
   background: transparent;
   border-end-start-radius: 4px;
-  padding-left: 0;
-  padding-right: 0;
+  /* Assistant bubbles have no visible background, so the inherited 10px
+     vertical padding from .claudian-message was pure dead space — and it
+     stacked at every pass boundary (bubble-1-padding-bottom + messages-gap
+     + bubble-2-padding-top), making cross-pass tool spacing visibly larger
+     than same-bubble spacing. Zero all four sides so the only space between
+     adjacent assistant passes is the .claudian-messages `gap: 10px` plus
+     intra-bubble tool margins. Same-bubble tool spacing is unchanged. */
+  padding: 0;
 }
 .claudian-message-content {
   font-size: var(--font-text-size, 14px);
@@ -755,22 +814,31 @@ mark.claudian-search-mark.is-active {
 
 /* ---- Tool calls ------------------------------------------- */
 .claudian-tool-call {
-  margin: 8px 0;
+  margin: 2px 0;
 }
 .claudian-tool-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
+  padding: 2px 0;
   cursor: pointer;
   user-select: none;
+  line-height: 1.4;
 }
 .claudian-tool-header:hover .claudian-tool-name {
   color: var(--claudian-brand);
 }
 .claudian-tool-icon {
-  color: var(--claudian-brand);
+  /* Same blue as the active tab badge's border (Obsidian's theme accent).
+     Keeps the tool icons readable and brand-neutral so they don't compete
+     visually with the orange claudian-brand used for the live spinner. */
+  color: var(--interactive-accent);
   display: inline-flex;
+  flex-shrink: 0;
+}
+.claudian-tool-icon svg {
+  width: 14px;
+  height: 14px;
 }
 .claudian-tool-name {
   font-family: var(--font-monospace);
@@ -778,28 +846,43 @@ mark.claudian-search-mark.is-active {
   font-weight: 600;
   color: var(--text-normal);
   transition: color 100ms ease;
+  flex-shrink: 0;
 }
+.claudian-tool-subject {
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-left: -2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.claudian-tool-subject.is-empty { display: none; }
 .claudian-tool-status {
   margin-left: auto;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+}
+.claudian-tool-status svg {
+  width: 14px;
+  height: 14px;
 }
 .claudian-tool-status.status-pending { color: var(--text-muted); }
-.claudian-tool-status.status-running { color: var(--claudian-brand); }
+.claudian-tool-status.status-approved { color: var(--text-success, #6bcb77); }
+.claudian-tool-status.status-running {
+  color: var(--claudian-brand);
+  animation: claudian-tool-spin 1.2s linear infinite;
+}
 .claudian-tool-status.status-completed { color: var(--text-success, #6bcb77); }
 .claudian-tool-status.status-errored,
 .claudian-tool-status.status-denied { color: var(--text-error, #dc3545); }
-.claudian-tool-chevron {
-  display: inline-flex;
-  width: 14px;
-  height: 14px;
-  color: var(--text-faint);
-  transition: transform 150ms ease;
-  transform: rotate(-90deg);
-}
-.claudian-tool-call.is-expanded .claudian-tool-chevron {
-  transform: rotate(0deg);
+@keyframes claudian-tool-spin {
+  to { transform: rotate(360deg); }
 }
 .claudian-tool-content {
   display: none;
@@ -1196,16 +1279,29 @@ mark.claudian-search-mark.is-active {
 .claudian-input {
   width: 100%;
   flex: 1 1 0;
-  min-height: 56px;
-  padding: 10px 12px;
+  min-height: 72px;
+  /* Extra bottom padding so wrapped lines have breathing room before the
+     bottom toolbar border — keeps the descender of "j"/"g"/"y" off the
+     border and matches the top padding's airiness for symmetry. */
+  padding: 14px 14px 18px 14px;
+  /* Use border-box so JS-driven autoResize (which sets height = scrollHeight,
+     and scrollHeight includes padding) maps 1:1 to visual height. With the
+     default content-box, height excludes padding and the textarea grows past
+     the wrapper as the user adds lines. */
+  box-sizing: border-box;
   border: none;
   outline: none;
   resize: none;
   background: transparent;
   color: var(--text-normal);
-  font: inherit;
-  font-size: var(--font-text-size, 14px);
+  /* Switch off Obsidian's inherited monospace/UI font for the composer.
+     Use the system humanist sans so the input matches the look of
+     Claude's web composer — larger, lighter weight, more breathing room. */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  font-weight: 400;
   line-height: 1.5;
+  letter-spacing: -0.005em;
   /* Match the wrapper's top corners so any hover/focus background painted
      by Obsidian's default form styles doesn't square-clip past the wrapper. */
   border-radius: 12px 12px 0 0;
@@ -1219,15 +1315,29 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-input::placeholder {
   color: var(--text-faint);
+  font-weight: 400;
+  letter-spacing: -0.005em;
 }
 .claudian-input-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 6px 8px 8px 8px;
-  border-top: 1px solid var(--background-modifier-border);
 }
 .claudian-input-toolbar-spacer { flex: 1; }
+
+/* Two-row layout: the top toolbar frames the input from above (mode +
+   model), the bottom toolbar frames it from below (effort + usage +
+   send). The border-bottom on top and border-top on bottom create a
+   subtle "card" effect around the textarea, with the active-file pill
+   bar (mountTopBar) sitting above the whole frame. */
+.claudian-input-toolbar-top {
+  padding: 8px 8px 4px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.claudian-input-toolbar-bottom {
+  border-top: 1px solid var(--background-modifier-border);
+}
 
 /* ---- Toolbar pills (model / effort) ----------------------- */
 .claudian-input-wrapper { position: relative; }
@@ -1251,6 +1361,23 @@ mark.claudian-search-mark.is-active {
 .claudian-toolbar-pill-value {
   color: var(--claudian-brand);
   font-weight: 600;
+}
+
+/* "→ Opus" / "→ Sonnet" badge that follows the model pill value when the
+   user selected Opus Plan. Surfaces the actual model the CLI resolved to,
+   per the last assistant turn. Hidden for every other model. */
+.claudian-model-pill-via {
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.85;
+  color: var(--text-muted);
+}
+.claudian-model-pill-via.is-opus {
+  color: var(--claudian-brand);
+}
+.claudian-model-pill-via.is-sonnet {
+  color: var(--text-accent, var(--interactive-accent));
 }
 
 /* ---- Popups (model + effort) ------------------------------ */
@@ -1321,10 +1448,40 @@ mark.claudian-search-mark.is-active {
   color: var(--text-muted);
 }
 
-/* Mode pill warning tones. The pill stays orange in Normal + Accept Edits;
-   Plan goes blue (purposeful), Auto goes amber, Bypass goes red (dangerous). */
+/* Mode pill is rendered as a *filled chip* in the two-row layout —
+   visually loud because Mode is the highest-blast-radius runtime control.
+   Normal/Accept Edits get a neutral surface (still readable but quiet);
+   Plan/Auto/Bypass each get a tinted surface so the active risk profile
+   is unmistakable from across the room. The `label` ("mode") stays muted
+   so the value reads as the headline. */
+.claudian-mode-pill {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+}
+.claudian-mode-pill:hover {
+  background: var(--background-modifier-hover);
+}
+.claudian-mode-pill .claudian-toolbar-pill-value {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+.claudian-mode-pill .claudian-toolbar-pill-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.claudian-mode-pill.mode-plan {
+  background: rgba(91, 141, 239, 0.18);
+}
 .claudian-mode-pill.mode-plan .claudian-toolbar-pill-value { color: #5b8def; }
+.claudian-mode-pill.mode-auto {
+  background: rgba(224, 168, 58, 0.18);
+}
 .claudian-mode-pill.mode-auto .claudian-toolbar-pill-value { color: #e0a83a; }
+.claudian-mode-pill.mode-bypass {
+  background: rgba(220, 53, 69, 0.22);
+}
 .claudian-mode-pill.mode-bypass .claudian-toolbar-pill-value { color: #dc3545; }
 
 /* ---- Context window indicators --------------------------- */
@@ -1377,7 +1534,7 @@ mark.claudian-search-mark.is-active {
   bottom: 100%;
   margin-bottom: 6px;
   z-index: 5;
-  max-height: 280px;
+  max-height: min(60vh, 520px);
   overflow-y: auto;
   padding: 4px;
   background: var(--background-primary);
@@ -1527,9 +1684,9 @@ mark.claudian-search-mark.is-active {
   align-items: center;
   gap: 8px;
   margin: 0 18px 6px 18px;
-  padding: 4px 10px;
+  padding: 5px 11px;
   width: fit-content;
-  font-size: 12px;
+  font-size: 13px;
   font-family: var(--font-interface);
   color: var(--text-muted);
   flex-shrink: 0;
@@ -1547,6 +1704,35 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-status-indicator.is-retrying .claudian-status-dot {
   background: #e0a83a;
+}
+/* Spark glyph: visible during the thinking state, hidden during retries.
+   The dot is the inverse so only one indicator is ever visible at a time.
+   Two animations combine — a slow whole-group rotation + a staggered per-
+   ray opacity chase. The chase creates the visible "bright ray traveling
+   around the circle" effect (the 12-fold symmetric outline alone wouldn't
+   show rotation); the rotation adds subtle drift. */
+.claudian-status-spark {
+  display: none;
+  width: 18px;
+  height: 18px;
+  color: var(--claudian-brand);
+  animation: claudian-spark-spin 1.6s linear infinite;
+  flex-shrink: 0;
+  line-height: 0;
+}
+.claudian-status-spark svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.claudian-status-indicator.is-thinking .claudian-status-spark {
+  display: inline-block;
+}
+.claudian-status-indicator.is-thinking .claudian-status-dot {
+  display: none;
+}
+@keyframes claudian-spark-spin {
+  to { transform: rotate(360deg); }
 }
 .claudian-status-label {
   font-weight: 500;

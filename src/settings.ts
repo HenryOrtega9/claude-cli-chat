@@ -6,12 +6,19 @@ import {
   PermissionsConfigStore,
   RECOMMENDED_ALLOW_PATTERNS,
 } from "./permissions/PermissionsConfig";
+import { findRemoteControlPids } from "./claude/SubprocessManager";
 
 /* Model IDs use the `[1m]` suffix to enable Claude's 1M-context window
    for Opus and Sonnet, matching Claudian's `enableOpus1M`/`enableSonnet1M`
-   behavior. Haiku does not support 1M context, so it stays unsuffixed. */
+   behavior. Haiku does not support 1M context, so it stays unsuffixed.
+
+   `opusplan` is a CLI alias that auto-routes between Opus (while in plan
+   mode) and Sonnet (everywhere else). No `[1m]` suffix because the alias
+   itself does the model selection; the underlying Opus path still gets
+   1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
   "opus-1m": "claude-opus-4-7[1m]",
+  "opus-plan": "opusplan",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
   "haiku": "haiku",
 } as const;
@@ -20,6 +27,7 @@ export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
   "opus-1m": "Opus 1M",
+  "opus-plan": "Opus Plan",
   "sonnet-1m": "Sonnet 1M",
   "haiku": "Haiku",
 };
@@ -38,17 +46,20 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   opus-1m today; everything else shows the standard four. */
+   Opus today (including opus-plan, which routes to Opus when in plan mode);
+   everything else shows the standard four. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "opus-1m") return EFFORT_ORDER;
+  if (model === "opus-1m" || model === "opus-plan") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
 /* Total context window size for a model, used as the denominator when the
    usage snapshot doesn't include `contextWindow` directly. The `[1m]` suffix
-   models open the 1M-token window; everything else is 200k. */
+   models open the 1M-token window; everything else is 200k. opus-plan can
+   resolve to either Opus (1M) or Sonnet (200k) at runtime — we display 1M
+   as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "opus-1m" || model === "sonnet-1m") return 1_000_000;
+  if (model === "opus-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 
@@ -347,6 +358,52 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       );
 
     this.renderSnippetsSection(containerEl);
+
+    this.renderProcessCleanupSection(containerEl);
+  }
+
+  /* Surfaces a count of live `claude --remote-control` processes (tracked
+     + orphan) and a kill-everything button. Wired to
+     SubprocessManager.killAllRemoteAndOrphans so it disposes tracked
+     sessions cleanly and also signals any leftover PIDs the registry lost
+     track of (e.g. survivors from before this cleanup logic existed). */
+  private renderProcessCleanupSection(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Process cleanup" });
+    containerEl.createEl("p", {
+      text: "Live `claude --remote-control` processes: both the ones this plugin is currently tracking and any orphans left over from a prior Obsidian session. Closing a tab in the UI should kill its remote session; this button is the safety net when that breaks.",
+      cls: "setting-item-description",
+    });
+
+    const livePids = findRemoteControlPids();
+    const tracked = this.plugin.subprocessManager.listRemote().length;
+    const total = livePids.length;
+    const orphans = Math.max(0, total - tracked);
+
+    new Setting(containerEl)
+      .setName("Active remote sessions")
+      .setDesc(
+        total === 0
+          ? "None running."
+          : `${total} process${total === 1 ? "" : "es"} found (${tracked} tracked, ${orphans} orphan${orphans === 1 ? "" : "s"}).`
+      )
+      .addButton(btn => {
+        btn.setButtonText(total === 0 ? "Refresh" : `Kill ${total}`);
+        if (total > 0) btn.setWarning();
+        btn.onClick(async () => {
+          if (total === 0) {
+            this.display();
+            return;
+          }
+          const { tracked: t, orphans: o } = await this.plugin.subprocessManager.killAllRemoteAndOrphans();
+          const killed = t + o;
+          new Notice(
+            killed === 0
+              ? "Nothing to kill."
+              : `Killed ${killed} session${killed === 1 ? "" : "s"} (${t} tracked, ${o} orphan${o === 1 ? "" : "s"}).`
+          );
+          this.display();
+        });
+      });
   }
 
   /* Tool allowlist editor — writes to <vault>/.claude/settings.json's
@@ -439,11 +496,23 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       return;
     }
 
+    /* Cap the allowlist's vertical footprint so a large list doesn't push
+       the rest of the settings panel off-screen. Border + padding give the
+       scroll region a clear visual boundary; max-height is a fixed pixel
+       value rather than vh so it doesn't grow with the user's monitor. */
+    const scrollWrap = containerEl.createDiv();
+    scrollWrap.style.maxHeight = "400px";
+    scrollWrap.style.overflowY = "auto";
+    scrollWrap.style.border = "1px solid var(--background-modifier-border)";
+    scrollWrap.style.borderRadius = "6px";
+    scrollWrap.style.padding = "4px 8px";
+    scrollWrap.style.marginTop = "8px";
+
     for (const pattern of patterns) {
       const truncated = pattern.length > 100 ? pattern.slice(0, 97) + "…" : pattern;
       const isMultiline = pattern.includes("\n");
       const displayName = isMultiline ? truncated.replace(/\n/g, " ⏎ ") : truncated;
-      const row = new Setting(containerEl)
+      const row = new Setting(scrollWrap)
         .setName(displayName)
         .addExtraButton(btn => {
           btn.setIcon("trash-2").setTooltip("Remove from allowlist").onClick(async () => {

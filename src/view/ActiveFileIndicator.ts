@@ -1,4 +1,5 @@
 import { setIcon, TFile, type App, type EventRef } from "obsidian";
+import { VIEW_TYPE_CLAUDE_CHAT } from "./ClaudeChatView";
 
 /* Renders a row of file pills above the input box. The currently-active
    Obsidian file always shows; previously-pinned files persist as pills
@@ -15,11 +16,18 @@ export type FilePillCallbacks = {
 
 export class ActiveFileIndicator {
   private app: App;
-  private root: HTMLElement;
+  /* Public so the owner (TabController) can reparent the pill bar — currently
+     mounted inside the input wrapper via InputBox.mountTopBar(). */
+  readonly root: HTMLElement;
   private callbacks: FilePillCallbacks;
   private pinnedPaths: Set<string>;
   private currentActiveFile: TFile | null = null;
   private eventRef: EventRef | null = null;
+  /* Per-path pill element cache. Surgical class updates against these
+     existing elements (instead of empty()+recreate) preserve click handlers
+     across refreshes, so an in-flight click can't be lost to a concurrent
+     active-leaf-change rebuilding the DOM. */
+  private pillElements = new Map<string, HTMLElement>();
 
   constructor(parent: HTMLElement, app: App, initialPinned: string[], callbacks: FilePillCallbacks) {
     this.app = app;
@@ -31,7 +39,17 @@ export class ActiveFileIndicator {
     this.root.style.display = "none";
 
     this.refresh();
-    this.eventRef = this.app.workspace.on("active-leaf-change", () => this.refresh());
+    /* Skip refreshes when the new active leaf is our own chat view. Clicking
+       a pill in the chat panel (while a markdown leaf was previously active)
+       fires active-leaf-change synchronously between mousedown and mouseup;
+       running refresh() there would destroy the click target before the click
+       event resolves, losing the pin. The user's underlying intent has not
+       changed when focus moves to our own view, so the right behavior is to
+       keep showing whatever file was active before. */
+    this.eventRef = this.app.workspace.on("active-leaf-change", (leaf) => {
+      if (leaf?.view.getViewType() === VIEW_TYPE_CLAUDE_CHAT) return;
+      this.refresh();
+    });
   }
 
   destroy() {
@@ -60,7 +78,6 @@ export class ActiveFileIndicator {
   }
 
   private renderPills() {
-    this.root.empty();
     /* Build the visible set: active file + all pinned. De-duplicated by path
        so the active file is rendered once even if it's also pinned. */
     const visible = new Map<string, { path: string; isActive: boolean; pinned: boolean }>();
@@ -77,27 +94,61 @@ export class ActiveFileIndicator {
     }
     if (visible.size === 0) {
       this.root.style.display = "none";
+      for (const el of this.pillElements.values()) el.remove();
+      this.pillElements.clear();
       return;
     }
     this.root.style.display = "";
+
+    /* Remove pills no longer in the visible set. Done before re-ordering so
+       the position loop below sees only pills that should exist. */
+    for (const [path, el] of [...this.pillElements]) {
+      if (!visible.has(path)) {
+        el.remove();
+        this.pillElements.delete(path);
+      }
+    }
+
+    /* Reuse existing pills when present, only updating their class state and
+       title. Create + cache new ones for paths that didn't have a pill yet.
+       After each pill is placed, walk it into the correct position so the
+       DOM order matches the visible map's insertion order. */
+    let prevPill: HTMLElement | null = null;
     for (const { path, isActive, pinned } of visible.values()) {
-      this.renderPill(path, isActive, pinned);
+      let pill = this.pillElements.get(path);
+      if (pill) {
+        this.updatePillState(pill, path, isActive, pinned);
+      } else {
+        pill = this.createPill(path, isActive, pinned);
+        this.pillElements.set(path, pill);
+      }
+      const expected: ChildNode | null = prevPill ? prevPill.nextSibling : this.root.firstChild;
+      if (pill !== expected) {
+        this.root.insertBefore(pill, expected);
+      }
+      prevPill = pill;
     }
   }
 
-  private renderPill(path: string, isActive: boolean, pinned: boolean) {
-    const pill = this.root.createDiv({
-      cls: "claudian-file-pill"
-        + (pinned ? " is-pinned" : "")
-        + (isActive ? " is-active-file" : ""),
-      attr: { title: pinned ? `${path} · pinned (click to unpin)` : `${path} · click to pin` },
-    });
+  private createPill(path: string, isActive: boolean, pinned: boolean): HTMLElement {
+    /* Obsidian augments HTMLElement.prototype with createSpan/createDiv etc.,
+       so detached elements get the same DOM helpers as Obsidian-created ones. */
+    const pill = document.createElement("div");
+    this.updatePillState(pill, path, isActive, pinned);
     const iconEl = pill.createSpan({ cls: "claudian-file-pill-icon" });
     const ext = path.split(".").pop() ?? "";
     setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
     const fileName = path.split("/").pop() ?? path;
     pill.createSpan({ cls: "claudian-file-pill-label", text: fileName });
     pill.addEventListener("click", () => this.togglePin(path));
+    return pill;
+  }
+
+  private updatePillState(pill: HTMLElement, path: string, isActive: boolean, pinned: boolean) {
+    pill.className = "claudian-file-pill"
+      + (pinned ? " is-pinned" : "")
+      + (isActive ? " is-active-file" : "");
+    pill.setAttribute("title", pinned ? `${path} · pinned (click to unpin)` : `${path} · click to pin`);
   }
 
   private togglePin(path: string) {

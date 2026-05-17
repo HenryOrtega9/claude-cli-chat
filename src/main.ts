@@ -4,6 +4,7 @@ import { ClaudeChatSettingTab, DEFAULT_SETTINGS, autodetectUserName, type Claude
 import { SubprocessManager } from "./claude/SubprocessManager";
 import { Persistence } from "./storage/Persistence";
 import { CLAUDE_ASTERISK_ICON_SVG } from "./view/Welcome";
+import { discoverSkillsAndCommands, type DiscoveryResult } from "./claude/SkillDiscovery";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
@@ -14,10 +15,16 @@ export default class ClaudeChatPlugin extends Plugin {
   settings: ClaudeChatSettings = DEFAULT_SETTINGS;
   subprocessManager = new SubprocessManager();
   persistence!: Persistence;
+  /* Disk-scanned skill + slash-command catalog. Populated on load so the
+     `/`-suggestion popup is non-empty before the first message ever fires
+     the CLI's system/init event. Re-runnable via refreshSkillCatalog() so
+     freshly added skills can be picked up without a plugin reload. */
+  skillCatalog: DiscoveryResult = { skills: [], commands: [] };
 
   async onload() {
     await this.loadSettings();
     this.persistence = new Persistence(this.app);
+    this.refreshSkillCatalog();
 
     /* Register the Claude asterisk icon BEFORE any UI that references it.
        Obsidian's addIcon takes inner SVG content; the asterisk is pre-scaled
@@ -89,6 +96,16 @@ export default class ClaudeChatPlugin extends Plugin {
     const adapter = this.app.vault.adapter;
     if (adapter instanceof FileSystemAdapter) return adapter.getBasePath();
     return "";
+  }
+
+  refreshSkillCatalog(): void {
+    try {
+      this.skillCatalog = discoverSkillsAndCommands(this.getVaultPath());
+    } catch (err) {
+      /* eslint-disable no-console */
+      console.warn("[claude-cli-chat] skill discovery failed:", err);
+      this.skillCatalog = { skills: [], commands: [] };
+    }
   }
 
   async loadSettings() {

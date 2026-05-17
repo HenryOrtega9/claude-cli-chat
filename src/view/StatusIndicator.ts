@@ -14,8 +14,48 @@ const THINKING_WORDS = [
   "Scheming", "Plotting", "Spinning up", "Warming up", "Dreaming up",
 ];
 
+/* Claude-mark-style spark glyph. Eleven tapered-spindle rays at non-uniform
+   angles and varied lengths, recreating the organic asymmetry of the real
+   Anthropic mark without copying the trademarked asset. The asymmetry
+   serves a second purpose: a perfectly 12-fold symmetric asterisk looks
+   stationary even while spinning (every 30° tick maps onto itself); these
+   irregular rays mean rotation is visibly readable without needing any
+   opacity tricks. All rays render at full color for a clean, solid look.
+
+   Spindle is parameterized by length L — outer tip at y=(12-L), waist
+   control points at y=(12-L/2), inner base at y=11 (small gap near center
+   so rays don't bunch into a solid disk). All coords stay inside the 24×24
+   viewBox so nothing bleeds past the pill background at 18px display. */
+const SPARK_SVG = (() => {
+  const rays: Array<{ a: number; L: number }> = [
+    { a: 0,   L: 9.5 },
+    { a: 32,  L: 7   },
+    { a: 65,  L: 8.5 },
+    { a: 98,  L: 10  },
+    { a: 132, L: 7.5 },
+    { a: 163, L: 9   },
+    { a: 198, L: 8   },
+    { a: 230, L: 7   },
+    { a: 263, L: 10  },
+    { a: 295, L: 7.5 },
+    { a: 328, L: 8.5 },
+  ];
+  const spindle = (L: number) => {
+    const oy = (12 - L).toFixed(2);
+    const my = (12 - L / 2).toFixed(2);
+    return `M 12 ${oy} Q 13 ${my} 12.5 11 L 11.5 11 Q 11 ${my} 12 ${oy} Z`;
+  };
+  const paths = rays.map(r =>
+    `<path d="${spindle(r.L)}" transform="rotate(${r.a} 12 12)"/>`
+  ).join("");
+  return `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">` +
+    `<g fill="currentColor">${paths}</g>` +
+    `</svg>`;
+})();
+
 export class StatusIndicator {
   private root: HTMLElement;
+  private sparkEl: HTMLElement;
   private dotEl: HTMLElement;
   private labelEl: HTMLElement;
   private detailEl: HTMLElement;
@@ -25,11 +65,20 @@ export class StatusIndicator {
 
   constructor(parent: HTMLElement) {
     this.root = parent.createDiv({ cls: "claudian-status-indicator" });
+    /* Spark (thinking) and dot (retrying) coexist in DOM; CSS toggles which
+       one is visible based on the is-thinking / is-retrying class on root. */
+    this.sparkEl = this.root.createSpan({ cls: "claudian-status-spark" });
+    this.sparkEl.innerHTML = SPARK_SVG;
     this.dotEl = this.root.createSpan({ cls: "claudian-status-dot" });
     this.labelEl = this.root.createSpan({ cls: "claudian-status-label" });
     this.detailEl = this.root.createSpan({ cls: "claudian-status-detail" });
     this.hide();
   }
+
+  /* The TabController hands this root to MessageRenderer.setTailEl so the
+     pill rides at the bottom of the message list (just above the sentinel)
+     and trails whatever assistant block was last rendered. */
+  get rootEl(): HTMLElement { return this.root; }
 
   setThinking() {
     this.mode = "thinking";

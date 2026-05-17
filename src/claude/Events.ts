@@ -59,6 +59,18 @@ export type SystemInitEvent = {
   model: string;
   cwd?: string;
   tools?: string[];
+  /* The slash commands the CLI has discovered for this session. Includes
+     CLI built-ins (clear, compact, init, review, ...) and every skill from
+     every loaded plugin / user / project source. Surfaced in the slash-
+     command suggestion popup so users can discover them inline. */
+  slash_commands?: string[];
+  /* Subset of slash_commands that map to a skill (vs. a CLI built-in).
+     Same names appear in both arrays — separated so the dropdown can label
+     them differently. */
+  skills?: string[];
+  /* The permission mode the CLI ended up in. Useful when the user passed
+     --permission-mode and we need to mirror its accepted value. */
+  permissionMode?: string;
   metadata?: Record<string, unknown>;
 };
 

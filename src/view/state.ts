@@ -77,6 +77,11 @@ export type TabState = {
      submit. Active-file pill toggles entries in this list. Per-tab so each
      conversation can pin its own context set. */
   pinnedFilePaths?: string[];
+  /* Discovered slash commands + skills from the most recent system/init
+     event. Refreshed on every (re)spawn. Used to populate the slash-command
+     suggestion popup. Not persisted — re-derived on next subprocess spawn. */
+  availableSlashCommands?: string[];
+  availableSkills?: string[];
 };
 
 export type PendingApproval = {
