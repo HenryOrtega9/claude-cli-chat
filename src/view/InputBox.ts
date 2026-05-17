@@ -48,6 +48,13 @@ export type InputBoxCallbacks = {
   /* Fired when the user presses Esc while Claude is streaming (busy=true).
      Caller is expected to interrupt the in-flight turn. */
   onCancel: () => void;
+  /* Fired when the user dismisses the selection chip via its (×) button.
+     CONTRACT (consumed by Agent C / TabController): wire this to
+     SelectionTracker.clear() so the next selectionchange refresh doesn't
+     re-push the same selection back into the chip. Optional — InputBox
+     keeps working without it but the chip will reappear on the next cursor
+     move in the source editor. */
+  onSelectionDismissed?: () => void;
 };
 
 /* Map a raw Anthropic model id ("claude-opus-4-7", "claude-sonnet-4-6",
@@ -105,6 +112,9 @@ export class InputBox {
     items: Suggestion[];
     activeIndex: number;
   } | null = null;
+  /* destroy() flips this so late-firing callbacks (FileReader.onload after a
+     tab close, deferred setTimeout handlers, etc.) can no-op safely. */
+  private destroyed = false;
 
   constructor(
     container: HTMLElement,
@@ -272,6 +282,20 @@ export class InputBox {
   setBusy(busy: boolean) {
     this.busy = busy;
     this.sendBtn.toggleClass("is-disabled", busy);
+  }
+
+  /* Tear down the InputBox cleanly. Removes any document-level listeners that
+     popups installed, closes any visible popup/suggestion (which also pulls
+     their listeners), and flips `destroyed` so late callbacks (deferred
+     setTimeout-installed listeners, FileReader.onload after a paste while the
+     tab is being closed) short-circuit instead of touching detached DOM.
+     CONTRACT (consumed by Agent C / TabController): call on tab close BEFORE
+     the parent DOM is removed so the global document.removeEventListener
+     handles in closePopup/hideSuggestion are still wired to live references. */
+  public destroy(): void {
+    this.destroyed = true;
+    if (this.openPopup) this.closePopup();
+    if (this.suggestion) this.hideSuggestion();
   }
 
   /* Mounts an external element (e.g. the active-file pill bar) just
@@ -628,8 +652,12 @@ export class InputBox {
     }
 
     /* Esc while Claude is streaming = cancel the current turn. Only fires
-       when busy so a stray Esc on an idle input doesn't fire a no-op. */
+       when busy so a stray Esc on an idle input doesn't fire a no-op.
+       During IME composition Escape is the user dismissing the candidate
+       window — never an interrupt request — so bail before we'd otherwise
+       kill the turn behind their back. */
     if (e.key === "Escape" && this.busy) {
+      if (e.isComposing) return;
       e.preventDefault();
       e.stopPropagation();
       this.callbacks.onCancel();
@@ -659,9 +687,12 @@ export class InputBox {
     const cursor = this.textarea.selectionStart ?? 0;
     const before = this.textarea.value.slice(0, cursor);
 
-    /* `@` trigger: preceded by start-of-text or whitespace, followed by any
-       non-whitespace, non-@ chars up to the cursor. */
-    const atMatch = before.match(/(?:^|\s)@([^\s@]*)$/);
+    /* `@` trigger: preceded by start-of-text or whitespace, followed by chars
+       that could plausibly be part of a vault path (alphanumerics, `_.-/`).
+       Restricted from `[^\s@]*` to avoid firing on things like email handles
+       (`user@host.com`) or other non-path tokens, and to cut down on stray
+       vault-index lookups for queries that can never resolve. */
+    const atMatch = before.match(/(?:^|\s)@([A-Za-z0-9_.\-\/]*)$/);
     if (atMatch) {
       const query = atMatch[1];
       const triggerStart = cursor - query.length - 1;  // index of "@"
@@ -770,12 +801,22 @@ export class InputBox {
     if (!items) return;
     const imageItems = Array.from(items).filter(it => it.kind === "file" && it.type.startsWith("image/"));
     if (imageItems.length === 0) return;
-    e.preventDefault();
+    /* Many sources (screenshot tools, browsers copying images with alt text,
+       rich editors) populate the clipboard with BOTH a text payload and an
+       image. Previous behavior preventDefault()'d unconditionally on image
+       presence, silently dropping the text. Instead: only preventDefault when
+       the clipboard is image-only. When text is also present, let the browser
+       handle the text paste normally and process the image asynchronously into
+       the attachment list (FileReader is already async, so the text paste
+       lands first regardless). */
+    const hasText = Array.from(items).some(it => it.kind === "string" && it.type === "text/plain");
+    if (!hasText) e.preventDefault();
     for (const item of imageItems) {
       const file = item.getAsFile();
       if (!file) continue;
       const reader = new FileReader();
       reader.onload = () => {
+        if (this.destroyed) return;
         const result = reader.result as string;
         const comma = result.indexOf(",");
         const data = comma >= 0 ? result.slice(comma + 1) : result;
@@ -839,6 +880,11 @@ export class InputBox {
         e.stopPropagation();
         this.currentSelection = null;
         this.renderContextRow();
+        /* Notify the caller so SelectionTracker can be cleared in lockstep.
+           Without this, the next refresh() in SelectionTracker re-emits the
+           same selection and the chip pops back into view. See
+           InputBoxCallbacks.onSelectionDismissed for the contract. */
+        this.callbacks.onSelectionDismissed?.();
       });
     }
 

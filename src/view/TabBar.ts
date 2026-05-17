@@ -1,4 +1,4 @@
-import { setIcon } from "obsidian";
+import { Menu, setIcon } from "obsidian";
 
 export type TabBarCallbacks = {
   onSelect: (tabId: string) => void;
@@ -50,7 +50,18 @@ export class TabBar {
       });
       badge.addEventListener("contextmenu", e => {
         e.preventDefault();
-        this.callbacks.onClose(tab.id);
+        /* Right-click used to close silently — easy to fire by accident on
+           a trackpad two-finger tap, losing the user's tab without a confirm
+           step. Now opens a tiny one-item menu; middle-click still closes
+           instantly via the auxclick handler above for users who want the
+           old behavior. */
+        const menu = new Menu();
+        menu.addItem(item =>
+          item.setTitle("Close tab")
+            .setIcon("x")
+            .onClick(() => this.callbacks.onClose(tab.id))
+        );
+        menu.showAtMouseEvent(e);
       });
     });
   }

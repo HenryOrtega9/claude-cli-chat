@@ -61,6 +61,7 @@ export class StatusIndicator {
   private detailEl: HTMLElement;
   private wordTimer: number | null = null;
   private countdownTimer: number | null = null;
+  private watchdogTimer: number | null = null;
   private mode: "idle" | "thinking" | "retrying" = "idle";
 
   constructor(parent: HTMLElement) {
@@ -91,6 +92,15 @@ export class StatusIndicator {
     /* Cycle every 3s so the user sees the spinner is alive without it
        being distracting. */
     this.wordTimer = window.setInterval(() => this.cycleWord(), 3000);
+    /* Watchdog: if no state transition happens within 90s, auto-hide with a
+       hover hint so a wedged CLI doesn't leave the user staring at a
+       perpetual "Pondering…" pill. Cleared by hide()/setRetrying() via
+       clearTimers, so the only path that fires this is a genuine stall. */
+    this.watchdogTimer = window.setTimeout(() => {
+      this.watchdogTimer = null;
+      this.root.setAttribute("title", "(status timed out — no update in 90s)");
+      this.hide();
+    }, 90_000);
   }
 
   setRetrying(attempt: number, maxRetries: number, retryDelayMs: number) {
@@ -149,6 +159,10 @@ export class StatusIndicator {
     if (this.countdownTimer !== null) {
       window.clearInterval(this.countdownTimer);
       this.countdownTimer = null;
+    }
+    if (this.watchdogTimer !== null) {
+      window.clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
     }
   }
 }

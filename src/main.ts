@@ -111,12 +111,25 @@ export default class ClaudeChatPlugin extends Plugin {
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     /* First-install user name autodetect. Empty userName means we've never
-       populated it; try the OS account once and save. */
+       populated it; try the OS account once and save. Validate the result
+       — if dscl misbehaves and leaks an error string into stdout, the
+       truthy check would otherwise save the garbage forever. Whitelist:
+       starts with a letter, allows letters / spaces / common punctuation,
+       caps at 50 chars, must contain a letter. Falls through to USER env. */
     if (!this.settings.userName) {
       const detected = autodetectUserName();
-      if (detected) {
+      const looksLikeName = /^[A-Za-z][A-Za-z .'-]{0,49}$/.test(detected) && /[A-Za-z]/.test(detected);
+      if (detected && looksLikeName) {
         this.settings.userName = detected;
         await this.saveSettings();
+      } else {
+        /* Fall through to capitalized $USER as a safer secondary source. */
+        const u = process.env.USER ?? "";
+        const fallback = u ? u.charAt(0).toUpperCase() + u.slice(1) : "";
+        if (fallback && /^[A-Za-z][A-Za-z .'-]{0,49}$/.test(fallback)) {
+          this.settings.userName = fallback;
+          await this.saveSettings();
+        }
       }
     }
   }

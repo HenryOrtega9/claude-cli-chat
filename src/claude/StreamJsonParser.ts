@@ -16,8 +16,13 @@ export class StreamJsonParser {
   }
 
   detach() {
-    this.rl?.close();
-    this.rl = null;
+    /* rl.close() fires a final `line` event for any buffered partial line
+       that lacked a trailing newline (per Node readline semantics). This
+       flushes residual data before the stream is dropped. */
+    if (this.rl) {
+      try { this.rl.close(); } catch { /* ignore */ }
+      this.rl = null;
+    }
   }
 
   onEvent(cb: (e: StreamEvent) => void) {

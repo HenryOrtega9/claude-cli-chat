@@ -53,7 +53,17 @@ export class RemotePairingCard {
   setUrl(url: string) {
     this.url = url;
     this.urlEl.setText(url);
-    this.urlEl.href = url;
+    /* Guard against javascript: / data: / file: URLs that could ride in via
+       a compromised pairing transport — assigning straight to `.href` would
+       make them clickable. Only http(s) gets to be a real link; anything else
+       renders as plain text and is logged so we notice if it's a real upstream
+       bug rather than an attack. */
+    if (url.startsWith("https://") || url.startsWith("http://")) {
+      this.urlEl.href = url;
+    } else {
+      this.urlEl.removeAttribute("href");
+      console.warn(`RemotePairingCard: refusing to assign non-http(s) URL: ${url}`);
+    }
   }
 
   setStatus(status: RemoteStatus) {

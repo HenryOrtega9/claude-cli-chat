@@ -16,6 +16,12 @@ import { autodetectClaudePath } from "../settings";
 export class MCPManagerModal extends Modal {
   private store: MCPConfigStore;
   private claudePath: string;
+  /* Tracks the in-flight `claude mcp list` invocation. Single-flighted: if a
+     check is running, additional clicks are no-ops (button is also visually
+     disabled). Aborted on modal close to avoid orphan child processes that
+     write their Notice into the void after the user has moved on. */
+  private inflightCheck: AbortController | null = null;
+  private checkBtn: HTMLButtonElement | null = null;
 
   constructor(app: App, claudePath: string) {
     super(app);
@@ -32,6 +38,12 @@ export class MCPManagerModal extends Modal {
   }
 
   onClose() {
+    /* Cancel any in-flight status check so its child process and Notice
+       don't outlive the modal. */
+    if (this.inflightCheck) {
+      this.inflightCheck.abort();
+      this.inflightCheck = null;
+    }
     this.contentEl.empty();
   }
 
@@ -47,6 +59,13 @@ export class MCPManagerModal extends Modal {
     const headerRow = this.contentEl.createDiv({ cls: "claudian-mcp-header-row" });
     headerRow.createEl("h3", { text: `${servers.length} server${servers.length === 1 ? "" : "s"} configured` });
     const checkBtn = headerRow.createEl("button", { text: "Check status", cls: "mod-cta" });
+    this.checkBtn = checkBtn;
+    /* Carry over the disabled state across re-renders triggered by an
+       add/edit/delete landing while a check is mid-flight. */
+    if (this.inflightCheck) {
+      checkBtn.disabled = true;
+      checkBtn.setText("Checking…");
+    }
     checkBtn.addEventListener("click", () => this.runStatusCheck());
     const addBtn = headerRow.createEl("button", { text: "Add server" });
     addBtn.addEventListener("click", () => this.editServer(null));
@@ -102,6 +121,11 @@ export class MCPManagerModal extends Modal {
 
   private editServer(existing: { name: string; config: MCPServerConfig } | null) {
     new MCPServerEditModal(this.app, existing, async (name, config) => {
+      /* TODO(bugfix-sweep): rename is currently two writes (removeServer + upsertServer);
+         if the second write fails the config is left missing the server entirely.
+         The fix lives in MCPConfigStore (Agent A's scope): add a
+         renameServer(oldName, newName, config) helper that mutates the JSON
+         in memory and persists once. Until then, we accept the race here. */
       if (existing && existing.name !== name) {
         await this.store.removeServer(existing.name);
       }
@@ -113,23 +137,64 @@ export class MCPManagerModal extends Modal {
 
   /* Spawns `claude mcp list` to verify the CLI can see the servers and what
      state they're in. Output is shown in a Notice — for V1 this gives the
-     user signal without needing a full status pane in the modal. */
+     user signal without needing a full status pane in the modal.
+     Single-flighted via this.inflightCheck so rapid clicks don't fan out into
+     N parallel child processes; a 30s timeout aborts hung invocations so
+     we don't leave zombie children behind. */
   private runStatusCheck() {
+    if (this.inflightCheck) return;
+    const controller = new AbortController();
+    this.inflightCheck = controller;
+    if (this.checkBtn) {
+      this.checkBtn.disabled = true;
+      this.checkBtn.setText("Checking…");
+    }
+
     const child = spawn(this.claudePath, ["mcp", "list"], {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, PATH: `${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH ?? ""}` },
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    let settled = false;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      if (this.inflightCheck === controller) this.inflightCheck = null;
+      if (this.checkBtn) {
+        this.checkBtn.disabled = false;
+        this.checkBtn.setText("Check status");
+      }
+    };
+
+    const timer = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    }, 30_000);
+
+    controller.signal.addEventListener("abort", () => {
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    });
+
     child.stdout.on("data", chunk => { stdout += chunk.toString("utf8"); });
     child.stderr.on("data", chunk => { stderr += chunk.toString("utf8"); });
     child.on("exit", code => {
-      const message = code === 0
-        ? `claude mcp list:\n\n${stdout.trim() || "(no output)"}`
-        : `claude mcp list failed (exit ${code}):\n${stderr.trim() || stdout.trim() || "(no output)"}`;
+      cleanup();
+      if (controller.signal.aborted && !timedOut) return;  /* user closed modal */
+      const message = timedOut
+        ? "claude mcp list timed out after 30s (process killed)."
+        : code === 0
+          ? `claude mcp list:\n\n${stdout.trim() || "(no output)"}`
+          : `claude mcp list failed (exit ${code}):\n${stderr.trim() || stdout.trim() || "(no output)"}`;
       new Notice(message, 12000);
     });
     child.on("error", err => {
+      cleanup();
+      if (controller.signal.aborted && !timedOut) return;
       new Notice(`Failed to spawn claude: ${err.message}`, 8000);
     });
   }
@@ -262,14 +327,59 @@ class MCPServerEditModal extends Modal {
     });
   }
 
-  /* Parse a single-line "arg1 arg2 'arg with space' \"quoted\"" string. */
+  /* Parse a single-line shell-ish arg string, e.g.
+       arg1 arg2 'arg with space' "quoted" --regex='it\'s'
+     Hand-rolled char-by-char state machine so escaped quotes inside a quoted
+     section don't terminate the section early — the previous regex broke on
+     `--regex='it\'s'` and similar. Supports `\` as a generic escape both
+     inside and outside quoted runs; unquoted whitespace separates args. */
   private parseArgs(text: string): string[] {
     const out: string[] = [];
-    const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-    let match;
-    while ((match = re.exec(text)) !== null) {
-      out.push(match[1] ?? match[2] ?? match[3]);
+    let current = "";
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+    let started = false;  /* true once `current` has been opened by any char */
+
+    const flush = () => {
+      if (started) {
+        out.push(current);
+        current = "";
+        started = false;
+      }
+    };
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (escaped) {
+        current += ch;
+        started = true;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (inSingle) {
+        if (ch === "'") { inSingle = false; continue; }
+        current += ch;
+        started = true;
+        continue;
+      }
+      if (inDouble) {
+        if (ch === "\"") { inDouble = false; continue; }
+        current += ch;
+        started = true;
+        continue;
+      }
+      if (ch === "'") { inSingle = true; started = true; continue; }
+      if (ch === "\"") { inDouble = true; started = true; continue; }
+      if (/\s/.test(ch)) { flush(); continue; }
+      current += ch;
+      started = true;
     }
+    flush();
     return out;
   }
 

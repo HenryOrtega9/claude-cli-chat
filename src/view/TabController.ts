@@ -78,6 +78,20 @@ export class TabController {
      ask the view to create a new tab branching from a given message id. */
   onForkRequest?: (sourceTab: TabController, messageId: string) => void;
 
+  /* Set to true while teardownSession() is executing so re-entrant callers
+     (e.g. an onExit firing mid-dispose) don't double-dispose. */
+  private tearingDown = false;
+
+  /* Tracks whether handleError has already pushed an error bubble for the
+     current pass. onError and onExit can both fire for the same failure
+     (spawn-error path → onError, then exit code 1 → onExit). Reset in
+     teardownSession() and at the top of submit(). */
+  private errorBubbleEmitted = false;
+
+  /* Resolves when the initial replayMessages() pass finishes. submit() awaits
+     this before mutating state to avoid racing the renderer's catch-up. */
+  private replayDone: Promise<void>;
+
   constructor(
     plugin: ClaudeChatPlugin,
     parent: HTMLElement,
@@ -153,6 +167,7 @@ export class TabController {
         onMentionQuery: query => this.queryFileSuggestions(query),
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
+        onSelectionDismissed: () => this.selectionTracker?.clear(),
       },
       {
         model: (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel,
@@ -189,7 +204,13 @@ export class TabController {
       this.inputBox.setSelection(sel);
     });
 
-    void this.replayMessages();
+    /* Disable the input until replay finishes so users can't fire a submit
+       that races the renderer's catch-up pass. setBusy(false) re-enables it
+       once replay resolves. */
+    this.inputBox.setBusy(true);
+    this.replayDone = this.replayMessages().finally(() => {
+      if (!this.state.busy) this.inputBox.setBusy(false);
+    });
     this.updateWelcomeVisibility();
   }
 
@@ -197,20 +218,19 @@ export class TabController {
   hide() { this.root.style.display = "none"; }
   async destroy(): Promise<void> {
     /* Unregister BEFORE disposing so the manager's onExit callback doesn't
-       race against our own teardown. The dispose() promises we await below
-       guarantee the SIGTERM has been sent and the process has exited (or
-       been SIGKILLed after the 1.5-2s timeout). */
+       race against our own teardown. teardownSession() awaits SIGTERM and
+       the eventual process-exit. */
     if (this.remoteSession) this.plugin.subprocessManager.unregisterRemote(this.state.id);
-    const work: Promise<void>[] = [];
-    if (this.session) work.push(this.session.dispose());
-    if (this.remoteSession) work.push(this.remoteSession.dispose());
-    this.jsonlTailer?.stop();
+    await this.teardownSession("destroy");
+    const remoteWork = this.remoteSession ? [this.remoteSession.dispose()] : [];
+    const tailerWork = this.jsonlTailer ? [this.jsonlTailer.stop()] : [];
     this.statusIndicator.destroy();
     this.activeFileIndicator.destroy();
     this.selectionTracker.destroy();
     this.renderer.destroy();
+    this.inputBox.destroy();
     this.root.remove();
-    await Promise.all(work);
+    await Promise.all([...remoteWork, ...tailerWork]);
   }
 
   async switchMode(mode: TabMode): Promise<void> {
@@ -220,17 +240,14 @@ export class TabController {
 
     /* Tear down whatever is currently active. */
     if (this.mode === "local") {
-      if (this.session) {
-        await this.session.dispose();
-        this.session = null;
-      }
+      await this.teardownSession("switch");
     } else {
       if (this.remoteSession) {
         this.plugin.subprocessManager.unregisterRemote(this.state.id);
         await this.remoteSession.dispose();
         this.remoteSession = null;
       }
-      this.jsonlTailer?.stop();
+      await this.jsonlTailer?.stop();
       this.jsonlTailer = null;
       this.pairingCard.hide();
     }
@@ -244,6 +261,41 @@ export class TabController {
     /* Local mode is lazy: ensureSession() fires on next submit. */
 
     this.onStateChangeCb();
+  }
+
+  /* Consolidated subprocess teardown. Five call sites (cancel/restart/clear/
+     switch/destroy) all used to duplicate roughly the same dispose-then-null
+     sequence with subtle differences; centralizing them prevents drift and
+     lets a single re-entrancy guard cover them all.
+     - sets `tearingDown` so re-entrant onExit handlers see in-progress state
+     - awaits session.dispose() in try/finally so `this.session` is always nulled
+     - clears stream pointers and pass timing
+     - resets busy (except for "switch", which hands off to the next mode)
+     - dismisses visible approval cards for user-driven teardowns
+     - clears the errorBubbleEmitted dedup flag */
+  private async teardownSession(reason: "cancel" | "restart" | "clear" | "switch" | "destroy"): Promise<void> {
+    if (this.tearingDown) return;
+    this.tearingDown = true;
+    try {
+      const s = this.session;
+      this.session = null;
+      if (s) {
+        try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
+      }
+      this.clearStreamingPointer();
+      this.streamingBlocks.clear();
+      this.passStartedAt = null;
+      this.errorBubbleEmitted = false;
+      if (reason !== "switch") {
+        this.state.busy = false;
+        this.inputBox.setBusy(false);
+      }
+      if (reason === "cancel" || reason === "clear" || reason === "destroy") {
+        this.approvalArea.dismissAll();
+      }
+    } finally {
+      this.tearingDown = false;
+    }
   }
 
   private startRemoteMode() {
@@ -286,7 +338,12 @@ export class TabController {
     if (this.jsonlTailer) return;
     this.jsonlTailer = new JsonlTailer(path);
     this.jsonlTailer.onEvent(e => void this.onEvent(e));
-    void this.jsonlTailer.start();
+    /* Surface start failures (file missing, EACCES, etc.) into the chat
+       instead of letting them die as an unhandled promise rejection. */
+    this.jsonlTailer.start().catch(err => {
+      console.warn(`[claude-cli-chat] jsonlTailer.start failed:`, err);
+      void this.handleError({ type: "error", subtype: "tailer_start_error", message: String(err) } as ErrorEvent);
+    });
   }
 
   hasPendingApprovals(): boolean { return this.state.pendingApprovals.size > 0; }
@@ -317,7 +374,15 @@ export class TabController {
     input.focus();
     input.select();
 
+    /* Sentinel guards against Enter + blur double-commit: pressing Enter
+       triggers commit AND a blur (since the input is replaced), which
+       without this would fire commit() twice and re-replace the already-
+       replaced element. Cancel sets the flag too so the trailing blur is
+       a no-op. */
+    let committed = false;
     const commit = () => {
+      if (committed) return;
+      committed = true;
       const value = input.value.trim();
       this.state.title = value || "New chat";
       this.state.updatedAt = Date.now();
@@ -326,6 +391,8 @@ export class TabController {
       this.onStateChangeCb();
     };
     const cancel = () => {
+      if (committed) return;
+      committed = true;
       input.replaceWith(this.titleTextEl);
       this.refreshTitleBar();
     };
@@ -348,7 +415,7 @@ export class TabController {
     const [head] = trimmed.toLowerCase().split(/\s+/);
     switch (head) {
       case "/clear":
-        this.clear();
+        void this.clear();
         new Notice("Cleared chat — next message starts a new Claude session.");
         return true;
       case "/help": {
@@ -380,16 +447,12 @@ export class TabController {
   /* Resets the active tab in place: kills the subprocess, wipes messages and
      session id, restores the welcome screen. The tab id is preserved so disk
      persistence and the tab bar position stay stable. */
-  clear() {
-    if (this.session) {
-      void this.session.dispose();
-      this.session = null;
-    }
+  async clear() {
+    await this.teardownSession("clear");
     this.state.messages = [];
     this.state.pendingApprovals.clear();
     this.state.sessionId = null;
     this.state.title = "New chat";
-    this.state.busy = false;
     this.state.updatedAt = Date.now();
     /* Drop cached skill / slash lists so the suggestion popup doesn't
        advertise commands until the new subprocess re-announces them. */
@@ -398,13 +461,8 @@ export class TabController {
     this.titleGenerationStarted = false;
     this.refreshTitleBar();
     this.toolToMessage.clear();
-    this.clearStreamingPointer();
-    this.streamingBlocks.clear();
-    this.passStartedAt = null;
     this.renderer.reset();
-    this.approvalArea.clear();
     this.statusIndicator.hide();
-    this.inputBox.setBusy(false);
     this.inputBox.setUsage(undefined);
     this.inputBox.setActiveSubModel(undefined);
     this.updateWelcomeVisibility();
@@ -417,22 +475,21 @@ export class TabController {
   async cancelStream() {
     if (!this.state.busy) return;
     this.userCancelInitiated = true;
-    if (this.session) {
-      await this.session.dispose();
-      this.session = null;
+    /* Best-effort deny any pending approvals so the CLI doesn't sit waiting
+       for a response we'll never send. Ignore individual errors — the
+       subprocess may already be gone. */
+    for (const requestId of Array.from(this.state.pendingApprovals.keys())) {
+      try {
+        this.session?.deny(requestId, "User cancelled");
+      } catch { /* ignore — best-effort */ }
     }
+    this.state.pendingApprovals.clear();
     if (this.remoteSession) {
       await this.remoteSession.dispose();
       this.remoteSession = null;
     }
-    this.state.pendingApprovals.clear();
-    this.clearStreamingPointer();
-    this.streamingBlocks.clear();
-    this.passStartedAt = null;
-    this.state.busy = false;
+    await this.teardownSession("cancel");
     this.statusIndicator.hide();
-    this.approvalArea.clear();
-    this.inputBox.setBusy(false);
     new Notice("Stopped Claude.");
     this.onStateChangeCb();
   }
@@ -487,8 +544,7 @@ export class TabController {
   private lastStderr = "";
 
   private restartSubprocess() {
-    if (this.session) void this.session.dispose();
-    this.session = null;
+    void this.teardownSession("restart");
     this.lastStderr = "";
   }
 
@@ -543,6 +599,17 @@ export class TabController {
   private async submit(payload: SubmitPayload) {
     let { text } = payload;
     const { attachments, selection } = payload;
+
+    /* Block until the constructor's replay pass has fully rendered the
+       restored messages — otherwise our state.messages.push() races the
+       renderer's catch-up loop. */
+    await this.replayDone;
+
+    /* Reset per-pass dedup flags so a new submit can emit a fresh error
+     bubble and so any lingering cancel intent from a previous interaction
+     doesn't suppress the new turn's events. */
+    this.errorBubbleEmitted = false;
+    this.userCancelInitiated = false;
 
     /* Plugin-side slash commands. Claude Code's stream-json mode does NOT
        intercept slash commands — they get sent to the model as plain text.
@@ -735,7 +802,9 @@ export class TabController {
     const text = textBlocks.map(b => b.text).join("");
     if (!text) return;
     const last = [...this.state.messages].reverse().find(m => m.role === "user");
-    if (last && last.content === text) return;
+    /* Compare trimmed so an echo that adds/strips trailing whitespace doesn't
+       cause a duplicate bubble. */
+    if (last && last.content.trim() === text.trim()) return;
     const msg: ChatMessage = {
       id: makeMessageId(),
       role: "user",
@@ -749,6 +818,7 @@ export class TabController {
   }
 
   private async handleStreamEvent(event: StreamEventEvent) {
+    if (this.userCancelInitiated) return;
     const inner = event.event;
 
     if (inner.type === "content_block_start") {
@@ -799,7 +869,14 @@ export class TabController {
              If JSON is incomplete this throws — silently ignore until it parses. */
           try {
             const parsed = JSON.parse(slot.partialJson);
-            const msg = this.state.messages.find(m => m.toolCalls?.some(t => t.id === slot.toolId));
+            /* Resolve the owning message via toolToMessage first — that map
+               is the authoritative registry of which message owns each
+               tool_use_id (handled at content_block_start / handleToolUse).
+               Fall back to scanning state.messages for legacy compat in case
+               we somehow received deltas before the start event. */
+            const ownerId = this.toolToMessage.get(slot.toolId);
+            let msg = ownerId ? this.state.messages.find(m => m.id === ownerId) : undefined;
+            if (!msg) msg = this.state.messages.find(m => m.toolCalls?.some(t => t.id === slot.toolId));
             const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
             if (tool) {
               tool.input = parsed;
@@ -819,6 +896,11 @@ export class TabController {
         await this.renderer.upsertMessage(msg);
       }
       this.streamingBlocks.delete(inner.index);
+      /* If a tool block is still streaming after this text/thinking block
+         finishes, re-arm the gerund spinner — the user is still waiting on
+         the model and tool deltas don't fire the indicator on their own. */
+      const stillToolRunning = Array.from(this.streamingBlocks.values()).some(s => s.kind === "tool");
+      if (stillToolRunning) this.statusIndicator.setThinking();
       return;
     }
 
@@ -829,6 +911,7 @@ export class TabController {
   }
 
   private async handleAssistant(event: AssistantEvent) {
+    if (this.userCancelInitiated) return;
     const msg = this.getOrCreateStreamingAssistantMessage();
     const blocks = (event.message.content ?? []) as AssistantContentBlock[];
 
@@ -882,14 +965,19 @@ export class TabController {
     await this.renderer.upsertMessage(msg);
 
     /* After a final assistant message, future deltas belong to a new bubble.
-       Reset the pass anchor so the next pass (e.g. after a tool round-trip)
-       measures its own duration cleanly. */
+       Null out passStartedAt rather than restamping to Date.now(): the old
+       code re-anchored here, which on a multi-pass tool turn caused the
+       NEXT pass's timer to include the entire tool-execution wait (since
+       no other event reset it before the next content_block_start). Nulling
+       lets getOrCreateStreamingAssistantMessage() anchor a fresh timer
+       when the next pass actually begins streaming. */
     this.clearStreamingPointer();
     this.streamingBlocks.clear();
-    this.passStartedAt = Date.now();
+    this.passStartedAt = null;
   }
 
   private async handleToolUse(event: ToolUseEvent) {
+    if (this.userCancelInitiated) return;
     const msg = this.getOrCreateStreamingAssistantMessage();
     msg.toolCalls = msg.toolCalls ?? [];
     const tool: ToolCall = {
@@ -904,6 +992,7 @@ export class TabController {
   }
 
   private async handleToolResult(event: ToolResultEvent) {
+    if (this.userCancelInitiated) return;
     const msgId = this.toolToMessage.get(event.tool_use_id);
     if (!msgId) return;
     const msg = this.state.messages.find(m => m.id === msgId);
@@ -917,6 +1006,7 @@ export class TabController {
   }
 
   private handleControlRequest(event: ControlRequestEvent) {
+    if (this.userCancelInitiated) return;
     const approval: PendingApproval = {
       requestId: event.request_id,
       toolName: event.request.tool_name,
@@ -984,6 +1074,12 @@ export class TabController {
   }
 
   private async handleError(event: ErrorEvent) {
+    /* Dedup: onError (spawn failure) followed by onExit (non-zero exit code)
+       used to push two error bubbles for the same underlying failure. The
+       first call sets the flag; subsequent calls in the same pass no-op. */
+    if (this.errorBubbleEmitted) return;
+    this.errorBubbleEmitted = true;
+
     const errorMsg: ChatMessage = {
       id: makeMessageId(),
       role: "assistant",
@@ -991,6 +1087,12 @@ export class TabController {
       timestamp: Date.now(),
     };
     this.state.messages.push(errorMsg);
+    /* ErrorEvent has no `isFatal` field today (see src/claude/Events.ts).
+       TODO(bugfix-sweep): mid-stream non-fatal errors (transient API retries,
+       partial decode failures) should NOT release busy — they should let the
+       stream continue. Today, every error event clears busy because we have
+       no way to distinguish. Once Agent D plumbs an isFatal/transient hint
+       through ErrorEvent, gate the busy-clear on it. */
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
@@ -998,9 +1100,14 @@ export class TabController {
   }
 
   private handleApproval(requestId: string, decision: ApprovalDecision) {
+    if (this.userCancelInitiated) return;
     const approval = this.state.pendingApprovals.get(requestId);
-    this.state.pendingApprovals.delete(requestId);
+    /* Order matters: bail if there's no session BEFORE removing the
+       pendingApprovals entry. Otherwise a user-click during a teardown
+       race silently drops the approval, the card is already gone via
+       dismiss(), and the user has no way to redrive it. */
     if (!this.session) return;
+    this.state.pendingApprovals.delete(requestId);
     if (decision.allowed) {
       /* Pass the original input from the request — the SDK requires
          `updatedInput` even when we're not modifying anything. */
@@ -1083,6 +1190,14 @@ export class TabController {
     };
     this.state.messages.push(msg);
     this.streamingAssistantMessageId = msg.id;
+    /* Anchor a new pass's wall-clock timer here — the first time we mint a
+       fresh streaming bubble after clearStreamingPointer(). For the very
+       first pass of a turn, submit() already set passStartedAt at the same
+       Date.now() moment, so this is a benign overwrite. For subsequent
+       passes after a tool round-trip, this is the correct anchor: it
+       excludes the tool-execution wait from the assistant's "Thought for"
+       elapsed time. */
+    if (this.passStartedAt === null) this.passStartedAt = Date.now();
     return msg;
   }
 

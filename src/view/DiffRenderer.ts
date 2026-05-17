@@ -31,13 +31,27 @@ export type DiffRenderOptions = {
   numbered?: boolean;
 };
 
+/* Hard ceiling on diff lines rendered per call so a giant MultiEdit doesn't
+   freeze the chat with a 50k-row diff block. Applied across the entire
+   collection of ops (not per-op) so MultiEdit hunks share the budget. */
+const MAX_LINES = 200;
+
 /* Renders one or more edit ops as a unified diff block inside `target`. */
 export function renderDiff(target: HTMLElement, ops: EditOp[], opts: DiffRenderOptions = {}): HTMLElement {
   const wrap = target.createDiv({ cls: "claudian-diff" });
   if (opts.filePath) {
     wrap.createDiv({ cls: "claudian-diff-file", text: opts.filePath });
   }
+  /* Walk ops + their lines once first to know the total line budget;
+     subsequent rendering stops when we hit MAX_LINES and appends a single
+     truncation note. */
+  let totalLines = 0;
+  for (const op of ops) totalLines += diffLinesFromEdit(op).length;
+
+  let rendered = 0;
+  let truncated = false;
   ops.forEach((op, i) => {
+    if (truncated) return;
     if (opts.numbered) {
       wrap.createDiv({ cls: "claudian-diff-hunk-label", text: `Hunk ${i + 1}${op.replaceAll ? " · replace all" : ""}` });
     } else if (op.replaceAll) {
@@ -45,11 +59,20 @@ export function renderDiff(target: HTMLElement, ops: EditOp[], opts: DiffRenderO
     }
     const block = wrap.createDiv({ cls: "claudian-diff-block" });
     for (const line of diffLinesFromEdit(op)) {
+      if (rendered >= MAX_LINES) { truncated = true; break; }
       const row = block.createDiv({ cls: `claudian-diff-line claudian-diff-${line.kind}` });
       row.createSpan({ cls: "claudian-diff-marker", text: line.kind === "del" ? "−" : line.kind === "add" ? "+" : " " });
       row.createSpan({ cls: "claudian-diff-text", text: line.text });
+      rendered++;
     }
   });
+  if (truncated) {
+    const remaining = totalLines - rendered;
+    wrap.createDiv({
+      cls: "claudian-diff-truncated",
+      text: `… ${remaining} more line${remaining === 1 ? "" : "s"} (showing first ${MAX_LINES})`,
+    });
+  }
   return wrap;
 }
 

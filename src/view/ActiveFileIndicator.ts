@@ -23,6 +23,8 @@ export class ActiveFileIndicator {
   private pinnedPaths: Set<string>;
   private currentActiveFile: TFile | null = null;
   private eventRef: EventRef | null = null;
+  private deleteRef: EventRef | null = null;
+  private renameRef: EventRef | null = null;
   /* Per-path pill element cache. Surgical class updates against these
      existing elements (instead of empty()+recreate) preserve click handlers
      across refreshes, so an in-flight click can't be lost to a concurrent
@@ -50,12 +52,47 @@ export class ActiveFileIndicator {
       if (leaf?.view.getViewType() === VIEW_TYPE_CLAUDE_CHAT) return;
       this.refresh();
     });
+
+    /* When a pinned file is deleted or renamed outside this view, the
+       persisted path becomes a phantom: clicking the pill would resolve to a
+       missing file, and the pill keeps rendering as if nothing happened.
+       Drop the path on delete and rewrite it on rename so the pill bar always
+       reflects vault truth. Persist via the same onPinChange callback the
+       click handler uses so the controller's saved state stays in sync. */
+    this.deleteRef = this.app.vault.on("delete", (file) => {
+      if (!this.pinnedPaths.has(file.path)) return;
+      this.pinnedPaths.delete(file.path);
+      this.renderPills();
+      this.callbacks.onPinChange([...this.pinnedPaths]);
+    });
+    this.renameRef = this.app.vault.on("rename", (file, oldPath) => {
+      if (!this.pinnedPaths.has(oldPath)) return;
+      this.pinnedPaths.delete(oldPath);
+      this.pinnedPaths.add(file.path);
+      /* Drop the cached pill element keyed by the old path so renderPills
+         creates a fresh one with the new label and click handler. */
+      const stale = this.pillElements.get(oldPath);
+      if (stale) {
+        stale.remove();
+        this.pillElements.delete(oldPath);
+      }
+      this.renderPills();
+      this.callbacks.onPinChange([...this.pinnedPaths]);
+    });
   }
 
   destroy() {
     if (this.eventRef) {
       this.app.workspace.offref(this.eventRef);
       this.eventRef = null;
+    }
+    if (this.deleteRef) {
+      this.app.vault.offref(this.deleteRef);
+      this.deleteRef = null;
+    }
+    if (this.renameRef) {
+      this.app.vault.offref(this.renameRef);
+      this.renameRef = null;
     }
     this.root.remove();
   }

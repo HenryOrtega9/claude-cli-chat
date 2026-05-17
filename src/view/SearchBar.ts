@@ -11,6 +11,13 @@ export class SearchBar {
   private marks: HTMLElement[] = [];
   private activeIndex = 0;
   private visible = false;
+  /* Streaming renders blow away the message DOM (and thus our <mark> nodes)
+     while the search bar is open. Watch the container for mutations and
+     re-run refreshMatches() to re-wrap matches against the new DOM. Debounced
+     so a burst of deltas during a streaming token storm doesn't cause one
+     refresh per character. */
+  private mutationObserver: MutationObserver | null = null;
+  private refreshDebounceTimer: number | null = null;
 
   constructor(parent: HTMLElement, messagesContainer: HTMLElement) {
     this.messagesContainer = messagesContainer;
@@ -54,15 +61,63 @@ export class SearchBar {
     this.input.value = "";
     this.input.focus();
     this.refreshMatches();
+    this.attachMutationObserver();
   }
 
   close() {
     this.root.style.display = "none";
     this.visible = false;
+    this.detachMutationObserver();
     this.clearMarks();
   }
 
   isOpen(): boolean { return this.visible; }
+
+  /* Subscribe to DOM mutations inside the messages container so streaming
+     re-renders that wipe our marks trigger an automatic re-highlight. Skips
+     mutations that only touched <mark> nodes (those are our own work — the
+     wrap/unwrap operations would otherwise feed back into us). */
+  private attachMutationObserver() {
+    if (typeof MutationObserver === "undefined") return;
+    if (this.mutationObserver) return;
+    this.mutationObserver = new MutationObserver((mutations) => {
+      let shouldRefresh = false;
+      for (const m of mutations) {
+        const onlyMarks = (nodes: NodeList) => {
+          for (const n of Array.from(nodes)) {
+            if (n.nodeType === Node.ELEMENT_NODE && (n as HTMLElement).tagName === "MARK") continue;
+            if (n.nodeType === Node.TEXT_NODE) {
+              const parent = (n as Text).parentElement;
+              if (parent && parent.tagName === "MARK") continue;
+            }
+            return false;
+          }
+          return true;
+        };
+        if (m.type === "childList" && onlyMarks(m.addedNodes) && onlyMarks(m.removedNodes)) continue;
+        shouldRefresh = true;
+        break;
+      }
+      if (!shouldRefresh) return;
+      if (this.refreshDebounceTimer !== null) window.clearTimeout(this.refreshDebounceTimer);
+      this.refreshDebounceTimer = window.setTimeout(() => {
+        this.refreshDebounceTimer = null;
+        if (this.visible) this.refreshMatches();
+      }, 50);
+    });
+    this.mutationObserver.observe(this.messagesContainer, { childList: true, subtree: true, characterData: true });
+  }
+
+  private detachMutationObserver() {
+    if (this.mutationObserver) {
+      this.mutationObserver.disconnect();
+      this.mutationObserver = null;
+    }
+    if (this.refreshDebounceTimer !== null) {
+      window.clearTimeout(this.refreshDebounceTimer);
+      this.refreshDebounceTimer = null;
+    }
+  }
 
   private refreshMatches() {
     this.clearMarks();
@@ -161,5 +216,19 @@ export class SearchBar {
     }
     this.marks = [];
     this.activeIndex = 0;
+    /* Final sweep: any <mark.claudian-search-mark> that escaped tracking
+       (parent was detached mid-flight, MutationObserver replaced subtree, etc.)
+       gets unwrapped now so stale highlights don't survive a close/reopen. */
+    const strays = this.messagesContainer.querySelectorAll<HTMLElement>("mark.claudian-search-mark");
+    const strayParents = new Set<Node>();
+    for (const stray of Array.from(strays)) {
+      const parent = stray.parentNode;
+      if (!parent) continue;
+      parent.replaceChild(document.createTextNode(stray.textContent ?? ""), stray);
+      strayParents.add(parent);
+    }
+    for (const p of strayParents) {
+      if (p instanceof HTMLElement) p.normalize();
+    }
   }
 }

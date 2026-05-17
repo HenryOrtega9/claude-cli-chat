@@ -1,4 +1,5 @@
-import type { App } from "obsidian";
+import { Notice, type App } from "obsidian";
+import { writeJsonAtomic } from "../mcp/MCPConfig";
 
 /* Schema mirrors Claude Code's <vault>/.claude/settings.json `permissions`
    block. Unknown top-level keys ($schema, enabledPlugins, hooks, env, etc.)
@@ -53,6 +54,11 @@ export const RECOMMENDED_ALLOW_PATTERNS: string[] = [
 ];
 
 export class PermissionsConfigStore {
+  /* Serializes load-mutate-save operations so concurrent add/remove calls
+     don't race on the shared settings.json. Each mutator chains onto this
+     promise; readers stay lock-free since stale reads are tolerable. */
+  private writeChain: Promise<void> = Promise.resolve();
+
   constructor(private app: App) {}
 
   private async ensureDir(): Promise<void> {
@@ -63,56 +69,99 @@ export class PermissionsConfigStore {
   async load(): Promise<SettingsJsonFile> {
     const adapter = this.app.vault.adapter;
     if (!(await adapter.exists(SETTINGS_JSON_PATH))) return {};
+    const text = await adapter.read(SETTINGS_JSON_PATH);
     try {
-      return JSON.parse(await adapter.read(SETTINGS_JSON_PATH)) as SettingsJsonFile;
+      const parsed = JSON.parse(text) as unknown;
+      if (!parsed || typeof parsed !== "object") return {};
+      const cfg = parsed as SettingsJsonFile;
+      /* Defensive normalization: permissions may be present-but-null (user
+         hand-edit) or `allow` may be a string/null instead of an array.
+         Treat any non-array allow as empty; it will be overwritten on the
+         next save so we don't silently drop a bad shape forever. */
+      if (cfg.permissions === null || cfg.permissions === undefined) {
+        /* leave as undefined; callers default it */
+      } else if (typeof cfg.permissions === "object") {
+        const allow = (cfg.permissions as PermissionsBlock).allow;
+        if (!Array.isArray(allow)) {
+          (cfg.permissions as PermissionsBlock).allow = [];
+        }
+      }
+      return cfg;
     } catch {
-      /* Malformed file — return empty so the UI lets the user re-author
-         rather than blocking. The user can still hand-fix the file. */
+      /* Rotate corrupted file to .bak so user can recover hand-edits, then
+         return defaults so the UI doesn't block. Surface a Notice so the
+         user knows their edits got rejected. */
+      const bak = `${SETTINGS_JSON_PATH}.bak`;
+      try {
+        await adapter.write(bak, text);
+        new Notice(`Could not parse ${SETTINGS_JSON_PATH}; backup saved to ${bak}`);
+      } catch {
+        new Notice(`Could not parse ${SETTINGS_JSON_PATH}; backup write also failed`);
+      }
       return {};
     }
   }
 
   async save(config: SettingsJsonFile): Promise<void> {
     await this.ensureDir();
-    await this.app.vault.adapter.write(SETTINGS_JSON_PATH, JSON.stringify(config, null, 2));
+    await writeJsonAtomic(this.app.vault.adapter, SETTINGS_JSON_PATH, config);
   }
 
   async listAllow(): Promise<string[]> {
     const cfg = await this.load();
-    return cfg.permissions?.allow ?? [];
+    const allow = cfg.permissions?.allow;
+    return Array.isArray(allow) ? allow : [];
   }
 
-  async addAllow(pattern: string): Promise<boolean> {
+  addAllow(pattern: string): Promise<boolean> {
     const trimmed = pattern.trim();
-    if (!trimmed) return false;
-    const cfg = await this.load();
-    if (!cfg.permissions) cfg.permissions = {};
-    if (!cfg.permissions.allow) cfg.permissions.allow = [];
-    if (cfg.permissions.allow.includes(trimmed)) return false;
-    cfg.permissions.allow.push(trimmed);
-    await this.save(cfg);
-    return true;
+    if (!trimmed) return Promise.resolve(false);
+    /* Chain onto writeChain so concurrent calls don't clobber each other.
+       Capture the resolved value via a sentinel so the outer promise can
+       still return boolean. */
+    let result = false;
+    const next = this.writeChain.then(async () => {
+      const cfg = await this.load();
+      if (!cfg.permissions) cfg.permissions = {};
+      if (!Array.isArray(cfg.permissions.allow)) cfg.permissions.allow = [];
+      if (cfg.permissions.allow.includes(trimmed)) { result = false; return; }
+      cfg.permissions.allow.push(trimmed);
+      await this.save(cfg);
+      result = true;
+    });
+    /* Swallow rejections on the chain so one failed write doesn't poison
+       all future writes; surface them to the caller via the returned promise. */
+    this.writeChain = next.catch(() => undefined);
+    return next.then(() => result);
   }
 
-  async addAllowMany(patterns: string[]): Promise<number> {
-    const cfg = await this.load();
-    if (!cfg.permissions) cfg.permissions = {};
-    if (!cfg.permissions.allow) cfg.permissions.allow = [];
+  addAllowMany(patterns: string[]): Promise<number> {
     let added = 0;
-    for (const raw of patterns) {
-      const p = raw.trim();
-      if (!p || cfg.permissions.allow.includes(p)) continue;
-      cfg.permissions.allow.push(p);
-      added++;
-    }
-    if (added > 0) await this.save(cfg);
-    return added;
+    const next = this.writeChain.then(async () => {
+      const cfg = await this.load();
+      if (!cfg.permissions) cfg.permissions = {};
+      if (!Array.isArray(cfg.permissions.allow)) cfg.permissions.allow = [];
+      for (const raw of patterns) {
+        const p = raw.trim();
+        if (!p || cfg.permissions.allow.includes(p)) continue;
+        cfg.permissions.allow.push(p);
+        added++;
+      }
+      if (added > 0) await this.save(cfg);
+    });
+    this.writeChain = next.catch(() => undefined);
+    return next.then(() => added);
   }
 
-  async removeAllow(pattern: string): Promise<void> {
-    const cfg = await this.load();
-    if (!cfg.permissions?.allow) return;
-    cfg.permissions.allow = cfg.permissions.allow.filter(p => p !== pattern);
-    await this.save(cfg);
+  removeAllow(pattern: string): Promise<void> {
+    const next = this.writeChain.then(async () => {
+      const cfg = await this.load();
+      const allow = cfg.permissions?.allow;
+      if (!Array.isArray(allow)) return;
+      cfg.permissions!.allow = allow.filter(p => p !== pattern);
+      await this.save(cfg);
+    });
+    this.writeChain = next.catch(() => undefined);
+    return next;
   }
 }

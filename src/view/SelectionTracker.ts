@@ -25,6 +25,11 @@ export class SelectionTracker {
   private workspaceRef: EventRef | null = null;
   private selectionListener: (() => void) | null = null;
   private refreshScheduled = false;
+  /* Timestamp of the last explicit clear(). A microtask refresh queued just
+     before clear() lands will still fire after it; without this guard, that
+     refresh re-emits the same selection and the chip the user just dismissed
+     immediately reappears. Refreshes within 100ms of a clear are dropped. */
+  private clearedAt = 0;
 
   constructor(app: App, onChange: (sel: ActiveSelection | null) => void) {
     this.app = app;
@@ -69,6 +74,7 @@ export class SelectionTracker {
   /* Force-clear the tracked selection — used after the user dismisses the
      chip manually or after a submit consumed it. */
   clear() {
+    this.clearedAt = Date.now();
     if (this.current !== null) {
       this.current = null;
       this.onChange(null);
@@ -76,6 +82,11 @@ export class SelectionTracker {
   }
 
   private refresh() {
+    /* Drop refreshes scheduled around a clear() — the underlying editor
+       selection is still live, so a refresh here would re-emit it and undo
+       the user's dismissal. 100ms covers the microtask-coalesced batch plus
+       any selectionchange that fires as Obsidian processes the click. */
+    if (Date.now() - this.clearedAt < 100) return;
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     /* No markdown view in the workspace's active leaf usually means the
        user moved focus to our chat textarea (or to a non-markdown view).
