@@ -435,6 +435,11 @@ export class MessageListRenderer {
         this.wireInternalLinks(block);
       }
       if (msg.durationMs !== undefined && !msg.streaming && this.passHasVisibleContent(msg)) {
+        /* Idempotent: concurrent upserts can both cross the MarkdownRenderer
+           await above, and the later el.empty() only wipes pre-await DOM.
+           Drop any prior footer before appending so the second arrival
+           replaces instead of stacks. */
+        el.querySelector(":scope > .claudian-thought-duration")?.remove();
         el.createDiv({ cls: "claudian-thought-duration", text: `Thought for ${this.formatDuration(msg.durationMs)}` });
       }
     }
