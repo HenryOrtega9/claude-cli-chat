@@ -8,6 +8,22 @@ import {
 } from "./permissions/PermissionsConfig";
 import { findRemoteControlPids } from "./claude/SubprocessManager";
 
+/* Per-control debounce helper used to coalesce rapid text-input keystrokes
+   into a single saveSettings() call. The synchronous in-memory state is
+   still updated immediately by the caller — only the disk write is
+   debounced. 250ms feels instant to the user but absorbs a fast typist's
+   keystroke train into one write. */
+function debounced<A extends unknown[]>(fn: (...args: A) => void, ms: number): (...args: A) => void {
+  let handle: ReturnType<typeof setTimeout> | null = null;
+  return (...args: A) => {
+    if (handle) clearTimeout(handle);
+    handle = setTimeout(() => {
+      handle = null;
+      fn(...args);
+    }, ms);
+  };
+}
+
 /* Model IDs use the `[1m]` suffix to enable Claude's 1M-context window
    for Opus and Sonnet, matching Claudian's `enableOpus1M`/`enableSonnet1M`
    behavior. Haiku does not support 1M context, so it stays unsuffixed.
@@ -151,7 +167,14 @@ export function resolveModelId(key: ModelKey): string {
   return MODEL_IDS[key];
 }
 
+/* Module-scoped caches so the settings tab's display() call (re-run on
+   every render) doesn't re-fork a child process for the autodetect helpers
+   on every paint. Reset implicitly on plugin reload via module re-eval. */
+let cachedClaudePath: string | null = null;
+let cachedUserName: string | null = null;
+
 export function autodetectClaudePath(): string {
+  if (cachedClaudePath !== null) return cachedClaudePath;
   const candidates = [
     `${process.env.HOME}/.local/bin/claude`,
     "/usr/local/bin/claude",
@@ -159,13 +182,19 @@ export function autodetectClaudePath(): string {
     `${process.env.HOME}/.npm-global/bin/claude`,
   ];
   for (const p of candidates) {
-    if (existsSync(p)) return p;
+    if (existsSync(p)) {
+      cachedClaudePath = p;
+      return p;
+    }
   }
   try {
-    return execSync("command -v claude", { encoding: "utf8" }).trim();
+    /* 3s timeout matches autodetectUserName's bound so a stuck PATH lookup
+       can't freeze the settings tab. */
+    cachedClaudePath = execSync("command -v claude", { encoding: "utf8", timeout: 3000 }).trim();
   } catch {
-    return "";
+    cachedClaudePath = "";
   }
+  return cachedClaudePath;
 }
 
 /* Autodetect the user's display name on first install. macOS `dscl` returns
@@ -173,16 +202,21 @@ export function autodetectClaudePath(): string {
    fails, fall back to capitalizing the shell username. The user can override
    anytime in plugin settings. */
 export function autodetectUserName(): string {
+  if (cachedUserName !== null) return cachedUserName;
   try {
     const out = execSync("dscl . -read /Users/$USER RealName 2>/dev/null | sed -n 's/^ //p' | tail -1", {
       encoding: "utf8",
       timeout: 1000,
       shell: "/bin/sh",
     }).trim();
-    if (out) return out;
+    if (out) {
+      cachedUserName = out;
+      return out;
+    }
   } catch { /* ignore */ }
   const u = process.env.USER ?? "";
-  return u ? u.charAt(0).toUpperCase() + u.slice(1) : "";
+  cachedUserName = u ? u.charAt(0).toUpperCase() + u.slice(1) : "";
+  return cachedUserName;
 }
 
 export class ClaudeChatSettingTab extends PluginSettingTab {
@@ -204,18 +238,24 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Claude (CLI Chat)" });
 
+    const saveDebounced = debounced(() => { void this.plugin.saveSettings(); }, 250);
+
     new Setting(containerEl)
       .setName("Your name")
       .setDesc("Used in the welcome greeting (e.g., \"Hey there, Henry Ortega\").")
-      .addText(text =>
+      .addText(text => {
+        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         text
           .setPlaceholder("Henry Ortega")
           .setValue(this.plugin.settings.userName)
-          .onChange(async value => {
+          .onChange(value => {
+            /* In-memory state update is synchronous so any consumer reading
+               settings between keystrokes sees the latest value; only the
+               disk flush is debounced. */
             this.plugin.settings.userName = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+            debouncedSave();
+          });
+      });
 
     new Setting(containerEl)
       .setName("Default model")
@@ -253,12 +293,13 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       .setName("Claude CLI path")
       .setDesc("Absolute path to the `claude` binary. Leave empty to autodetect.")
       .addText(text => {
+        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         text
           .setPlaceholder(autodetectClaudePath() || "/path/to/claude")
           .setValue(this.plugin.settings.claudePath)
-          .onChange(async value => {
+          .onChange(value => {
             this.plugin.settings.claudePath = value.trim();
-            await this.plugin.saveSettings();
+            debouncedSave();
           });
       })
       .addButton(btn =>
@@ -307,11 +348,12 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       .setName("Custom system prompt")
       .setDesc("Plain text. Leave empty for none.")
       .addTextArea(t => {
+        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         t.setPlaceholder("e.g. Always cite source notes by [[wikilink]] when referencing vault content.")
           .setValue(this.plugin.settings.vaultSystemPromptAddendum)
-          .onChange(async value => {
+          .onChange(value => {
             this.plugin.settings.vaultSystemPromptAddendum = value;
-            await this.plugin.saveSettings();
+            debouncedSave();
           });
         t.inputEl.rows = 6;
         t.inputEl.style.width = "100%";
@@ -334,28 +376,30 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Title generation model")
       .setDesc("Model alias to use for auto-titling. Haiku is fast and cheap; pass any alias the CLI understands.")
-      .addText(text =>
+      .addText(text => {
+        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         text
           .setPlaceholder("haiku")
           .setValue(this.plugin.settings.titleGenerationModel)
-          .onChange(async value => {
+          .onChange(value => {
             this.plugin.settings.titleGenerationModel = value.trim() || "haiku";
-            await this.plugin.saveSettings();
-          })
-      );
+            debouncedSave();
+          });
+      });
 
     new Setting(containerEl)
       .setName("Remote Control session prefix")
       .setDesc("Optional prefix for auto-generated Remote Control session names. Defaults to your machine hostname.")
-      .addText(text =>
+      .addText(text => {
+        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         text
           .setPlaceholder("hostname")
           .setValue(this.plugin.settings.remoteSessionNamePrefix)
-          .onChange(async value => {
+          .onChange(value => {
             this.plugin.settings.remoteSessionNamePrefix = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+            debouncedSave();
+          });
+      });
 
     this.renderSnippetsSection(containerEl);
 
@@ -456,10 +500,12 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     /* Add custom pattern — text input + button. */
     let pendingPattern = "";
+    let inputEl: HTMLInputElement | null = null;
     new Setting(containerEl)
       .setName("Add custom pattern")
       .setDesc("e.g. Bash(npm test:*) or Bash(curl https://api.example.com:*) — leave empty and Enter does nothing.")
       .addText(t => {
+        inputEl = t.inputEl;
         t.setPlaceholder("Bash(your command:*)")
           .onChange(v => { pendingPattern = v; });
         t.inputEl.addEventListener("keydown", async e => {
@@ -483,6 +529,10 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
         self.allowPatternsCache = null;
         self.display();
       } else {
+        /* Duplicate — clear the input so the user can immediately try a
+           different pattern without manually wiping the stale text. */
+        if (inputEl) inputEl.value = "";
+        pendingPattern = "";
         new Notice("Already in allowlist.");
       }
     }
@@ -562,11 +612,13 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
   private renderSnippetRow(containerEl: HTMLElement, snippet: EnvSnippet) {
     const wrap = containerEl.createDiv({ cls: "claudian-snippet-editor" });
 
+    const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
+
     new Setting(wrap)
       .setName("Name")
-      .addText(t => t.setValue(snippet.name).onChange(async v => {
+      .addText(t => t.setValue(snippet.name).onChange(v => {
         snippet.name = v;
-        await this.plugin.saveSettings();
+        debouncedSave();
       }))
       .addExtraButton(btn => {
         btn.setIcon("trash-2").setTooltip("Delete snippet").onClick(async () => {
@@ -614,9 +666,9 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       .setName("System prompt addendum")
       .setDesc("Text appended to Claude's system prompt via --append-system-prompt.")
       .addTextArea(t => {
-        t.setValue(snippet.systemPromptAddendum).onChange(async v => {
+        t.setValue(snippet.systemPromptAddendum).onChange(v => {
           snippet.systemPromptAddendum = v;
-          await this.plugin.saveSettings();
+          debouncedSave();
         });
         t.inputEl.rows = 4;
         t.inputEl.style.width = "100%";

@@ -13,6 +13,11 @@ export type ApprovalCallbacks = {
 export class ApprovalArea {
   private root: HTMLElement;
   private cards = new Map<string, HTMLElement>();
+  /* Request IDs that were dismissed (via dismissAll or a direct dismiss) before
+     their show() ever landed. The SDK can emit the approval event and the
+     "request resolved" event close together; on a session cancel we may want
+     to drop the card before it's mounted. show() consults this set and skips. */
+  private preDismissed = new Set<string>();
 
   constructor(parent: HTMLElement, private callbacks: ApprovalCallbacks) {
     this.root = parent.createDiv({ cls: "claudian-approval-area" });
@@ -20,6 +25,13 @@ export class ApprovalArea {
 
   show(approval: PendingApproval) {
     if (this.cards.has(approval.requestId)) return;
+    /* If dismissAll/dismiss was called for this id before show landed,
+       respect that intent and don't mount the card at all. Clear the entry
+       so a future genuine approval for the same id can still surface. */
+    if (this.preDismissed.has(approval.requestId)) {
+      this.preDismissed.delete(approval.requestId);
+      return;
+    }
     const card = this.root.createDiv({ cls: "claudian-ask-approval-info" });
 
     const toolRow = card.createDiv({ cls: "claudian-ask-approval-tool" });
@@ -84,7 +96,13 @@ export class ApprovalArea {
 
   dismiss(requestId: string) {
     const card = this.cards.get(requestId);
-    if (!card) return;
+    if (!card) {
+      /* Auto-dismiss for a card that never made it onto the DOM yet. Stash
+         the id so the eventual show() can no-op cleanly. Bounded growth in
+         practice: each entry is consumed by show() or by dismissAll(). */
+      this.preDismissed.add(requestId);
+      return;
+    }
     card.remove();
     this.cards.delete(requestId);
   }
@@ -92,6 +110,17 @@ export class ApprovalArea {
   clear() {
     this.cards.forEach(card => card.remove());
     this.cards.clear();
+  }
+
+  /* Remove every visible card. CONTRACT (consumed by Agent C / TabController):
+     call on session cancel / tab exit to drop any pending UI without firing
+     onDecide. The optional reason is reserved for a future "(cancelled: …)"
+     toast — current implementation just tears the cards down silently.
+     Also clears the preDismissed set so a fresh session starts clean. */
+  dismissAll(_reason?: string): void {
+    for (const card of this.cards.values()) card.remove();
+    this.cards.clear();
+    this.preDismissed.clear();
   }
 
   private iconForTool(name: string): string {

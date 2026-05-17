@@ -9,6 +9,12 @@ type ConversationRow = {
 };
 
 export class HistoryModal extends Modal {
+  /* Guards against a second click landing while the first onPick is still
+     mid-flight. Without it, a user double-clicking a row (or clicking two
+     rows in quick succession) could spawn two tab-creation paths racing
+     each other, leading to an orphaned empty tab. */
+  private processing = false;
+
   constructor(
     app: App,
     private persistence: Persistence,
@@ -51,6 +57,13 @@ export class HistoryModal extends Modal {
     setIcon(openBtn, "external-link");
 
     row.addEventListener("click", () => {
+      if (this.processing) return;
+      this.processing = true;
+      /* Visually disable the whole list so the user gets feedback that the
+         click took. The modal closes synchronously below, but the underlying
+         tab creation is async — flagging here ensures a stray late click
+         can't slip through before close() tears the DOM down. */
+      row.addClass("is-disabled");
       this.onPick(conv.id);
       this.close();
     });

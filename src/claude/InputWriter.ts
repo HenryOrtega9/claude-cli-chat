@@ -7,15 +7,50 @@ import type {
 } from "./Events";
 
 /* NDJSON writer for the Claude Code subprocess's stdin. Each call serializes one JSON
-   object on its own line, matching the `--input-format stream-json` wire format. */
+   object on its own line, matching the `--input-format stream-json` wire format.
+
+   Writes are queued onto a per-instance promise chain so that concurrent
+   `send()` calls cannot interleave bytes on the underlying pipe. This
+   matters for image attachments and other payloads that exceed PIPE_BUF
+   (4KB on macOS/Linux), where the kernel no longer guarantees atomic
+   delivery of a single write(). Backpressure is also respected: if the
+   stream's internal buffer is full, we await `drain` before continuing. */
 export class InputWriter {
+  private writeChain: Promise<void> = Promise.resolve();
+
   constructor(private stdin: Writable) {}
 
   send(message: OutboundJson) {
     if (!this.stdin.writable) {
       throw new Error("Claude subprocess stdin is no longer writable");
     }
-    this.stdin.write(`${JSON.stringify(message)}\n`);
+    const payload = `${JSON.stringify(message)}\n`;
+    /* Chain the write so concurrent callers are serialized. We swallow the
+       chain's own rejection so one failed write doesn't poison the chain;
+       individual write errors still propagate via the per-write Promise. */
+    this.writeChain = this.writeChain.then(() => this.actuallyWrite(payload)).catch(() => {});
+  }
+
+  private actuallyWrite(payload: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.stdin.writable) {
+        reject(new Error("Claude subprocess stdin is no longer writable"));
+        return;
+      }
+      const ok = this.stdin.write(payload, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        if (ok) resolve();
+        /* If write() returned false, the drain handler below resolves. */
+      });
+      if (!ok) {
+        /* Stream backpressure: wait for the buffer to flush before resolving
+           so the next chained write doesn't pile on top. */
+        this.stdin.once("drain", () => resolve());
+      }
+    });
   }
 
   sendUserText(text: string, sessionId?: string) {
@@ -65,6 +100,12 @@ export class InputWriter {
   }
 
   closeStdin() {
-    if (this.stdin.writable) this.stdin.end();
+    /* Wait for any queued writes to flush before signaling EOF; otherwise
+       the child can miss the final NDJSON line. */
+    this.writeChain = this.writeChain.then(() => {
+      if (this.stdin.writable) this.stdin.end();
+    }).catch(() => {
+      try { if (this.stdin.writable) this.stdin.end(); } catch { /* ignore */ }
+    });
   }
 }

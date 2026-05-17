@@ -1,4 +1,5 @@
 import { spawn, execSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { dirname } from "node:path";
 import { StreamJsonParser } from "./StreamJsonParser";
 import { InputWriter } from "./InputWriter";
 import type { StreamEvent, ControlRequestEvent, ContentBlock } from "./Events";
@@ -9,18 +10,47 @@ import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from ".
    `claude --remote-control`. Used by the settings UI to count live remote
    sessions and by killAllRemoteAndOrphans() to sweep up anything the
    in-process registry doesn't know about (e.g. survivors of a prior plugin
-   instance that exited before this cleanup logic landed). */
+   instance that exited before this cleanup logic landed).
+
+   The pattern uses pgrep's BRE (`-f` matches the full argv) to require
+   `claude` either at the start of the argv or after a `/` (so an absolute
+   path matches), followed by whitespace, then `--remote-control` bounded by
+   whitespace or end. This avoids false positives like man pages, editor
+   buffers, or another tool with `claude --remote-control` embedded in a
+   longer command. After parsing, we cross-check via `ps -p <pid> -o
+   command=` so we only return PIDs whose argv actually begins with the
+   claude binary. */
 export function findRemoteControlPids(): number[] {
+  let raw: string;
   try {
-    const out = execSync('pgrep -f "claude --remote-control"', { encoding: "utf8" }).trim();
-    if (!out) return [];
-    return out
-      .split("\n")
-      .map(s => parseInt(s.trim(), 10))
-      .filter(n => Number.isFinite(n));
+    raw = execSync('pgrep -f "(^|/)claude[[:space:]]+--remote-control([[:space:]]|$)"', { encoding: "utf8" }).trim();
   } catch {
     return [];
   }
+  if (!raw) return [];
+  const candidates = raw
+    .split("\n")
+    .map(s => parseInt(s.trim(), 10))
+    .filter(n => Number.isFinite(n));
+
+  /* Cross-check each PID's argv to drop false positives that the regex
+     somehow let through (e.g. shell wrappers, comment lines in scripts). */
+  const verified: number[] = [];
+  for (const pid of candidates) {
+    try {
+      const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf8" }).trim();
+      /* The argv as ps shows it: first token should be `claude` (possibly
+         absolute path) and `--remote-control` should appear as its own token. */
+      const argv = cmd.split(/\s+/);
+      const first = argv[0] ?? "";
+      const isClaude = first === "claude" || /\/claude$/.test(first);
+      const hasFlag = argv.includes("--remote-control");
+      if (isClaude && hasFlag) verified.push(pid);
+    } catch {
+      /* Process gone between pgrep and ps. Skip. */
+    }
+  }
+  return verified;
 }
 
 export type TabMode = "local" | "remote-control";
@@ -66,6 +96,11 @@ export class TabSession {
   private errorListeners: ErrorListener[] = [];
   private stderrListeners: StderrListener[] = [];
   private pendingApprovals = new Map<string, ControlRequestEvent>();
+  /* Errors that fire before any onError() listener is registered get queued
+     here. This matters for synchronous spawn failures (ENOENT on the claude
+     binary): Node fires the `error` event in a nextTick before the caller
+     has had a chance to wire up listeners. Drained on first onError(). */
+  private earlyErrors: Error[] = [];
 
   constructor(tabId: string, opts: SpawnOptions) {
     this.tabId = tabId;
@@ -77,15 +112,21 @@ export class TabSession {
     const cmd = opts.claudePath || autodetectClaudePath() || "claude";
 
     /* Also enrich PATH with common install dirs so any child processes the
-       CLI spawns (e.g. via Bash tool) can find their tools. */
+       CLI spawns (e.g. via Bash tool) can find their tools. Guard the
+       `~/.local/bin` entry when HOME is unset so we don't inject a bare
+       `/.local/bin`. Also include the dir containing the claude binary when
+       an explicit path was provided, so sibling tooling resolves alongside
+       it. */
     const home = process.env.HOME ?? "";
+    const claudeDir = opts.claudePath ? dirname(opts.claudePath) : "";
     const enrichedPath = [
       process.env.PATH ?? "",
-      `${home}/.local/bin`,
+      home ? `${home}/.local/bin` : "",
       "/opt/homebrew/bin",
       "/usr/local/bin",
       "/usr/bin",
       "/bin",
+      claudeDir,
     ].filter(Boolean).join(":");
 
     /* eslint-disable no-console */
@@ -116,6 +157,13 @@ export class TabSession {
     this.child.on("error", err => {
       console.error(`[claude-cli-chat] child error:`, err);
       this.status = "error";
+      if (this.errorListeners.length === 0) {
+        /* No listeners yet (likely a synchronous spawn failure that fired
+           before the caller wired up onError). Queue for delivery on the
+           first onError() registration. */
+        this.earlyErrors.push(err);
+        return;
+      }
       for (const cb of this.errorListeners) cb(err);
     });
 
@@ -208,7 +256,19 @@ export class TabSession {
 
   onEvent(cb: EventListener) { this.eventListeners.push(cb); }
   onExit(cb: ExitListener) { this.exitListeners.push(cb); }
-  onError(cb: ErrorListener) { this.errorListeners.push(cb); }
+  onError(cb: ErrorListener) {
+    this.errorListeners.push(cb);
+    /* Drain any errors that arrived before listeners existed. We invoke them
+       on the next microtask so the caller's registration completes first. */
+    if (this.earlyErrors.length > 0) {
+      const drained = this.earlyErrors.splice(0, this.earlyErrors.length);
+      queueMicrotask(() => {
+        for (const err of drained) {
+          try { cb(err); } catch { /* listener error swallowed */ }
+        }
+      });
+    }
+  }
   onStderr(cb: StderrListener) { this.stderrListeners.push(cb); }
 
   async dispose(): Promise<void> {
@@ -234,6 +294,37 @@ export class TabSession {
 export class SubprocessManager {
   private sessions = new Map<string, TabSession>();
   private remoteSessions = new Map<string, RemoteControlSession>();
+  /* Session-file paths already claimed by an active RemoteControlSession.
+     Used by the mtime-based session-file poll to avoid picking the same
+     JSONL twice under parallel-spawn races. */
+  private claimedSessionFiles = new Set<string>();
+
+  /* Returns true on first claim, false if the path was already claimed. The
+     poll logic in RemoteControlSession uses this to skip files another
+     instance has already grabbed. */
+  claimSessionFile(path: string): boolean {
+    if (this.claimedSessionFiles.has(path)) return false;
+    this.claimedSessionFiles.add(path);
+    return true;
+  }
+
+  releaseSessionFile(path: string): void {
+    this.claimedSessionFiles.delete(path);
+  }
+
+  isSessionFileClaimed(path: string): boolean {
+    return this.claimedSessionFiles.has(path);
+  }
+
+  /* Bridge object matching RemoteControlSession's `claimedSessionFiles`
+     option shape. Pass this when constructing a RemoteControlSession so
+     parallel spawns coordinate session-file claims. */
+  sessionFileClaimAdapter(): { claim(path: string): boolean; isClaimed(path: string): boolean } {
+    return {
+      claim: (path: string) => this.claimSessionFile(path),
+      isClaimed: (path: string) => this.isSessionFileClaimed(path),
+    };
+  }
 
   spawn(tabId: string, opts: SpawnOptions): TabSession {
     const existing = this.sessions.get(tabId);
@@ -262,14 +353,25 @@ export class SubprocessManager {
      first so re-registration doesn't leak. */
   registerRemote(tabId: string, session: RemoteControlSession): void {
     const prior = this.remoteSessions.get(tabId);
-    if (prior && prior !== session) void prior.dispose();
+    if (prior && prior !== session) {
+      if (prior.sessionFile) this.releaseSessionFile(prior.sessionFile);
+      void prior.dispose();
+    }
     this.remoteSessions.set(tabId, session);
+    session.onSessionFile((path: string) => {
+      /* Best-effort claim: the session may have already claimed the path
+         itself via the poll loop. Calling claim() again is a no-op. */
+      this.claimSessionFile(path);
+    });
     session.onExit(() => {
       if (this.remoteSessions.get(tabId) === session) this.remoteSessions.delete(tabId);
+      if (session.sessionFile) this.releaseSessionFile(session.sessionFile);
     });
   }
 
   unregisterRemote(tabId: string): void {
+    const session = this.remoteSessions.get(tabId);
+    if (session?.sessionFile) this.releaseSessionFile(session.sessionFile);
     this.remoteSessions.delete(tabId);
   }
 
@@ -282,6 +384,7 @@ export class SubprocessManager {
     const remote = Array.from(this.remoteSessions.values()).map(s => s.dispose());
     this.sessions.clear();
     this.remoteSessions.clear();
+    this.claimedSessionFiles.clear();
     await Promise.all([...local, ...remote]);
   }
 
@@ -296,11 +399,28 @@ export class SubprocessManager {
     await Promise.all(work);
     let orphans = 0;
     for (const pid of findRemoteControlPids()) {
+      /* Pre-flight: confirm the PID still exists AND still looks like a
+         claude --remote-control process. PIDs can be reused on a busy
+         system; between findRemoteControlPids() and the kill below, the
+         original process may have exited and a new program may have taken
+         its slot. process.kill(pid, 0) is a no-signal existence probe;
+         ESRCH means the process is gone. */
+      try { process.kill(pid, 0); } catch { continue; }
+      /* Verify argv still matches (cheap defense against PID reuse). */
+      try {
+        const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf8" }).trim();
+        const argv = cmd.split(/\s+/);
+        const first = argv[0] ?? "";
+        const isClaude = first === "claude" || /\/claude$/.test(first);
+        if (!isClaude || !argv.includes("--remote-control")) continue;
+      } catch {
+        continue;
+      }
       try {
         process.kill(pid, "SIGTERM");
         orphans++;
       } catch {
-        /* already gone or permission denied — ignore */
+        /* already gone or permission denied; ignore */
       }
     }
     return { tracked, orphans };

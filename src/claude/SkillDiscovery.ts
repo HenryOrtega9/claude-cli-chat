@@ -49,29 +49,52 @@ const BUILTIN_COMMANDS: { name: string; description: string }[] = [
 ];
 
 function parseFrontmatter(content: string): { name?: string; description?: string } {
-  /* Frontmatter must be the first chars of the file, `---` fenced. Multi-line
-     description values (folded or block) are common in skill SKILL.md files;
-     keep the regex lazy and let later cleanup trim it. */
+  /* Frontmatter must be the first chars of the file, `---` fenced. */
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return {};
   const block = m[1];
-  const nameMatch = block.match(/^name:\s*(.+)$/m);
-  const descMatch = block.match(/^description:\s*([\s\S]+?)(?=\n[a-zA-Z_-]+:\s|\n*$)/);
-  let description = descMatch?.[1]?.trim();
-  /* Strip surrounding quotes (single OR double) — they're a YAML convention,
-     not part of the value. */
-  if (description) {
-    if ((description.startsWith('"') && description.endsWith('"')) ||
-        (description.startsWith("'") && description.endsWith("'"))) {
-      description = description.slice(1, -1);
+
+  /* Line-by-line top-level key parser. We only recognize key:value lines
+     where `key` starts at column 0 (no leading whitespace) and matches the
+     conservative identifier regex. Indented continuation lines (multi-line
+     YAML descriptions) are folded into the most recent top-level key's value.
+     This avoids the greedy [\s\S]+? regex misreading indented YAML keys
+     inside a description as the next top-level key. We do not handle folded
+     (>) or literal (|) block scalars. */
+  const KEY_LINE = /^([a-z_][a-z0-9_-]*):\s*(.*)$/i;
+  const fields: Record<string, string> = {};
+  let currentKey: string | null = null;
+  const lines = block.split(/\r?\n/);
+  for (const line of lines) {
+    const km = line.match(KEY_LINE);
+    if (km) {
+      currentKey = km[1];
+      fields[currentKey] = km[2] ?? "";
+    } else if (currentKey !== null) {
+      /* Continuation: append the line (with a separating space) so multi-line
+         descriptions still flatten to a single string. */
+      const trimmed = line.trim();
+      if (trimmed) {
+        fields[currentKey] = (fields[currentKey] ? fields[currentKey] + " " : "") + trimmed;
+      }
     }
-    /* Collapse whitespace runs so a multi-line description displays as one
-       trimmed line in the suggestion popup. */
-    description = description.replace(/\s+/g, " ").trim();
   }
+
+  const cleanValue = (raw: string | undefined): string | undefined => {
+    if (raw === undefined) return undefined;
+    let v = raw.trim();
+    if (!v) return undefined;
+    if ((v.startsWith('"') && v.endsWith('"')) ||
+        (v.startsWith("'") && v.endsWith("'"))) {
+      v = v.slice(1, -1);
+    }
+    v = v.replace(/\s+/g, " ").trim();
+    return v || undefined;
+  };
+
   return {
-    name: nameMatch?.[1]?.trim(),
-    description,
+    name: cleanValue(fields["name"]),
+    description: cleanValue(fields["description"]),
   };
 }
 

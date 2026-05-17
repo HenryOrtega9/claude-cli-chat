@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { autodetectClaudePath } from "../settings";
 
 /* Spawns a one-off `claude --print` call with a small fast model (Haiku by
@@ -81,15 +83,20 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
       "Title:";
 
   /* PATH enrichment matches SubprocessManager so the binary resolves from a
-     Finder-launched Obsidian even when the shell PATH wasn't inherited. */
+     Finder-launched Obsidian even when the shell PATH wasn't inherited.
+     Guard `~/.local/bin` when HOME is unset so we don't inject a bare
+     `/.local/bin`. Also append the dir containing the claude binary when an
+     explicit path was provided, so sibling tooling resolves alongside it. */
   const home = process.env.HOME ?? "";
+  const claudeDir = opts.claudePath ? dirname(opts.claudePath) : "";
   const enrichedPath = [
     process.env.PATH ?? "",
-    `${home}/.local/bin`,
+    home ? `${home}/.local/bin` : "",
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
     "/bin",
+    claudeDir,
   ].filter(Boolean).join(":");
 
   const args = [
@@ -106,6 +113,14 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
   /* eslint-disable no-console */
   const t0 = Date.now();
   console.log(`[claude-cli-chat] title-gen spawn`, { cmd, model: opts.model });
+
+  /* cwd existence check: a missing cwd causes spawn() to emit ENOENT on the
+     child's `error` event, but pre-checking gives a clearer log and avoids
+     the spawn overhead entirely. */
+  if (!existsSync(opts.cwd)) {
+    console.warn(`[claude-cli-chat] title-gen skipped: cwd does not exist: ${opts.cwd}`);
+    return null;
+  }
 
   return new Promise<string | null>((resolve) => {
     const child = spawn(cmd, args, {
@@ -135,7 +150,11 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
       resolve(null);
     }, 30000);
 
-    child.on("exit", code => {
+    /* Use `close` instead of `exit` so stdout is fully drained before we
+       call cleanTitle(). `exit` fires when the process terminates but
+       stdout may still have buffered data; `close` waits for the stdio
+       streams to flush too. */
+    child.on("close", code => {
       clearTimeout(timeout);
       const elapsed = Date.now() - t0;
       if (code !== 0) {

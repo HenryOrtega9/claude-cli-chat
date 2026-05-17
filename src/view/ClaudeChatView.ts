@@ -11,12 +11,23 @@ import { makeTabState, type TabState } from "./state";
 
 export const VIEW_TYPE_CLAUDE_CHAT = "claude-cli-chat-view";
 
+/* Vault-relative path for the multi-window lock file. Each window writes its
+   PID here on open and removes it on close. A second window opening sees the
+   lock, verifies the PID is still alive, and renders a "already open" notice
+   instead of restoring tabs (otherwise both windows would race on the same
+   persisted tab files and each other's subprocesses). */
+const WINDOW_LOCK_DIR = ".claude-cli-chat";
+const WINDOW_LOCK_PATH = `${WINDOW_LOCK_DIR}/window.lock`;
+
 export class ClaudeChatView extends ItemView {
   plugin: ClaudeChatPlugin;
   private tabs: TabController[] = [];
   private activeTabId: string | null = null;
   private tabBar!: TabBar;
   private tabsContainer!: HTMLElement;
+  /* True when this view detected another live window already holding the
+     vault lock. We render a placeholder and skip tab restore in that case. */
+  private holdingLock = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: ClaudeChatPlugin) {
     super(leaf);
@@ -33,6 +44,15 @@ export class ClaudeChatView extends ItemView {
     root.addClass("claudian-container");
     root.setAttribute("data-provider", "claude");
 
+    /* Check the multi-window lock BEFORE setting up any UI. If another live
+       window holds it, we short-circuit with a placeholder. */
+    const lockHolder = await this.checkWindowLock();
+    if (lockHolder !== null) {
+      this.renderAlreadyOpenPlaceholder(root as HTMLElement, lockHolder);
+      return;
+    }
+    await this.acquireWindowLock();
+
     renderHeader(root as HTMLElement, {
       onNewTab: () => this.createTab(),
       onClear: () => this.clearActiveTab(),
@@ -45,7 +65,7 @@ export class ClaudeChatView extends ItemView {
     const navRow = (root as HTMLElement).createDiv({ cls: "claudian-input-nav-row" });
     this.tabBar = new TabBar(navRow, {
       onSelect: (id) => this.selectTab(id),
-      onClose: (id) => this.closeTab(id),
+      onClose: (id) => void this.closeTab(id),
       onNew: () => this.createTab(),
     });
 
@@ -54,19 +74,94 @@ export class ClaudeChatView extends ItemView {
     await this.restoreTabs();
   }
 
+  /* Returns the PID of the live window currently holding the lock, or null
+     if no live holder exists (lock missing, stale, or unreadable). */
+  private async checkWindowLock(): Promise<number | null> {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!(await adapter.exists(WINDOW_LOCK_PATH))) return null;
+      const raw = (await adapter.read(WINDOW_LOCK_PATH)).trim();
+      const pid = parseInt(raw, 10);
+      if (!Number.isFinite(pid) || pid <= 0) return null;
+      /* PID equality with our own process means we're reopening the view in
+         the same window (tab close/reopen) — treat as no foreign holder. */
+      if (pid === process.pid) return null;
+      try {
+        /* signal 0 doesn't deliver a signal; it tests whether the target is
+           still alive and accessible. Throws ESRCH if the process is gone. */
+        process.kill(pid, 0);
+        return pid;
+      } catch {
+        /* Stale lock from a crashed prior instance. Safe to overwrite. */
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async acquireWindowLock(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!(await adapter.exists(WINDOW_LOCK_DIR))) {
+        await adapter.mkdir(WINDOW_LOCK_DIR);
+      }
+      await adapter.write(WINDOW_LOCK_PATH, String(process.pid));
+      this.holdingLock = true;
+    } catch (err) {
+      console.warn(`[claude-cli-chat] failed to acquire window lock:`, err);
+    }
+  }
+
+  private async releaseWindowLock(): Promise<void> {
+    if (!this.holdingLock) return;
+    this.holdingLock = false;
+    const adapter = this.app.vault.adapter;
+    try {
+      if (await adapter.exists(WINDOW_LOCK_PATH)) {
+        const raw = (await adapter.read(WINDOW_LOCK_PATH)).trim();
+        const pid = parseInt(raw, 10);
+        /* Only remove the lock if it's still ours — otherwise we'd be
+           clobbering a lock another window legitimately took after we
+           dropped ours (e.g. during onClose of this view). */
+        if (pid === process.pid) {
+          await adapter.remove(WINDOW_LOCK_PATH);
+        }
+      }
+    } catch (err) {
+      console.warn(`[claude-cli-chat] failed to release window lock:`, err);
+    }
+  }
+
+  private renderAlreadyOpenPlaceholder(root: HTMLElement, holderPid: number): void {
+    const wrap = root.createDiv({ cls: "claudian-multi-window-block" });
+    wrap.style.padding = "2em";
+    wrap.style.textAlign = "center";
+    wrap.createEl("h3", { text: "Claude is already open in another window" });
+    wrap.createEl("p", {
+      text: `Another Obsidian window (pid ${holderPid}) is currently running this plugin. ` +
+            "Open the existing window to continue your conversations. Running two windows " +
+            "at once would race on the same persisted tabs and subprocesses.",
+    });
+  }
+
   private async restoreTabs() {
     const index = await this.plugin.persistence.loadIndex();
     if (!index || index.tabs.length === 0) {
       this.createTab();
       return;
     }
+    /* Bypass per-tab saveIndex writes during the restore loop — each
+       createTab + selectTab pair would otherwise trigger TWO index writes
+       per restored tab. We do one write at the very end instead. */
     for (const entry of index.tabs) {
       const state = await this.plugin.persistence.loadTab(entry.id);
-      this.createTab(state ?? undefined);
+      this.createTab(state ?? undefined, { skipSave: true });
     }
     if (index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)) {
-      this.selectTab(index.activeTabId);
+      this.selectTab(index.activeTabId, { skipSave: true });
     }
+    this.saveIndex();
   }
 
   private saveIndex() {
@@ -87,13 +182,16 @@ export class ClaudeChatView extends ItemView {
        in the middle of shutting down, leaking them as PPID=1 orphans. */
     await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs = [];
+    /* Release the multi-window lock so another window opened later (or the
+       same window reopened) can start cleanly. */
+    await this.releaseWindowLock();
   }
 
   newTab() {
     this.createTab();
   }
 
-  private createTab(state?: TabState) {
+  private createTab(state?: TabState, opts: { skipSave?: boolean } = {}) {
     const controller = new TabController(
       this.plugin,
       this.tabsContainer,
@@ -107,8 +205,8 @@ export class ClaudeChatView extends ItemView {
     );
     controller.onForkRequest = (src, messageId) => this.forkFromMessage(src, messageId);
     this.tabs.push(controller);
-    this.selectTab(controller.state.id);
-    this.saveIndex();
+    this.selectTab(controller.state.id, { skipSave: true });
+    if (!opts.skipSave) this.saveIndex();
   }
 
   /* Create a new tab whose state is the source tab's history truncated at
@@ -144,7 +242,7 @@ export class ClaudeChatView extends ItemView {
     );
   }
 
-  private selectTab(tabId: string) {
+  private selectTab(tabId: string, opts: { skipSave?: boolean } = {}) {
     this.activeTabId = tabId;
     for (const tab of this.tabs) {
       if (tab.state.id === tabId) tab.show();
@@ -153,14 +251,18 @@ export class ClaudeChatView extends ItemView {
     const active = this.tabs.find(t => t.state.id === tabId);
     if (active) active.focusInput();
     this.renderTabBar();
-    this.saveIndex();
+    if (!opts.skipSave) this.saveIndex();
   }
 
-  private closeTab(tabId: string) {
+  private async closeTab(tabId: string): Promise<void> {
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
     const [removed] = this.tabs.splice(idx, 1);
-    removed.destroy();
+    /* Await destroy() before splicing out — otherwise the subprocess SIGTERM
+       handshake races against onClose-like cleanup and we can leak children
+       as PPID=1 orphans (same failure mode that onClose's await pattern
+       fixed for the bulk path). */
+    await removed.destroy();
     void this.plugin.persistence.deleteTab(tabId);
     if (this.tabs.length === 0) {
       this.createTab();
@@ -183,7 +285,7 @@ export class ClaudeChatView extends ItemView {
 
   private clearActiveTab() {
     const active = this.tabs.find(t => t.state.id === this.activeTabId);
-    if (active) active.clear();
+    if (active) void active.clear();
   }
 
   private showMcpManager() {
@@ -230,7 +332,7 @@ export class ClaudeChatView extends ItemView {
 
   /* Public command targets — used by plugin.addCommand registrations. */
   closeActiveTab() {
-    if (this.activeTabId) this.closeTab(this.activeTabId);
+    if (this.activeTabId) void this.closeTab(this.activeTabId);
   }
   nextTab() {
     if (this.tabs.length < 2) return;

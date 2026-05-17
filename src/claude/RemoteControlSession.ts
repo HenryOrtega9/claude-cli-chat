@@ -10,6 +10,13 @@ export type RemoteControlOptions = {
   sessionId?: string;
   sessionName?: string;
   claudePath?: string;
+  /* Optional handle to the SubprocessManager so the session-file poll can
+     coordinate "claimed" JSONL paths across parallel RC spawns. When
+     omitted, the poll falls back to plain mtime ranking. */
+  claimedSessionFiles?: {
+    claim(path: string): boolean;
+    isClaimed(path: string): boolean;
+  };
 };
 
 type UrlListener = (url: string) => void;
@@ -45,14 +52,29 @@ const PTY_PROXY_SCRIPT = `
 import pty, os, sys, select, fcntl, signal
 cmd = sys.argv[1:]
 if not cmd: sys.exit(2)
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(cmd[0], cmd)
+# Forward-declare pid so the signal handler can reference it before the
+# pty.fork() returns. Installing the handlers BEFORE the fork means a
+# SIGTERM arriving between fork() and the handler installation can't kill
+# the parent without forwarding to the child.
+pid = -1
 def _term(signum, frame):
-    try: os.kill(pid, signal.SIGTERM)
-    except OSError: pass
+    if pid > 0:
+        try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
 signal.signal(signal.SIGTERM, _term)
 signal.signal(signal.SIGHUP, _term)
+pid, fd = pty.fork()
+if pid == 0:
+    # Child: exec the target command. Wrap in try/except so an ENOENT or
+    # permission error writes a clean diagnostic to stderr and exits with
+    # 127 (shell-convention "command not found") instead of dumping a
+    # Python traceback onto the controlling tty.
+    try:
+        os.execvp(cmd[0], cmd)
+    except Exception as e:
+        try: os.write(2, ("pty_proxy: failed to exec %s: %s\\n" % (cmd[0], e)).encode())
+        except Exception: pass
+        os._exit(127)
 fcntl.fcntl(0, fcntl.F_SETFL, os.O_NONBLOCK)
 fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK)
 try:
@@ -102,10 +124,22 @@ export class RemoteControlSession {
   private errorListeners: ErrorListener[] = [];
   private exitListeners: ExitListener[] = [];
   private sessionFilePoll: ReturnType<typeof setInterval> | null = null;
+  /* 60s budget for the CLI to print its pairing URL. If it never appears,
+     surface an error and dispose. Cleared when the URL is captured. */
+  private urlTimeout: ReturnType<typeof setTimeout> | null = null;
+  /* Session id parsed from the CLI's stdout (welcome banner), if it prints
+     one. Used to disambiguate the session file under parallel spawns. */
+  private discoveredSessionId: string | null = null;
+  private claimedSessionFiles?: RemoteControlOptions["claimedSessionFiles"];
+  /* Cap on stdoutBuffer once the URL is captured: anything past this point
+     is only useful for debugging. Keeping the buffer unbounded would leak
+     memory for long-running RC sessions. */
+  private static readonly STDOUT_BUFFER_CAP = 64 * 1024;
 
   constructor(opts: RemoteControlOptions) {
     this.cwd = opts.cwd;
     this.spawnTime = Date.now();
+    this.claimedSessionFiles = opts.claimedSessionFiles;
 
     const claude = opts.claudePath || autodetectClaudePath() || "claude";
     const pyArgs = ["-c", PTY_PROXY_SCRIPT, claude, "--remote-control"];
@@ -136,8 +170,26 @@ export class RemoteControlSession {
       console.log(`[claude-cli-chat] RC exit code=${code}`);
       this.setStatus("exited");
       this.stopSessionFilePoll();
+      this.clearUrlTimeout();
       for (const cb of this.exitListeners) cb(code);
     });
+
+    /* URL discovery deadline. If the CLI hasn't printed a pairing URL in
+       60s something is wrong (hung trust prompt, missing network, CLI
+       version that uses a different welcome format). Surface an error and
+       dispose so the UI can fall back gracefully instead of spinning
+       forever. */
+    this.urlTimeout = setTimeout(() => {
+      if (this.url) return;
+      const err = new Error(
+        `RemoteControlSession: timed out waiting for pairing URL after 60s. ` +
+        `Last stdout (${this.stdoutBuffer.length} bytes): ${this.stdoutBuffer.slice(-400)}`,
+      );
+      console.error(`[claude-cli-chat] RC url-discovery timeout`);
+      this.setStatus("error");
+      for (const cb of this.errorListeners) cb(err);
+      void this.dispose();
+    }, 60000);
 
     /* If an explicit sessionId was provided, we know the JSONL path upfront.
        Otherwise poll the project dir for a newer file appearing post-spawn. */
@@ -145,6 +197,7 @@ export class RemoteControlSession {
       const path = sessionFilePathFor(this.cwd, opts.sessionId);
       if (existsSync(path)) {
         this.sessionFile = path;
+        this.claimedSessionFiles?.claim(path);
         for (const cb of this.sessionFileListeners) cb(path);
       }
     } else {
@@ -160,6 +213,7 @@ export class RemoteControlSession {
 
   async dispose(): Promise<void> {
     this.stopSessionFilePoll();
+    this.clearUrlTimeout();
     if (this.status === "exited") return;
     return new Promise(resolve => {
       const timeout = setTimeout(() => {
@@ -171,7 +225,27 @@ export class RemoteControlSession {
     });
   }
 
+  private clearUrlTimeout() {
+    if (this.urlTimeout) {
+      clearTimeout(this.urlTimeout);
+      this.urlTimeout = null;
+    }
+  }
+
   private handleStdout(chunk: string) {
+    /* Once we have the URL and have captured any session-id banner, the
+       buffer's only use is debugging the URL-timeout error. Cap it with
+       FIFO truncation so a long-running RC session can't leak memory. */
+    if (this.url) {
+      this.stdoutBuffer += stripAnsi(chunk);
+      if (this.stdoutBuffer.length > RemoteControlSession.STDOUT_BUFFER_CAP) {
+        this.stdoutBuffer = this.stdoutBuffer.slice(-RemoteControlSession.STDOUT_BUFFER_CAP);
+      }
+      /* Still try to capture a session id if it appears post-URL. */
+      this.tryCaptureSessionId();
+      return;
+    }
+
     this.stdoutBuffer += stripAnsi(chunk);
 
     /* Auto-confirm trust prompt by sending Enter. The CLI pre-selects "Yes,
@@ -182,15 +256,36 @@ export class RemoteControlSession {
       try { this.child.stdin.write("\r"); } catch { /* ignore */ }
     }
 
-    if (!this.url) {
-      const match = this.stdoutBuffer.match(URL_PATTERN);
-      if (match) {
-        this.url = match[0];
-        this.setStatus("ready");
-        console.log(`[claude-cli-chat] RC paired url=${this.url}`);
-        for (const cb of this.urlListeners) cb(this.url);
-      } else if (this.status === "starting" && /remote control|connecting/i.test(this.stdoutBuffer)) {
-        this.setStatus("waiting");
+    this.tryCaptureSessionId();
+
+    const match = this.stdoutBuffer.match(URL_PATTERN);
+    if (match) {
+      this.url = match[0];
+      this.setStatus("ready");
+      this.clearUrlTimeout();
+      console.log(`[claude-cli-chat] RC paired url=${this.url}`);
+      for (const cb of this.urlListeners) cb(this.url);
+    } else if (this.status === "starting" && /remote control|connecting/i.test(this.stdoutBuffer)) {
+      this.setStatus("waiting");
+    }
+  }
+
+  /* The CLI welcome banner sometimes prints a line like "Session: <uuid>"
+     or "session_id: <uuid>". When present, this is the most reliable way
+     to map the spawn to its JSONL file under parallel-spawn races. We try
+     several known formats; if none match the poll falls back to mtime. */
+  private tryCaptureSessionId() {
+    if (this.discoveredSessionId) return;
+    const patterns = [
+      /(?:^|\s)Session(?:\s*ID)?:\s*([a-f0-9-]{8,})/im,
+      /session_id["':\s]+([a-f0-9-]{8,})/im,
+    ];
+    for (const p of patterns) {
+      const m = this.stdoutBuffer.match(p);
+      if (m) {
+        this.discoveredSessionId = m[1];
+        console.log(`[claude-cli-chat] RC discovered sessionId from stdout: ${m[1]}`);
+        return;
       }
     }
   }
@@ -205,7 +300,17 @@ export class RemoteControlSession {
     const dir = projectDirFor(this.cwd);
     /* Poll every 500ms for up to 30s for a new .jsonl file. Inotify would be
        cleaner but adds complexity; polling is sufficient for one-time
-       discovery. */
+       discovery.
+
+       Disambiguation strategy under parallel RC spawns:
+         1. If we've parsed a session id out of the CLI's stdout banner,
+            trust that and look up the file directly. Most reliable.
+         2. Otherwise fall back to mtime ranking, but:
+            (a) tighten the spawn-time window to +/-300ms so we don't
+                accidentally grab a file the OTHER session just created.
+            (b) prefer files NOT already claimed by another instance via
+                the SubprocessManager-level claimed registry. */
+    const SPAWN_WINDOW_MS = 300;
     let attempts = 0;
     this.sessionFilePoll = setInterval(() => {
       attempts++;
@@ -213,28 +318,60 @@ export class RemoteControlSession {
         this.stopSessionFilePoll();
         return;
       }
+
+      /* Path 1: direct lookup if we parsed a session id from stdout. */
+      if (this.discoveredSessionId) {
+        const candidate = sessionFilePathFor(this.cwd, this.discoveredSessionId);
+        if (existsSync(candidate)) {
+          this.adoptSessionFile(candidate);
+          return;
+        }
+      }
+
       if (!existsSync(dir)) return;
       try {
         const files = readdirSync(dir).filter(f => f.endsWith(".jsonl"));
         let newest: { path: string; mtime: number } | null = null;
+        let newestUnclaimed: { path: string; mtime: number } | null = null;
         for (const file of files) {
           const fullPath = join(dir, file);
           try {
             const st = statSync(fullPath);
             const mtime = st.mtimeMs;
-            if (mtime >= this.spawnTime - 1000 && (!newest || mtime > newest.mtime)) {
-              newest = { path: fullPath, mtime };
+            /* Tighter window: file must have been created/modified within
+               300ms of our spawn time. Going wider risks claiming a sibling
+               session's file. */
+            if (mtime < this.spawnTime - SPAWN_WINDOW_MS) continue;
+            if (mtime > this.spawnTime + 30000) continue;
+            if (!newest || mtime > newest.mtime) newest = { path: fullPath, mtime };
+            const claimed = this.claimedSessionFiles?.isClaimed(fullPath) ?? false;
+            if (!claimed && (!newestUnclaimed || mtime > newestUnclaimed.mtime)) {
+              newestUnclaimed = { path: fullPath, mtime };
             }
           } catch { /* ignore */ }
         }
-        if (newest) {
-          this.sessionFile = newest.path;
-          this.stopSessionFilePoll();
-          console.log(`[claude-cli-chat] RC session file detected: ${newest.path}`);
-          for (const cb of this.sessionFileListeners) cb(newest.path);
+        /* Prefer the newest UNCLAIMED file; only fall back to claimed if
+           nothing else fits the window. */
+        const pick = newestUnclaimed ?? newest;
+        if (pick) {
+          this.adoptSessionFile(pick.path);
         }
       } catch { /* ignore */ }
     }, 500);
+  }
+
+  /* Common claim-and-notify path for both discovery routes. */
+  private adoptSessionFile(path: string) {
+    if (this.claimedSessionFiles) {
+      const ok = this.claimedSessionFiles.claim(path);
+      /* If another instance has already claimed this exact path, skip
+         silently and let the poll keep trying. */
+      if (!ok) return;
+    }
+    this.sessionFile = path;
+    this.stopSessionFilePoll();
+    console.log(`[claude-cli-chat] RC session file detected: ${path}`);
+    for (const cb of this.sessionFileListeners) cb(path);
   }
 
   private stopSessionFilePoll() {

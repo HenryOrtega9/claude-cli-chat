@@ -27,6 +27,11 @@ export class MessageListRenderer {
   private bottomSentinel: HTMLElement;
   private liveEls = new Map<string, { root: HTMLElement; content: HTMLElement }>();
   private toolEls = new Map<string, HTMLElement>();
+  /* Per-message render chain. `renderContent` awaits MarkdownRenderer.render,
+     opening a race window where two concurrent upserts can both clear pre-await
+     DOM and both append. Serializing per-id removes the window structurally
+     rather than patching symptoms downstream (footer dedup, etc.). */
+  private renderChains = new Map<string, Promise<void>>();
   /* Sticky per-message override for the thinking-block toggle. Set when the
      user clicks the header. Survives the empty()+rebuild cycle that happens
      on every streaming delta, so a user-collapsed block doesn't auto-reopen
@@ -146,6 +151,20 @@ export class MessageListRenderer {
   }
 
   async upsertMessage(msg: ChatMessage) {
+    /* Serialize per-message: queue this upsert behind any in-flight chain for
+       the same id so MarkdownRenderer.render's await can never interleave with
+       another upsert clearing the same content element. GC the map entry once
+       the chain settles so long-lived sessions don't leak. */
+    const prev = this.renderChains.get(msg.id) ?? Promise.resolve();
+    const next = prev.then(() => this.doUpsert(msg));
+    this.renderChains.set(msg.id, next);
+    next.finally(() => {
+      if (this.renderChains.get(msg.id) === next) this.renderChains.delete(msg.id);
+    });
+    await next;
+  }
+
+  private async doUpsert(msg: ChatMessage) {
     let entry = this.liveEls.get(msg.id);
     if (!entry) {
       entry = this.createBubble(msg);
@@ -435,6 +454,11 @@ export class MessageListRenderer {
         this.wireInternalLinks(block);
       }
       if (msg.durationMs !== undefined && !msg.streaming && this.passHasVisibleContent(msg)) {
+        /* Idempotent: concurrent upserts can both cross the MarkdownRenderer
+           await above, and the later el.empty() only wipes pre-await DOM.
+           Drop any prior footer before appending so the second arrival
+           replaces instead of stacks. */
+        el.querySelector(":scope > .claudian-thought-duration")?.remove();
         el.createDiv({ cls: "claudian-thought-duration", text: `Thought for ${this.formatDuration(msg.durationMs)}` });
       }
     }

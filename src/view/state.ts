@@ -94,10 +94,22 @@ export type PendingApproval = {
   blockedPath?: string | null;
 };
 
+/* 128-bit ids via crypto.randomUUID where available (Node 19+, all modern
+   browsers — Obsidian's runtime ships with this). Falls back to the legacy
+   ~20-bit Math.random scheme if the API is missing, since this code lands in
+   an Obsidian plugin that has to start regardless. */
+function makeId(prefix: string): string {
+  const cryptoObj = (globalThis as { crypto?: Crypto }).crypto;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return `${prefix}-${cryptoObj.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
 export function makeTabState(): TabState {
   const now = Date.now();
   return {
-    id: `tab-${now}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+    id: makeId("tab"),
     sessionId: null,
     title: "New chat",
     createdAt: now,
@@ -109,5 +121,5 @@ export function makeTabState(): TabState {
 }
 
 export function makeMessageId(): string {
-  return `msg-${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  return makeId("msg");
 }
