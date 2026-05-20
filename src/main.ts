@@ -1,10 +1,12 @@
 import { FileSystemAdapter, Plugin, WorkspaceLeaf, addIcon } from "obsidian";
 import { ClaudeChatView, VIEW_TYPE_CLAUDE_CHAT } from "./view/ClaudeChatView";
 import { ClaudeChatSettingTab, DEFAULT_SETTINGS, autodetectUserName, type ClaudeChatSettings } from "./settings";
-import { SubprocessManager } from "./claude/SubprocessManager";
+import { SubprocessManager, spawnOptionsFromSettings } from "./claude/SubprocessManager";
+import type { AssistantEvent, ResultEvent, StreamEvent } from "./claude/Events";
 import { Persistence } from "./storage/Persistence";
 import { CLAUDE_ASTERISK_ICON_SVG } from "./view/Welcome";
 import { discoverSkillsAndCommands, type DiscoveryResult } from "./claude/SkillDiscovery";
+import { StateEmitter } from "./claude/StateEmitter";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
@@ -85,6 +87,12 @@ export default class ClaudeChatPlugin extends Plugin {
     });
 
     this.addSettingTab(new ClaudeChatSettingTab(this.app, this));
+
+    /* TC001 status display: configure from persisted settings and emit
+       idle once at load. No network calls happen unless the user has
+       toggled the integration on. */
+    StateEmitter.configure(this.settings.tc001Enabled, this.settings.tc001Ip);
+    if (this.settings.tc001Enabled) StateEmitter.setState("idle");
   }
 
   async onunload() {
@@ -136,6 +144,80 @@ export default class ClaudeChatPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  /* Programmatic one-shot prompt for other plugins (e.g. obsidian-docx-claude).
+     Spawns a transient TabSession with systemPrompt appended via
+     --append-system-prompt, sends userPrompt once, accumulates assistant text
+     from `assistant` events, resolves on the `result` event, and disposes the
+     session in finally. */
+  async runHeadlessPrompt(
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { timeoutMs?: number; cwd?: string },
+  ): Promise<string> {
+    const timeoutMs = opts?.timeoutMs ?? 120_000;
+    const tabId = `headless-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const cwd = opts?.cwd ?? this.getVaultPath() ?? process.cwd();
+    const spawnOpts = spawnOptionsFromSettings(this.settings, cwd, undefined, {
+      appendSystemPrompt: systemPrompt,
+    });
+    const session = this.subprocessManager.spawn(tabId, spawnOpts);
+
+    let resolved = false;
+    let assistantText = "";
+
+    return new Promise<string>((resolve, reject) => {
+      const finish = (value: string | null, err?: Error) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        session.dispose().finally(() => {
+          if (err) reject(err);
+          else resolve(value ?? "");
+        });
+      };
+
+      const timer = setTimeout(() => {
+        finish(null, new Error(`runHeadlessPrompt timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      session.onEvent((e: StreamEvent) => {
+        if (e.type === "assistant") {
+          const ae = e as AssistantEvent;
+          for (const block of ae.message.content) {
+            if (block.type === "text") assistantText += block.text;
+          }
+        } else if (e.type === "result") {
+          const re = e as ResultEvent;
+          if (re.is_error) {
+            finish(null, new Error(`Claude returned error: ${re.subtype}`));
+            return;
+          }
+          if (typeof re.result === "string" && re.result.length > 0) {
+            finish(re.result);
+          } else if (re.result && typeof re.result === "object") {
+            const textBlocks = re.result.content
+              .filter((b): b is { type: "text"; text: string } => b.type === "text")
+              .map((b) => b.text)
+              .join("");
+            finish(textBlocks || assistantText);
+          } else {
+            finish(assistantText);
+          }
+        }
+      });
+      session.onError((err) => finish(null, err));
+      session.onExit((code) => {
+        if (!resolved) finish(null, new Error(`Claude subprocess exited (code=${code}) before result`));
+      });
+
+      try {
+        session.sendUserText(userPrompt);
+      } catch (err) {
+        finish(null, err instanceof Error ? err : new Error(String(err)));
+      }
+    });
   }
 
   async activateView() {

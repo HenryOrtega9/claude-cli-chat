@@ -14,6 +14,8 @@ import { resolveModelId, type ModelKey, type EffortLevel, type PermissionMode, t
 import { RemoteControlSession, sessionFilePathFor } from "../claude/RemoteControlSession";
 import { JsonlTailer } from "../claude/JsonlTailer";
 import { generateTitle } from "../claude/TitleGenerator";
+import { MCPConfigStore } from "../mcp/MCPConfig";
+import { StateEmitter } from "../claude/StateEmitter";
 import type ClaudeChatPlugin from "../main";
 import type {
   StreamEvent,
@@ -179,19 +181,37 @@ export class TabController {
        textarea) instead of letting it float above the entire input box.
        Parent is this.root only to satisfy the constructor; the next line
        reparents to the wrapper. */
+    /* Legacy-state migration for sticky pins. If the persisted state
+       predates the sticky field (undefined), assume all currently-pinned
+       files were sticky (matches old behavior where every pin survived
+       across submits). Once stickyPinnedFilePaths is defined, it's
+       authoritative — even when empty. */
+    const initialPinned = this.state.pinnedFilePaths ?? [];
+    const initialSticky = this.state.stickyPinnedFilePaths ?? initialPinned;
     this.activeFileIndicator = new ActiveFileIndicator(
       this.root,
       this.app,
-      this.state.pinnedFilePaths ?? [],
+      initialPinned,
+      initialSticky,
       {
-        onPinChange: paths => {
+        onPinChange: (paths, stickyPaths) => {
           this.state.pinnedFilePaths = paths;
+          this.state.stickyPinnedFilePaths = stickyPaths;
           this.state.updatedAt = Date.now();
           this.onStateChangeCb();
+          /* Pin count is half of the cost-surface pill's payload; refresh
+             so the toolbar count reflects this change immediately. MCP
+             count comes along for the ride from the same async load. */
+          void this.refreshCostSurface();
         },
       }
     );
     this.inputBox.mountTopBar(this.activeFileIndicator.root);
+    /* Seed the cost-surface pill on mount: counts pinned files in this tab
+       and MCP servers configured in <vault>/.claude/mcp.json. Async because
+       the MCP config is read from disk. Re-fires from onPinChange and from
+       refreshCostSurface() after the MCP manager closes. */
+    void this.refreshCostSurface();
 
     this.pairingCard = new RemotePairingCard(this.root, {
       onDisconnect: () => void this.switchMode("local"),
@@ -298,10 +318,69 @@ export class TabController {
     }
   }
 
+  /* Reload the cost-surface pill: count pinned files for this tab and read
+     MCP server config (both enabled and disabled) from
+     <vault>/.claude/mcp.json. Public so the parent view can re-trigger
+     after the MCP manager modal closes (which may have added/removed
+     servers). Pin changes call this from the indicator callback directly.
+
+     Tool lists come from the most recent init event's tool catalog,
+     stashed on state.mcpToolsByServer. Until the first init arrives
+     (brand-new tab, no messages yet), tools arrays are empty and the
+     pill shows server count without tool count. After init the pill
+     gains "(N tools)".
+
+     Errors swallowed because this is a UI hint, not load-bearing — the
+     chat works regardless of whether the pill is accurate. */
+  public async refreshCostSurface(): Promise<void> {
+    const pinCount = (this.state.pinnedFilePaths ?? []).length;
+    let mcpServers: Array<{ name: string; enabled: boolean; tools: string[] }> = [];
+    try {
+      const store = new MCPConfigStore(this.app);
+      const all = await store.listAllServers();
+      const toolMap = this.state.mcpToolsByServer ?? {};
+      mcpServers = all.map(s => ({
+        name: s.name,
+        enabled: s.enabled,
+        tools: s.enabled ? (toolMap[s.name] ?? []) : [],
+      }));
+    } catch {
+      /* ignore — leave mcpServers empty */
+    }
+    this.inputBox.setCostSurface({
+      pinCount,
+      mcpServers,
+      onMcpToggle: (name, enabled) => void this.setMcpEnabled(name, enabled),
+    });
+  }
+
+  /* Toggle a server's enabled state and refresh the pill. The mcp.json
+     change won't take effect until the CLI subprocess respawns (next
+     /clear or new tab); we surface that via a Notice so the user knows
+     to restart if they want the change to land immediately. */
+  public async setMcpEnabled(name: string, enabled: boolean): Promise<void> {
+    try {
+      const changed = await new MCPConfigStore(this.app).setEnabled(name, enabled);
+      if (changed) {
+        new Notice(
+          `${enabled ? "Enabled" : "Disabled"} MCP server "${name}". Restart this chat (/clear) for the change to take effect.`,
+          6000
+        );
+      }
+    } catch (err) {
+      new Notice(`Failed to ${enabled ? "enable" : "disable"} MCP server: ${(err as Error).message}`, 6000);
+    }
+    void this.refreshCostSurface();
+  }
+
   private startRemoteMode() {
     const cwd = this.plugin.getVaultPath();
-    const prefix = this.plugin.settings.remoteSessionNamePrefix?.trim() || undefined;
-    const sessionName = prefix ? `${prefix}-${this.state.id.slice(-6)}` : undefined;
+    /* When the user sets a name, use it verbatim. Earlier behavior appended
+       `-<last 6 of tab id>` to keep concurrent sessions distinct, but that
+       leaked into the remote session list on the web/phone where the user
+       just wants the configured label. If the field is blank, hand undefined
+       to the proxy and let it fall back to the upstream default (hostname). */
+    const sessionName = this.plugin.settings.remoteSessionNamePrefix?.trim() || undefined;
 
     this.pairingCard.show();
     this.pairingCard.setStatus("starting");
@@ -467,6 +546,10 @@ export class TabController {
     this.inputBox.setActiveSubModel(undefined);
     this.updateWelcomeVisibility();
     this.onStateChangeCb();
+    /* Reset the TC001 to "ready" so it doesn't sit on whatever state the
+       cancelled turn left it in (thinking / needs_permission). Animator's
+       60s timeout will flip ready → idle if no follow-up turn arrives. */
+    StateEmitter.setState("ready");
   }
 
   /* Esc-cancel: kill the in-flight subprocess so streaming stops, but keep
@@ -676,8 +759,18 @@ export class TabController {
     this.renderer.forceStickToBottom();
     this.inputBox.setBusy(true);
     this.statusIndicator.setThinking();
+    StateEmitter.setState("thinking");
     this.passStartedAt = Date.now();
     this.onStateChangeCb();
+
+    /* Auto-drop non-sticky pins. The file contents are already inlined
+       into THIS turn's wireText (built above), and once the API request
+       lands they live forever in the conversation history. Re-shipping
+       them on every follow-up turn is the cost we're trying to avoid.
+       Sticky pins survive; non-sticky pins fall off the pill bar.
+       setPinnedPaths is a no-op when sticky == pinned (nothing to drop). */
+    const stickyOnly = this.activeFileIndicator.getStickyPaths();
+    this.activeFileIndicator.setPinnedPaths(stickyOnly);
 
     /* Parallel-fire title generation: kick off the Haiku subprocess the
        moment we have the user's message, so it runs concurrently with the
@@ -724,6 +817,26 @@ export class TabController {
              depends on permission mode). */
           if (init.slash_commands) this.state.availableSlashCommands = init.slash_commands;
           if (init.skills) this.state.availableSkills = init.skills;
+          /* Group MCP-namespaced tools by server. The CLI names every MCP
+             tool as `mcp__<server>__<tool>` (double-underscore separator),
+             so parsing is mechanical. Other tools (Read, Bash, Edit, etc.)
+             are non-MCP and skipped. Result feeds the cost-surface pill
+             and its hover popup. */
+          if (Array.isArray(init.tools)) {
+            const grouped: Record<string, string[]> = {};
+            for (const tool of init.tools) {
+              if (!tool.startsWith("mcp__")) continue;
+              const parts = tool.split("__");
+              if (parts.length < 3) continue;
+              const server = parts[1];
+              const toolName = parts.slice(2).join("__");
+              (grouped[server] ??= []).push(toolName);
+            }
+            this.state.mcpToolsByServer = grouped;
+            /* Init carries the full tool list, so this is the canonical
+               moment to refresh the pill with real tool counts. */
+            void this.refreshCostSurface();
+          }
         } else if (sys.subtype === "api_retry") {
           const retry = sys as SystemApiRetryEvent;
           this.statusIndicator.setRetrying(retry.attempt, retry.max_retries, retry.retry_delay_ms);
@@ -962,6 +1075,7 @@ export class TabController {
     if (this.passStartedAt !== null) {
       msg.durationMs = Date.now() - this.passStartedAt;
     }
+    this.maybeMergePrefixPreamble(msg);
     await this.renderer.upsertMessage(msg);
 
     /* After a final assistant message, future deltas belong to a new bubble.
@@ -974,6 +1088,39 @@ export class TabController {
     this.clearStreamingPointer();
     this.streamingBlocks.clear();
     this.passStartedAt = null;
+  }
+
+  /* Interleaved thinking can produce two adjacent assistant passes where the
+     first is a partial preamble ("I'll build the…"), gets interrupted by a
+     thinking block, and the second pass re-emits the same opening in full
+     ("I'll build the… file now."). The two render as duplicate bubbles each
+     with their own "Thought for Ns" footer. When the second pass finalizes,
+     fold the earlier preamble into it: drop the older bubble from state +
+     DOM, sum the durations, and prefer the longer thinking trace (the long
+     pass's reasoning is the substantive one; the short pass after it is
+     usually a sanity-check). Guarded so it never collapses a real preamble
+     that was followed by a tool call, or short single-character prefixes. */
+  private maybeMergePrefixPreamble(current: ChatMessage) {
+    const idx = this.state.messages.findIndex(m => m.id === current.id);
+    if (idx <= 0) return;
+    const prev = this.state.messages[idx - 1];
+    if (prev.role !== "assistant") return;
+    if (prev.streaming) return;
+    if (prev.toolCalls && prev.toolCalls.length > 0) return;
+    const prevText = prev.content.trim();
+    const currText = current.content.trim();
+    if (prevText.length < 20) return;
+    if (prevText.length >= currText.length) return;
+    if (!currText.startsWith(prevText)) return;
+
+    if (prev.durationMs !== undefined) {
+      current.durationMs = (current.durationMs ?? 0) + prev.durationMs;
+    }
+    if (prev.thinking && (!current.thinking || prev.thinking.length > current.thinking.length)) {
+      current.thinking = prev.thinking;
+    }
+    this.state.messages.splice(idx - 1, 1);
+    this.renderer.removeMessage(prev.id);
   }
 
   private async handleToolUse(event: ToolUseEvent) {
@@ -1018,6 +1165,7 @@ export class TabController {
     };
     this.state.pendingApprovals.set(event.request_id, approval);
     this.approvalArea.show(approval);
+    StateEmitter.setState("needs_permission");
   }
 
   private handleResult(_event: ResultEvent) {
@@ -1026,6 +1174,10 @@ export class TabController {
     this.statusIndicator.hide();
     this.clearStreamingPointer();
     this.passStartedAt = null;
+    /* Turn settled. StateEmitter auto-transitions complete -> ready after
+       10s (matches the daemon's COMPLETE_TIMEOUT_S), and the animator daemon
+       times ready -> idle after 60s. */
+    StateEmitter.setState("complete");
     /* Do NOT use event.usage here — it sums across every API call in the
        turn (each tool round-trip counts the shared context again), inflating
        the displayed token count. handleAssistant updates the indicator
@@ -1058,11 +1210,18 @@ export class TabController {
        back to a user-only prompt when assistantResponse is empty. */
     const firstAssistant = this.state.messages.find(m => m.role === "assistant" && m.content.trim().length > 0);
     this.titleGenerationStarted = true;
+    /* Title generation is hard-pinned to Haiku 4.5. Rationale: under the
+       2026-06-15 Agent SDK credit pool, every chat turn drains a $100/mo
+       budget; auto-titling a tab is a one-shot summarization that Haiku
+       does well at ~1/20th the per-message cost of Sonnet and ~1/100th of
+       Opus. Locking the model here (rather than reading a setting) means
+       the cheap path can't drift back to Sonnet/Opus through a stale
+       settings file or a user typo. */
     const generated = await generateTitle({
       userMessage: firstUser.content,
       assistantResponse: firstAssistant?.content,
       claudePath: this.plugin.settings.claudePath || undefined,
-      model: this.plugin.settings.titleGenerationModel || "haiku",
+      model: "claude-haiku-4-5-20251001",
       cwd: this.plugin.getVaultPath(),
     });
     if (generated) {
@@ -1112,6 +1271,12 @@ export class TabController {
       /* Pass the original input from the request — the SDK requires
          `updatedInput` even when we're not modifying anything. */
       this.session.approve(requestId, approval?.input as Record<string, unknown> | undefined);
+      /* Recovery: the assistant is about to resume running the tool, so
+         flip the display back to thinking. handleResult will fire complete
+         when the turn finally settles. Deny doesn't fire a recovery
+         because the result event will arrive almost immediately with the
+         denial outcome. */
+      StateEmitter.setState("thinking");
     } else {
       this.session.deny(requestId, decision.reason);
     }

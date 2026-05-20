@@ -24,6 +24,11 @@ export const SETTINGS_JSON_PATH = ".claude/settings.json";
    `prefix `; `ToolName(literal)` matches that exact command; `ToolName`
    alone is a blanket approve for that tool. */
 export const RECOMMENDED_ALLOW_PATTERNS: string[] = [
+  // File writes / edits (covers Write, Edit line-deletions, batch + notebook)
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
   // Read-only file inspection
   "Bash(cat:*)",
   "Bash(head:*)",

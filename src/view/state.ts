@@ -77,11 +77,25 @@ export type TabState = {
      submit. Active-file pill toggles entries in this list. Per-tab so each
      conversation can pin its own context set. */
   pinnedFilePaths?: string[];
+  /* Subset of pinnedFilePaths flagged as "sticky" — these survive submit
+     instead of being auto-dropped. Default-on auto-drop saves the file
+     content from re-shipping on every follow-up turn (it's already in the
+     conversation history from the first turn it was attached). Shift+click
+     toggles a pin's sticky state. Legacy state (field undefined) treats
+     all existing pins as sticky to preserve old behavior on upgrade. */
+  stickyPinnedFilePaths?: string[];
   /* Discovered slash commands + skills from the most recent system/init
      event. Refreshed on every (re)spawn. Used to populate the slash-command
      suggestion popup. Not persisted — re-derived on next subprocess spawn. */
   availableSlashCommands?: string[];
   availableSkills?: string[];
+  /* MCP tools the CLI announced in the most recent system/init event,
+     grouped by server name. Derived from the `tools` field by filtering
+     `mcp__<server>__<tool>` entries and parsing out the server segment.
+     Powers the cost-surface pill's tool count + the hover popup's
+     per-server tool listing. Re-derived on every (re)spawn, never
+     persisted. */
+  mcpToolsByServer?: Record<string, string[]>;
 };
 
 export type PendingApproval = {

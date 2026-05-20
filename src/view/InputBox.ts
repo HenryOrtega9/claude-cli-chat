@@ -57,6 +57,22 @@ export type InputBoxCallbacks = {
   onSelectionDismissed?: () => void;
 };
 
+/* Payload TabController hands to InputBox.setCostSurface() to populate the
+   cost-surface pill and its hover popup. mcpServers lists every server
+   configured in mcp.json (enabled or disabled); tools is the live tool
+   list announced by the most recent init event (empty until the first
+   turn). onMcpToggle, when provided, lets the popup wire its checkboxes
+   to TabController.setMcpEnabled. */
+export type CostSurfacePayload = {
+  pinCount: number;
+  mcpServers: Array<{
+    name: string;
+    enabled: boolean;
+    tools: string[];
+  }>;
+  onMcpToggle?: (name: string, enabled: boolean) => void;
+};
+
 /* Map a raw Anthropic model id ("claude-opus-4-7", "claude-sonnet-4-6",
    "claude-haiku-4-5-20251001") to the short family label used in the pill
    "via" badge. Unknown ids return null so the badge stays hidden rather
@@ -91,6 +107,21 @@ export class InputBox {
   private usageDonutCircle: SVGCircleElement;
   private usagePercentEl: HTMLElement;
   private usagePill: HTMLElement;
+  /* "Cost surface" pill — shows how much configuration ships with every turn
+     (pinned files + connected MCP servers). Hidden when both counts are zero
+     so empty tabs stay quiet. See setCostSurface(). */
+  private costPill: HTMLElement;
+  private costPillText: HTMLElement;
+  /* Hover popup anchored to the costPill, showing per-server MCP details
+     and an enable/disable checkbox per server. Built lazily on first
+     hover and re-rendered when setCostSurface lands a new payload.
+     Visibility driven by mouseenter/leave on pill+popup with a small
+     grace window so cursor travel between the two doesn't close it. */
+  private costPopup: HTMLElement | null = null;
+  private costPopupHideTimer: number | null = null;
+  /* Most-recent cost-surface payload, retained so the hover popup can
+     re-render itself when shown without needing a fresh data load. */
+  private costPayload: CostSurfacePayload | null = null;
   private sendBtn: HTMLElement;
   private callbacks: InputBoxCallbacks;
   private currentModel: ModelKey;
@@ -220,6 +251,39 @@ export class InputBox {
     this.refreshEffortPill();
     this.refreshModePill();
 
+    /* Cost-surface pill — sits between effort and usage. Shows pinned-file
+       count + connected MCP server count, both of which ride on every turn's
+       input as cache-discounted but real tokens. Compact dual-count format
+       keeps it scannable; tooltip carries the fuller explanation. Hidden
+       until populated by TabController.refreshCostSurface(). */
+    this.costPill = this.bottomToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-cost-pill",
+      attr: {
+        "aria-label": "Per-turn cost surface (pinned files + MCP servers)",
+        title: "Pinned files and connected MCP servers ride on every turn. Hover for details.",
+      },
+    });
+    this.costPillText = this.costPill.createSpan({ cls: "claudian-toolbar-pill-value" });
+    this.costPill.style.display = "none";
+    /* Popup-trigger wiring: enter shows, leave schedules a close that the
+       popup's own enter handler cancels — that handoff is what lets the
+       cursor travel from pill to popup without the popup vanishing
+       mid-flight. closeNow / scheduleClose live as instance methods so
+       the popup-side handlers can call into them too. */
+    this.costPill.addEventListener("mouseenter", () => this.openCostPopup());
+    this.costPill.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
+    /* Click also toggles the popup (in addition to hover) so keyboard /
+       touch users have a stable affordance. Tapping the pill while the
+       popup is open closes it. */
+    this.costPill.addEventListener("click", e => {
+      e.stopPropagation();
+      if (this.costPopup && this.costPopup.style.display !== "none") {
+        this.closeCostPopupNow();
+      } else {
+        this.openCostPopup();
+      }
+    });
+
     /* Usage donut + percentage — inline in the bottom toolbar. Hidden
        until the first usage snapshot lands. */
     this.usagePill = this.bottomToolbar.createSpan({
@@ -282,6 +346,187 @@ export class InputBox {
   setBusy(busy: boolean) {
     this.busy = busy;
     this.sendBtn.toggleClass("is-disabled", busy);
+  }
+
+  /* Update the cost-surface pill and refresh the hover popup. Caller
+     passes a structured payload (see CostSurfacePayload). The pill shows
+     a compact "Pinned N · MCP M (T tools)" summary; the popup expands
+     into per-server detail with enable/disable checkboxes. Pill hides
+     entirely when there's nothing to surface.
+
+     Tool count is the sum across ENABLED servers only — disabled servers
+     don't contribute to the on-wire token cost, so they shouldn't show
+     up in the headline number even though they appear in the popup. */
+  setCostSurface(payload: CostSurfacePayload) {
+    this.costPayload = payload;
+    const pinCount = payload.pinCount;
+    const enabledServers = payload.mcpServers.filter(s => s.enabled);
+    const mcpCount = enabledServers.length;
+    const toolCount = enabledServers.reduce((sum, s) => sum + s.tools.length, 0);
+
+    if (pinCount <= 0 && payload.mcpServers.length <= 0) {
+      this.costPill.style.display = "none";
+      this.closeCostPopupNow();
+      return;
+    }
+    const parts: string[] = [];
+    if (pinCount > 0) parts.push(`Pinned ${pinCount}`);
+    if (payload.mcpServers.length > 0) {
+      /* "MCP 2 (5 tools)" once we know tool counts; just "MCP 2" before
+         the first init lands. Singular tool stays "tool". */
+      const mcpLabel = toolCount > 0
+        ? `MCP ${mcpCount} (${toolCount} tool${toolCount === 1 ? "" : "s"})`
+        : `MCP ${mcpCount}`;
+      parts.push(mcpLabel);
+    }
+    this.costPillText.setText(parts.join(" · "));
+    this.costPill.setAttribute(
+      "title",
+      `${pinCount} pinned file${pinCount === 1 ? "" : "s"} + ${mcpCount} active MCP server${mcpCount === 1 ? "" : "s"} (${toolCount} tool${toolCount === 1 ? "" : "s"}) ride on every turn. Hover for details + toggles.`
+    );
+    this.costPill.style.display = "";
+    /* If the popup is currently visible, re-render its contents so the
+       checkbox states / tool counts stay in sync with the new payload. */
+    if (this.costPopup && this.costPopup.style.display !== "none") {
+      this.renderCostPopupContent();
+    }
+  }
+
+  private openCostPopup() {
+    if (!this.costPayload) return;
+    if (this.costPopupHideTimer !== null) {
+      window.clearTimeout(this.costPopupHideTimer);
+      this.costPopupHideTimer = null;
+    }
+    if (!this.costPopup) {
+      this.costPopup = this.wrapper.createDiv({ cls: "claudian-cost-popup" });
+      /* Stop clicks inside the popup from bubbling — checkbox clicks
+         shouldn't propagate to outside listeners that might close us. */
+      this.costPopup.addEventListener("click", e => e.stopPropagation());
+      /* Hover handoff: cursor moving from pill onto the popup cancels
+         the scheduled close, so the user can actually click checkboxes
+         without the popup vanishing under their cursor. */
+      this.costPopup.addEventListener("mouseenter", () => {
+        if (this.costPopupHideTimer !== null) {
+          window.clearTimeout(this.costPopupHideTimer);
+          this.costPopupHideTimer = null;
+        }
+      });
+      this.costPopup.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
+    }
+    this.renderCostPopupContent();
+    this.costPopup.style.display = "";
+    /* Re-anchor on every open — the pill's position can shift between
+       opens (window resize, toolbar items added/removed). Same anchoring
+       contract as anchorPopup() for click-driven popups: pin to the pill
+       horizontally, sit just above the wrapper edge so the popup grows
+       upward into the message area. */
+    const pillRect = this.costPill.getBoundingClientRect();
+    const wrapperRect = this.wrapper.getBoundingClientRect();
+    this.costPopup.style.position = "absolute";
+    const wrapperMidX = (wrapperRect.left + wrapperRect.right) / 2;
+    const pillMidX = (pillRect.left + pillRect.right) / 2;
+    if (pillMidX > wrapperMidX) {
+      this.costPopup.style.right = `${wrapperRect.right - pillRect.right}px`;
+      this.costPopup.style.left = "";
+    } else {
+      this.costPopup.style.left = `${pillRect.left - wrapperRect.left}px`;
+      this.costPopup.style.right = "";
+    }
+    this.costPopup.style.bottom = `${wrapperRect.bottom - pillRect.top + 6}px`;
+    this.costPopup.style.top = "";
+  }
+
+  private scheduleCostPopupClose() {
+    if (this.costPopupHideTimer !== null) window.clearTimeout(this.costPopupHideTimer);
+    /* 250ms grace gives enough time for cursor travel between pill and
+       popup; longer feels sluggish, shorter races with normal hand
+       motion. */
+    this.costPopupHideTimer = window.setTimeout(() => {
+      this.closeCostPopupNow();
+    }, 250);
+  }
+
+  private closeCostPopupNow() {
+    if (this.costPopupHideTimer !== null) {
+      window.clearTimeout(this.costPopupHideTimer);
+      this.costPopupHideTimer = null;
+    }
+    if (this.costPopup) this.costPopup.style.display = "none";
+  }
+
+  /* Build the popup body from the cached payload. Cleared and rebuilt
+     on every render so toggle state transitions land cleanly without
+     having to diff individual checkboxes. */
+  private renderCostPopupContent() {
+    if (!this.costPopup || !this.costPayload) return;
+    this.costPopup.empty();
+    const payload = this.costPayload;
+
+    /* Header line summarizing the on-wire cost surface. Same info as the
+       pill text but expanded — gives context for the controls below. */
+    const header = this.costPopup.createDiv({ cls: "claudian-cost-popup-header" });
+    const enabledServers = payload.mcpServers.filter(s => s.enabled);
+    const toolCount = enabledServers.reduce((sum, s) => sum + s.tools.length, 0);
+    header.createDiv({
+      cls: "claudian-cost-popup-title",
+      text: `MCP: ${enabledServers.length} active · ${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+    });
+    header.createDiv({
+      cls: "claudian-cost-popup-subtitle",
+      text: "Every turn ships these tool definitions. Toggle to disable.",
+    });
+
+    if (payload.mcpServers.length === 0) {
+      this.costPopup.createDiv({
+        cls: "claudian-cost-popup-empty",
+        text: "No MCP servers configured.",
+      });
+      return;
+    }
+
+    /* One card per server, enabled or disabled. Disabled servers render
+       muted with the checkbox unchecked; clicking the checkbox toggles
+       state via the payload-supplied callback. */
+    const list = this.costPopup.createDiv({ cls: "claudian-cost-popup-server-list" });
+    for (const server of payload.mcpServers) {
+      const card = list.createDiv({
+        cls: "claudian-cost-popup-server" + (server.enabled ? "" : " is-disabled"),
+      });
+      const head = card.createDiv({ cls: "claudian-cost-popup-server-head" });
+      /* Native checkbox — accessible by default, works with shift+click
+         and keyboard, no need to reinvent. Wired to onMcpToggle. */
+      const checkbox = head.createEl("input", { attr: { type: "checkbox" } });
+      checkbox.checked = server.enabled;
+      checkbox.addEventListener("change", () => {
+        payload.onMcpToggle?.(server.name, checkbox.checked);
+      });
+      head.createSpan({ cls: "claudian-cost-popup-server-name", text: server.name });
+      const toolLabel = server.enabled
+        ? `${server.tools.length} tool${server.tools.length === 1 ? "" : "s"}`
+        : "disabled";
+      head.createSpan({ cls: "claudian-cost-popup-server-count", text: toolLabel });
+
+      if (server.tools.length > 0) {
+        const toolList = card.createDiv({ cls: "claudian-cost-popup-tool-list" });
+        for (const tool of server.tools) {
+          toolList.createDiv({ cls: "claudian-cost-popup-tool", text: tool });
+        }
+      } else if (server.enabled) {
+        /* Enabled but no tools yet means the init event hasn't landed
+           (brand-new tab, no first message). Surface this so the user
+           doesn't think the server is broken. */
+        card.createDiv({
+          cls: "claudian-cost-popup-tool-list claudian-cost-popup-pending",
+          text: "Tool list arrives after first message.",
+        });
+      }
+    }
+
+    this.costPopup.createDiv({
+      cls: "claudian-cost-popup-footer",
+      text: "Restart chat (/clear) to apply toggles.",
+    });
   }
 
   /* Tear down the InputBox cleanly. Removes any document-level listeners that

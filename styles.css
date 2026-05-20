@@ -592,6 +592,48 @@ mark.claudian-search-mark.is-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Sticky badge — a 10px pin glyph appended to the file-pill label, shown
+   only when .is-sticky is on the pill root. The base rule hides it so
+   one-shot pins read identically to pre-sticky pins; sticky pins gain a
+   visible pin icon and a heavier border to signal "this survives submit." */
+.claudian-file-pill-sticky-badge {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
+  margin-left: 1px;
+  color: inherit;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+.claudian-file-pill-sticky-badge svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.claudian-file-pill.is-sticky .claudian-file-pill-sticky-badge {
+  display: inline-flex;
+}
+/* Heavier border on sticky pins so the persistence is obvious even at
+   small sizes; pairs with the badge to make sticky vs. one-shot
+   unmistakable at a glance. */
+.claudian-file-pill.is-pinned.is-sticky {
+  border-color: var(--claudian-brand);
+  border-width: 1.5px;
+  padding: 2.5px 9.5px; /* offset the +0.5px border so total height stays put */
+}
+
+/* Slow fade for the auto-drop case where the dropped pill stays visible
+   (i.e., it was the active editor file). Overrides the default 100ms
+   pill transition with a longer ease so the unpin reads as deliberate
+   visual feedback rather than a snap. Class is added by setPinnedPaths
+   for ~850ms then removed once the animation completes; pills that
+   leave the bar entirely (non-active dropped pins) skip this and just
+   disappear. */
+.claudian-file-pill.is-fading-pin {
+  transition: background 800ms ease, color 800ms ease, border-color 800ms ease;
+}
 
 /* ---- Per-message action toolbar -------------------------- */
 .claudian-message {
@@ -1108,6 +1150,12 @@ mark.claudian-search-mark.is-active {
   gap: 6px;
   margin-bottom: 6px;
 }
+/* User messages are right-aligned, so their attachment rows should be too —
+   both when lifted above the bubble and when rendered inside it. */
+.claudian-message-wrapper-user .claudian-message-attachments {
+  justify-content: flex-end;
+  align-self: flex-end;
+}
 .claudian-message-attachment {
   max-width: 240px;
   max-height: 180px;
@@ -1521,6 +1569,133 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-usage-pill.warn { color: #e0a83a; }
 .claudian-usage-pill.danger { color: #dc3545; }
+
+/* Cost-surface pill: hover-driven, so use the help cursor to signal
+   "more info on hover" while keeping the click-toggle affordance. */
+.claudian-cost-pill {
+  cursor: help;
+}
+
+/* Hover popup anchored above the cost-surface pill. Shares the visual
+   language of .claudian-popup (background, border, shadow) but is wider
+   to accommodate per-server detail and uses a denser internal layout. */
+.claudian-cost-popup {
+  position: absolute;
+  z-index: 50;
+  min-width: 280px;
+  max-width: 360px;
+  padding: 10px 12px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-family: var(--font-interface);
+  font-size: 12px;
+  color: var(--text-normal);
+}
+.claudian-cost-popup-header {
+  margin-bottom: 8px;
+}
+.claudian-cost-popup-title {
+  font-weight: 600;
+  color: var(--claudian-brand);
+  font-size: 12px;
+}
+.claudian-cost-popup-subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.claudian-cost-popup-empty {
+  padding: 8px 0;
+  color: var(--text-muted);
+  font-style: italic;
+}
+.claudian-cost-popup-server-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.claudian-cost-popup-server {
+  padding: 8px 10px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  transition: opacity 120ms ease;
+}
+.claudian-cost-popup-server.is-disabled {
+  opacity: 0.55;
+}
+.claudian-cost-popup-server-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.claudian-cost-popup-server-head input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+.claudian-cost-popup-server-name {
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-cost-popup-server-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-cost-popup-tool-list {
+  margin-top: 6px;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.claudian-cost-popup-tool {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-cost-popup-pending {
+  font-style: italic;
+  font-family: var(--font-interface);
+  font-size: 11px;
+}
+.claudian-cost-popup-footer {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--background-modifier-border);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* Disabled-state row styling in the MCP manager modal. Muted opacity +
+   subtle italic on the name so the user can tell at a glance which
+   servers are inactive. */
+.claudian-mcp-server-row.is-disabled {
+  opacity: 0.6;
+}
+.claudian-mcp-server-row.is-disabled .claudian-mcp-server-name {
+  font-style: italic;
+}
+.claudian-mcp-server-toggle {
+  margin-right: 6px;
+  cursor: pointer;
+}
+.claudian-mcp-section-divider {
+  margin-top: 14px;
+  margin-bottom: 8px;
+  padding: 4px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
 
 /* ---- @ / slash suggestion popup -------------------------- */
 /* Floats ABOVE the entire input-wrapper so it never overlaps the textarea.

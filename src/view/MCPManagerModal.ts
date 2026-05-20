@@ -22,11 +22,16 @@ export class MCPManagerModal extends Modal {
      write their Notice into the void after the user has moved on. */
   private inflightCheck: AbortController | null = null;
   private checkBtn: HTMLButtonElement | null = null;
+  /* Optional close callback. Fires once from onClose. Used by ClaudeChatView
+     to refresh the active tab's cost-surface pill in case the user added or
+     removed servers while the modal was open. */
+  private onClosed: (() => void) | null = null;
 
-  constructor(app: App, claudePath: string) {
+  constructor(app: App, claudePath: string, onClosed?: () => void) {
     super(app);
     this.store = new MCPConfigStore(app);
     this.claudePath = claudePath || autodetectClaudePath() || "claude";
+    this.onClosed = onClosed ?? null;
   }
 
   async onOpen() {
@@ -45,11 +50,17 @@ export class MCPManagerModal extends Modal {
       this.inflightCheck = null;
     }
     this.contentEl.empty();
+    if (this.onClosed) {
+      try { this.onClosed(); } catch { /* never let a refresh callback take down modal teardown */ }
+      this.onClosed = null;
+    }
   }
 
   private async render() {
     this.contentEl.empty();
-    const servers = await this.store.listServers();
+    const all = await this.store.listAllServers();
+    const enabled = all.filter(s => s.enabled);
+    const disabled = all.filter(s => !s.enabled);
 
     const intro = this.contentEl.createDiv({ cls: "claudian-mcp-intro" });
     intro.createEl("p", {
@@ -57,7 +68,12 @@ export class MCPManagerModal extends Modal {
     });
 
     const headerRow = this.contentEl.createDiv({ cls: "claudian-mcp-header-row" });
-    headerRow.createEl("h3", { text: `${servers.length} server${servers.length === 1 ? "" : "s"} configured` });
+    /* Headline shows active count so the user sees how many actually
+       ship tool defs per turn, with the disabled count surfaced as a
+       muted suffix when present. */
+    const heading = `${enabled.length} active`
+      + (disabled.length > 0 ? ` · ${disabled.length} disabled` : "");
+    headerRow.createEl("h3", { text: heading });
     const checkBtn = headerRow.createEl("button", { text: "Check status", cls: "mod-cta" });
     this.checkBtn = checkBtn;
     /* Carry over the disabled state across re-renders triggered by an
@@ -70,7 +86,7 @@ export class MCPManagerModal extends Modal {
     const addBtn = headerRow.createEl("button", { text: "Add server" });
     addBtn.addEventListener("click", () => this.editServer(null));
 
-    if (servers.length === 0) {
+    if (all.length === 0) {
       this.contentEl.createDiv({
         cls: "claudian-mcp-empty",
         text: "No MCP servers configured yet. Click \"Add server\" to register one.",
@@ -78,15 +94,47 @@ export class MCPManagerModal extends Modal {
       return;
     }
 
-    const list = this.contentEl.createDiv({ cls: "claudian-mcp-server-list" });
-    for (const { name, config } of servers) {
-      this.renderServerRow(list, name, config);
+    if (enabled.length > 0) {
+      const enabledList = this.contentEl.createDiv({ cls: "claudian-mcp-server-list" });
+      for (const { name, config } of enabled) {
+        this.renderServerRow(enabledList, name, config, true);
+      }
+    }
+    if (disabled.length > 0) {
+      this.contentEl.createDiv({
+        cls: "claudian-mcp-section-divider",
+        text: "Disabled — kept in config but not loaded by the CLI",
+      });
+      const disabledList = this.contentEl.createDiv({ cls: "claudian-mcp-server-list" });
+      for (const { name, config } of disabled) {
+        this.renderServerRow(disabledList, name, config, false);
+      }
     }
   }
 
-  private renderServerRow(parent: HTMLElement, name: string, config: MCPServerConfig) {
-    const row = parent.createDiv({ cls: "claudian-mcp-server-row" });
+  private renderServerRow(parent: HTMLElement, name: string, config: MCPServerConfig, enabled: boolean) {
+    const row = parent.createDiv({ cls: "claudian-mcp-server-row" + (enabled ? "" : " is-disabled") });
     const head = row.createDiv({ cls: "claudian-mcp-server-head" });
+    /* Inline checkbox — toggling persists the change to mcp.json
+       immediately and re-renders the modal so the row jumps between
+       the enabled and disabled sections. Mirror of the popup behavior
+       on the cost-surface pill. */
+    const checkbox = head.createEl("input", { attr: { type: "checkbox" }, cls: "claudian-mcp-server-toggle" });
+    checkbox.checked = enabled;
+    checkbox.addEventListener("change", async () => {
+      try {
+        const changed = await this.store.setEnabled(name, checkbox.checked);
+        if (changed) {
+          new Notice(
+            `${checkbox.checked ? "Enabled" : "Disabled"} MCP server "${name}". Restart any active chats (/clear) for the change to take effect.`,
+            6000
+          );
+        }
+      } catch (err) {
+        new Notice(`Failed to toggle MCP server: ${(err as Error).message}`);
+      }
+      await this.render();
+    });
     head.createSpan({ cls: "claudian-mcp-server-name", text: name });
     const typeBadge = head.createSpan({ cls: "claudian-mcp-server-type" });
     typeBadge.setText(this.describeServerType(config));

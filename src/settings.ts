@@ -7,6 +7,7 @@ import {
   RECOMMENDED_ALLOW_PATTERNS,
 } from "./permissions/PermissionsConfig";
 import { findRemoteControlPids } from "./claude/SubprocessManager";
+import { StateEmitter } from "./claude/StateEmitter";
 
 /* Per-control debounce helper used to coalesce rapid text-input keystrokes
    into a single saveSettings() call. The synchronous in-memory state is
@@ -34,6 +35,7 @@ function debounced<A extends unknown[]>(fn: (...args: A) => void, ms: number): (
    1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
   "opus-1m": "claude-opus-4-7[1m]",
+  "opus-4-6-1m": "claude-opus-4-6[1m]",
   "opus-plan": "opusplan",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
   "haiku": "haiku",
@@ -42,9 +44,10 @@ export const MODEL_IDS = {
 export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
-  "opus-1m": "Opus 1M",
+  "opus-1m": "Opus 4.7 1M",
+  "opus-4-6-1m": "Opus 4.6 1M",
   "opus-plan": "Opus Plan",
-  "sonnet-1m": "Sonnet 1M",
+  "sonnet-1m": "Sonnet 4.6 1M",
   "haiku": "Haiku",
 };
 
@@ -62,20 +65,20 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   Opus today (including opus-plan, which routes to Opus when in plan mode);
-   everything else shows the standard four. */
+   Opus today (Opus 4.7, Opus 4.6, and opus-plan which routes to Opus when
+   in plan mode); everything else shows the standard four. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "opus-1m" || model === "opus-plan") return EFFORT_ORDER;
+  if (model === "opus-1m" || model === "opus-4-6-1m" || model === "opus-plan") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
 /* Total context window size for a model, used as the denominator when the
    usage snapshot doesn't include `contextWindow` directly. The `[1m]` suffix
    models open the 1M-token window; everything else is 200k. opus-plan can
-   resolve to either Opus (1M) or Sonnet (200k) at runtime — we display 1M
+   resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "opus-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "opus-1m" || model === "opus-4-6-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 
@@ -135,14 +138,19 @@ export type ClaudeChatSettings = {
   /* Auto-generate a conversation title after the first user message +
      assistant response. */
   autoGenerateTitles: boolean;
-  /* Model alias used for title generation. "haiku" is fast + cheap and
-     well-suited to the task. */
-  titleGenerationModel: string;
   /* Always-on system-prompt addendum applied to every tab in this vault.
      Passed via --append-system-prompt on every spawn. Composes with the
      per-tab env snippet's addendum (both apply if both set). Functionally
      equivalent to a vault-scoped CLAUDE.md addition. */
   vaultSystemPromptAddendum: string;
+  /* Ulanzi TC001 status display integration. When enabled, the plugin
+     drives a 32x8 LED matrix on the LAN: state changes (thinking,
+     needs_permission, complete, ready, idle) are pushed to the device
+     and written to /tmp/claude_state for the animator daemon. v1 is
+     plugin-only; terminal Claude Code does NOT emit. Default off so the
+     plugin is silent until hardware is on the network. */
+  tc001Enabled: boolean;
+  tc001Ip: string;
 };
 
 export const DEFAULT_SETTINGS: ClaudeChatSettings = {
@@ -155,8 +163,9 @@ export const DEFAULT_SETTINGS: ClaudeChatSettings = {
   permissionMode: "default",
   envSnippets: [],
   autoGenerateTitles: true,
-  titleGenerationModel: "haiku",
   vaultSystemPromptAddendum: "",
+  tc001Enabled: false,
+  tc001Ip: "192.168.1.50",
 };
 
 export function makeSnippetId(): string {
@@ -374,22 +383,8 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Title generation model")
-      .setDesc("Model alias to use for auto-titling. Haiku is fast and cheap; pass any alias the CLI understands.")
-      .addText(text => {
-        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
-        text
-          .setPlaceholder("haiku")
-          .setValue(this.plugin.settings.titleGenerationModel)
-          .onChange(value => {
-            this.plugin.settings.titleGenerationModel = value.trim() || "haiku";
-            debouncedSave();
-          });
-      });
-
-    new Setting(containerEl)
-      .setName("Remote Control session prefix")
-      .setDesc("Optional prefix for auto-generated Remote Control session names. Defaults to your machine hostname.")
+      .setName("Remote Control session name")
+      .setDesc("Label shown for this machine in the Remote Control session list on the web and phone. Used verbatim when set; defaults to your machine hostname when blank.")
       .addText(text => {
         const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         text
@@ -403,7 +398,50 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     this.renderSnippetsSection(containerEl);
 
+    this.renderTC001Section(containerEl);
+
     this.renderProcessCleanupSection(containerEl);
+  }
+
+  /* Ulanzi TC001 status display. v1 is plugin-only: terminal Claude Code
+     does NOT emit state, only this plugin does. Toggle is default-off so
+     the plugin makes no network calls until the user has hardware on the
+     LAN and explicitly opts in. */
+  private renderTC001Section(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Status display (Ulanzi TC001)" });
+    containerEl.createEl("p", {
+      text: "Drives a 32x8 LED matrix on the LAN with Claude's current state (idle, thinking, needs_permission, complete, ready). Plugin-only in v1; terminal Claude Code does not emit. Pushes are fail-silent with a 0.5s timeout, so toggling on when the device is unreachable will never block plugin events.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("Enable display integration")
+      .setDesc("Push state changes to the TC001 and write /tmp/claude_state for the animator daemon.")
+      .addToggle(t =>
+        t.setValue(this.plugin.settings.tc001Enabled).onChange(async value => {
+          this.plugin.settings.tc001Enabled = value;
+          await this.plugin.saveSettings();
+          StateEmitter.configure(value, this.plugin.settings.tc001Ip);
+          if (value) StateEmitter.setState("idle");
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("TC001 IP address")
+      .setDesc("LAN address of the device (set a DHCP reservation for stability). Awtrix Light HTTP API listens on port 80.")
+      .addText(text => {
+        const debouncedSave = debounced(() => {
+          void this.plugin.saveSettings();
+          StateEmitter.configure(this.plugin.settings.tc001Enabled, this.plugin.settings.tc001Ip);
+        }, 250);
+        text
+          .setPlaceholder("192.168.1.50")
+          .setValue(this.plugin.settings.tc001Ip)
+          .onChange(value => {
+            this.plugin.settings.tc001Ip = value.trim();
+            debouncedSave();
+          });
+      });
   }
 
   /* Surfaces a count of live `claude --remote-control` processes (tracked

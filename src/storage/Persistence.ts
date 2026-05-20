@@ -22,6 +22,10 @@ type StoredTab = {
   permissionMode?: string;
   envSnippetId?: string;
   pinnedFilePaths?: string[];
+  /* Subset of pinnedFilePaths flagged sticky (won't be auto-dropped after
+     submit). Undefined on legacy state predating the field; TabController
+     treats undefined as "all pins sticky" so behavior is preserved. */
+  stickyPinnedFilePaths?: string[];
 };
 
 type StoredMessage = {
@@ -106,6 +110,7 @@ export class Persistence {
       permissionMode: typeof stored.permissionMode === "string" ? stored.permissionMode : undefined,
       envSnippetId: typeof stored.envSnippetId === "string" ? stored.envSnippetId : undefined,
       pinnedFilePaths: Array.isArray(stored.pinnedFilePaths) ? stored.pinnedFilePaths : undefined,
+      stickyPinnedFilePaths: Array.isArray(stored.stickyPinnedFilePaths) ? stored.stickyPinnedFilePaths : undefined,
     };
   }
 
@@ -148,6 +153,7 @@ export class Persistence {
       permissionMode: state.permissionMode,
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths ? [...state.pinnedFilePaths] : undefined,
+      stickyPinnedFilePaths: state.stickyPinnedFilePaths ? [...state.stickyPinnedFilePaths] : undefined,
     };
   }
 
@@ -193,6 +199,7 @@ export class Persistence {
       permissionMode: state.permissionMode,
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths,
+      stickyPinnedFilePaths: state.stickyPinnedFilePaths,
     };
     const adapter = this.app.vault.adapter;
     await writeJsonAtomic(adapter, this.convPath(state.id), stored);

@@ -3,6 +3,7 @@ import type ClaudeChatPlugin from "../main";
 import { renderHeader } from "./Header";
 import { TabBar, type TabBadgeState } from "./TabBar";
 import { TabController } from "./TabController";
+import { StateEmitter } from "../claude/StateEmitter";
 import { HistoryModal } from "./HistoryModal";
 import { SnippetPicker } from "./SnippetPicker";
 import { MCPManagerModal } from "./MCPManagerModal";
@@ -206,7 +207,14 @@ export class ClaudeChatView extends ItemView {
     controller.onForkRequest = (src, messageId) => this.forkFromMessage(src, messageId);
     this.tabs.push(controller);
     this.selectTab(controller.state.id, { skipSave: true });
-    if (!opts.skipSave) this.saveIndex();
+    if (!opts.skipSave) {
+      this.saveIndex();
+      /* User-initiated new tab (or fork). Reset the TC001 to "ready" so a
+         lingering "thinking" / "needs_permission" from another tab doesn't
+         carry over. skipSave is set during plugin-load tab restore, where we
+         want to leave the device on whatever StateEmitter already emitted. */
+      StateEmitter.setState("ready");
+    }
   }
 
   /* Create a new tab whose state is the source tab's history truncated at
@@ -289,7 +297,13 @@ export class ClaudeChatView extends ItemView {
   }
 
   private showMcpManager() {
-    new MCPManagerModal(this.app, this.plugin.settings.claudePath).open();
+    new MCPManagerModal(this.app, this.plugin.settings.claudePath, () => {
+      /* When the modal closes, the active tab's cost-surface pill may be
+         stale (servers added/removed). Trigger a refresh so the count
+         reflects current mcp.json without needing a tab restart. */
+      const active = this.tabs.find(t => t.state.id === this.activeTabId);
+      if (active) void active.refreshCostSurface();
+    }).open();
   }
 
   private showSnippetPicker() {

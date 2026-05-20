@@ -164,6 +164,23 @@ export class MessageListRenderer {
     await next;
   }
 
+  /* Tear down all DOM and bookkeeping for a single message. Used when a
+     preamble pass is being folded into the following pass (interleaved
+     thinking can produce two adjacent assistant bubbles where the first is
+     a strict-prefix duplicate of the second). Also sweeps any tool elements
+     nested inside the bubble so their entries in toolEls don't dangle. */
+  removeMessage(id: string) {
+    const entry = this.liveEls.get(id);
+    if (!entry) return;
+    for (const [toolId, toolEl] of Array.from(this.toolEls)) {
+      if (entry.root.contains(toolEl)) this.toolEls.delete(toolId);
+    }
+    entry.root.remove();
+    this.liveEls.delete(id);
+    this.thinkingOpenOverride.delete(id);
+    this.renderChains.delete(id);
+  }
+
   private async doUpsert(msg: ChatMessage) {
     let entry = this.liveEls.get(msg.id);
     if (!entry) {
