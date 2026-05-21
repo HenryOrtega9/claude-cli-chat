@@ -9,6 +9,13 @@ export type ImageBlock = {
   source: { type: "base64"; media_type: string; data: string };
 };
 
+export type DocumentBlock = {
+  type: "document";
+  source: { type: "base64"; media_type: "application/pdf"; data: string };
+  /* Optional human-readable filename shown in citations. */
+  title?: string;
+};
+
 export type ToolUseBlock = {
   type: "tool_use";
   id: string;
@@ -27,8 +34,8 @@ export type RedactedThinkingBlock = {
   data: string;
 };
 
-/* Inputs we *send* — text + image only. */
-export type ContentBlock = TextBlock | ImageBlock;
+/* Inputs we *send* — text, image, and (for PDFs dropped from Finder) document. */
+export type ContentBlock = TextBlock | ImageBlock | DocumentBlock;
 
 /* What the model can *return* — text, tool_use, and the two thinking
    variants. Used for assistant message content and the streaming envelope's

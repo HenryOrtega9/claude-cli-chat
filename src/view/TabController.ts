@@ -1,4 +1,4 @@
-import { Notice, TFile, type App, type Component } from "obsidian";
+import { Notice, TFile, TFolder, type App, type Component } from "obsidian";
 import { MessageListRenderer } from "./MessageRenderer";
 import { ApprovalArea, type ApprovalDecision } from "./ApprovalModal";
 import { InputBox, type SubmitPayload, type Suggestion } from "./InputBox";
@@ -8,14 +8,19 @@ import { StatusIndicator } from "./StatusIndicator";
 import { SearchBar } from "./SearchBar";
 import { ActiveFileIndicator } from "./ActiveFileIndicator";
 import { SelectionTracker, type ActiveSelection } from "./SelectionTracker";
-import { makeMessageId, makeTabState, type ChatMessage, type TabState, type PendingApproval, type ToolCall } from "./state";
+import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
 import { resolveModelId, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet } from "../settings";
 import { RemoteControlSession, sessionFilePathFor } from "../claude/RemoteControlSession";
 import { JsonlTailer } from "../claude/JsonlTailer";
+import { SubagentSessionTracker, type SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
 import { generateTitle } from "../claude/TitleGenerator";
 import { MCPConfigStore } from "../mcp/MCPConfig";
+import { SubagentPicker } from "./SubagentPicker";
+import { CreateSubagentModal } from "./CreateSubagentModal";
+import type { SubagentEntry } from "../claude/SubagentDiscovery";
 import { StateEmitter } from "../claude/StateEmitter";
+import { extractOfficeText, isExtractableOffice } from "../util/officeExtract";
 import type ClaudeChatPlugin from "../main";
 import type {
   StreamEvent,
@@ -33,6 +38,7 @@ import type {
   ResultEvent,
   ErrorEvent,
   ImageBlock,
+  DocumentBlock,
   UsageEvent,
   UsageSnapshot,
 } from "../claude/Events";
@@ -75,6 +81,15 @@ export class TabController {
   /* Maps tool_use_id to the ChatMessage holding that tool call, so tool_result
      events can find their parent bubble. */
   private toolToMessage = new Map<string, string>();
+
+  /* One SubagentSessionTracker per active Task tool call. Created when the
+     tool's input finalizes (content_block_stop or assistant event) and
+     disposed when the matching tool_result arrives or the session is torn
+     down. The map's keys are tool_use_ids. */
+  private subagentTrackers = new Map<string, SubagentSessionTracker>();
+  /* Spawn timestamps per Task tool call, used to compute nestedDurationMs
+     when the tool_result arrives. */
+  private subagentSpawnTimes = new Map<string, number>();
 
   /* Optional fork handler — provided by ClaudeChatView so the controller can
      ask the view to create a new tab branching from a given message id. */
@@ -170,6 +185,15 @@ export class TabController {
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
         onSelectionDismissed: () => this.selectionTracker?.clear(),
+        /* Pill click opens the Create-subagent modal. Launching an existing
+           agent is still reachable via the /agent slash command, which keeps
+           the SubagentPicker path alive without needing a second toolbar
+           button. */
+        onAgentLaunch: () => this.openCreateSubagentModal(),
+        onPinFolder: path => this.activeFileIndicator.addPinnedPath(path),
+        onTryPinVaultPath: path => this.tryPinVaultPath(path),
+        onIsVaultDragActive: () => this.isVaultDragActive(),
+        onTryConsumeVaultDrag: () => this.tryConsumeVaultDrag(),
       },
       {
         model: (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel,
@@ -177,6 +201,10 @@ export class TabController {
         permissionMode: (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode,
       }
     );
+    /* Initial paint for the agents pill — visible whenever the catalog has
+       at least one entry. Re-painted in handlePluginSlashCommand after the
+       catalog refreshes. */
+    this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
     /* Mount the active-file pill bar inside the input wrapper (above the
        textarea) instead of letting it float above the entire input box.
        Parent is this.root only to satisfy the constructor; the next line
@@ -230,6 +258,11 @@ export class TabController {
     this.inputBox.setBusy(true);
     this.replayDone = this.replayMessages().finally(() => {
       if (!this.state.busy) this.inputBox.setBusy(false);
+      /* After replay, surface any in-flight Task/Agent tools the persisted
+         state still has marked running. Resumed tabs from a hard reload may
+         carry stale "running" statuses; surfacing them is honest to what's
+         in state and lets the user see something is unresolved. */
+      this.refreshRunningAgentCount();
     });
     this.updateWelcomeVisibility();
   }
@@ -302,6 +335,14 @@ export class TabController {
       if (s) {
         try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
       }
+      /* Stop any in-flight subagent JSONL trackers so they don't keep
+         pinging the disk after the parent session is gone. Fire and
+         forget; releasing the session-file claim happens inside stop(). */
+      for (const tracker of this.subagentTrackers.values()) {
+        void tracker.stop();
+      }
+      this.subagentTrackers.clear();
+      this.subagentSpawnTimes.clear();
       this.clearStreamingPointer();
       this.streamingBlocks.clear();
       this.passStartedAt = null;
@@ -491,7 +532,8 @@ export class TabController {
     const trimmed = text.trim();
     if (!trimmed.startsWith("/")) return false;
     /* Split on first whitespace so commands with args are matchable later. */
-    const [head] = trimmed.toLowerCase().split(/\s+/);
+    const parts = trimmed.split(/\s+/);
+    const head = parts[0].toLowerCase();
     switch (head) {
       case "/clear":
         void this.clear();
@@ -503,14 +545,19 @@ export class TabController {
         const builtins = allSlash.filter(s => !skills.includes(s));
         const skillsLine = skills.length > 0 ? `Skills (${skills.length}): ${skills.join(", ")}` : "Skills: (none discovered yet — send a message to spawn a session)";
         const builtinsLine = builtins.length > 0 ? `Slash commands: ${builtins.map(s => "/" + s).join(", ")}` : "";
+        const agentsLine = this.plugin.subagentCatalog.agents.length > 0
+          ? `Subagents (${this.plugin.subagentCatalog.agents.length}): ${this.plugin.subagentCatalog.agents.map(a => a.name).join(", ")}`
+          : "Subagents: (none discovered — add .md files under <vault>/.claude/agents/)";
         new Notice(
           [
             "Plugin commands:",
             "  /clear — reset this tab to a fresh session",
             "  /help — show this help",
+            "  /agent [name] — launch a subagent (Task tool); opens picker if name omitted",
             "",
             skillsLine,
             builtinsLine,
+            agentsLine,
             "",
             "Pick Opus Plan in the model pill for Anthropic's opusplan alias (Opus while in plan mode, Sonnet otherwise). Shift+Tab cycles permission modes.",
           ].filter(Boolean).join("\n"),
@@ -518,9 +565,80 @@ export class TabController {
         );
         return true;
       }
+      case "/agent": {
+        /* Refresh the catalog so edits made since the tab opened land
+           without a plugin reload. */
+        this.plugin.refreshSubagentCatalog();
+        this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
+        const name = parts[1];
+        const followup = parts.slice(2).join(" ").trim();
+        if (!name) {
+          this.openSubagentPicker(followup);
+          return true;
+        }
+        const entry = this.plugin.subagentCatalog.agents.find(a => a.name === name);
+        if (!entry) {
+          new Notice(
+            `No subagent named "${name}". Run /agent (no name) to pick from the discovered catalog.`,
+            8000,
+          );
+          return true;
+        }
+        this.launchSubagent(entry, followup);
+        return true;
+      }
       default:
         return false;
     }
+  }
+
+  /* Opens the Create-subagent modal. After a successful save the modal
+     calls back and we refresh the toolbar pill count so the new agent
+     surfaces immediately. */
+  openCreateSubagentModal(): void {
+    new CreateSubagentModal(this.app, this.plugin, () => {
+      this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
+    }).open();
+  }
+
+  /* Opens the SubagentPicker (Obsidian SuggestModal) and dispatches the
+     chosen entry. Optional `followup` is appended to the synthetic prompt
+     so the user can type `/agent some-followup-text` and have the picker
+     ask the chosen subagent to act on that text. */
+  openSubagentPicker(followup?: string): void {
+    const agents = this.plugin.subagentCatalog.agents;
+    if (agents.length === 0) {
+      new Notice(
+        "No subagents discovered. Add a markdown file under <vault>/.claude/agents/ or ~/.claude/agents/.",
+        8000,
+      );
+      return;
+    }
+    new SubagentPicker(this.app, agents, (entry) => {
+      this.launchSubagent(entry, followup ?? "");
+    }).open();
+  }
+
+  /* Build a synthetic user message asking Claude to invoke the Task tool
+     with the chosen subagent, then route it through submit() so the bubble
+     renders, persistence fires, and Phase 3's nested rendering activates
+     automatically. The synthetic prompt is the simplest reliable trigger;
+     phrasing here may need tuning per model (Haiku is the most literal,
+     Opus the most creative interpretation). */
+  launchSubagent(entry: SubagentEntry, followup?: string): void {
+    if (this.state.busy) {
+      new Notice("Wait for the current turn to finish before launching a subagent.");
+      return;
+    }
+    const followupText = (followup ?? "").trim();
+    const descBit = entry.description ? ` Description: "${entry.description}".` : "";
+    let text: string;
+    if (followupText) {
+      text = `Use the Task tool to launch the "${entry.name}" subagent.${descBit} ${followupText}`;
+    } else {
+      text = `Use the Task tool to launch the "${entry.name}" subagent.${descBit}`;
+    }
+    void this.submit({ text, attachments: [] });
   }
 
   /* Resets the active tab in place: kills the subprocess, wipes messages and
@@ -572,6 +690,21 @@ export class TabController {
       this.remoteSession = null;
     }
     await this.teardownSession("cancel");
+    /* Mark any Task/Agent tools that were still running as errored — the
+       subprocess just died, so they're not going to receive a tool_result.
+       Without this they linger at status=running indefinitely and the
+       Agents pill's running counter stays stuck. */
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      for (const t of m.toolCalls) {
+        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
+          t.status = "errored";
+          t.isError = true;
+          t.nestedStatus = "failed";
+        }
+      }
+    }
+    this.refreshRunningAgentCount();
     this.statusIndicator.hide();
     new Notice("Stopped Claude.");
     this.onStateChangeCb();
@@ -710,14 +843,35 @@ export class TabController {
     /* Pinned files from the file-pill bar inject as @-context. The pill bar
        is the new explicit mechanism (replaces the prior autoAttachActiveFile
        setting). Each pinned path is prepended once; duplicates the user
-       already wrote into the message are skipped. */
+       already wrote into the message are skipped.
+
+       Office binaries (.pptx, .docx) can't ride as @-refs — Claude Code's
+       Read tool rejects them. For those we extract plain text on the plugin
+       side and inline it as a fenced block; everything else still uses the
+       @-ref path so the CLI handles file expansion + caching. */
     const pinnedPaths = this.activeFileIndicator.getPinnedPaths();
-    const pinnedRefs = pinnedPaths
+    const officePaths = pinnedPaths.filter(p => isExtractableOffice(p));
+    const refPaths = pinnedPaths.filter(p => !isExtractableOffice(p));
+
+    const pinnedRefs = refPaths
       .filter(p => !text.includes(`@${p}`))
       .map(p => `@${p}`)
       .join(" ");
     if (pinnedRefs) {
       wireText = `${pinnedRefs} ${wireText}`;
+    }
+
+    const officeInlines: string[] = [];
+    for (const p of officePaths) {
+      try {
+        const extracted = await extractOfficeText(this.app, p);
+        officeInlines.push(`<file path="${p}">\n${extracted}\n</file>`);
+      } catch (err) {
+        new Notice(`Couldn't extract text from ${p}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (officeInlines.length > 0) {
+      wireText = `${officeInlines.join("\n\n")}\n\n${wireText}`;
     }
 
     /* If a selection was attached, render it as a small flag chip ABOVE
@@ -752,7 +906,10 @@ export class TabController {
          selection block prefix. */
       this.state.title = text.slice(0, 48);
     } else if (this.state.title === "New chat" && attachments.length > 0) {
-      this.state.title = `Image (${attachments.length})`;
+      const allImages = attachments.every(a => (a.kind ?? "image") === "image");
+      this.state.title = allImages
+        ? `Image (${attachments.length})`
+        : `Attachment (${attachments.length})`;
     }
     this.updateWelcomeVisibility();
     await this.renderer.upsertMessage(msg);
@@ -787,19 +944,58 @@ export class TabController {
        read at least one user message from stdin. Writing immediately after
        spawn is the correct pattern. The CLI processes the message, then
        emits init + response together. */
-    if (attachments.length === 0) {
-      session.sendUserText(wireText);
+    /* Build per-kind output. Text attachments don't ride as content blocks —
+       they get inlined into wireText as <file path="…"> envelopes, same shape
+       as the office-extraction path above. Images and PDFs ride as blocks.
+       Anything that fails its data/content invariant (shouldn't happen in
+       practice; defensive against future persisted-shape drift) is logged
+       and skipped rather than silently dropped or sent with bad data. */
+    const mediaBlocks: ContentBlock[] = [];
+    const textInlines: string[] = [];
+    for (const att of attachments) {
+      const kind = att.kind ?? "image";
+      if (kind === "image") {
+        if (!att.data) {
+          console.warn("[claude-cli-chat] image attachment missing data; skipping", att);
+          continue;
+        }
+        const block: ImageBlock = {
+          type: "image",
+          source: { type: "base64", media_type: att.mediaType, data: att.data },
+        };
+        mediaBlocks.push(block);
+      } else if (kind === "pdf") {
+        if (!att.data) {
+          console.warn("[claude-cli-chat] pdf attachment missing data; skipping", att);
+          continue;
+        }
+        /* No `title` field — undocumented for base64-PDF document blocks and
+           may trip the CLI's Zod schema validation (see CLAUDE.md wire-format
+           gotcha #4). The filename rides on the chip in the bubble, which is
+           enough for the user; Claude infers context from the PDF content. */
+        const block: DocumentBlock = {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: att.data },
+        };
+        mediaBlocks.push(block);
+      } else if (kind === "text") {
+        if (att.content === undefined) {
+          console.warn("[claude-cli-chat] text attachment missing content; skipping", att);
+          continue;
+        }
+        const path = att.filename ?? "attached.txt";
+        textInlines.push(`<file path="${path}">\n${att.content}\n</file>`);
+      }
+    }
+    const finalText = textInlines.length > 0
+      ? `${textInlines.join("\n\n")}\n\n${wireText}`
+      : wireText;
+    if (mediaBlocks.length === 0) {
+      session.sendUserText(finalText);
       return;
     }
-    const blocks: ContentBlock[] = [];
-    for (const att of attachments) {
-      const block: ImageBlock = {
-        type: "image",
-        source: { type: "base64", media_type: att.mediaType, data: att.data },
-      };
-      blocks.push(block);
-    }
-    if (wireText) blocks.push({ type: "text", text: wireText });
+    const blocks: ContentBlock[] = [...mediaBlocks];
+    if (finalText) blocks.push({ type: "text", text: finalText });
     session.sendUserContent(blocks);
   }
 
@@ -944,6 +1140,7 @@ export class TabController {
         if (!msg.toolCalls.find(t => t.id === block.id)) {
           msg.toolCalls.push({ id: block.id, name: block.name, input: block.input ?? {}, status: "running" });
           this.toolToMessage.set(block.id, msg.id);
+          if (block.name === "Task" || block.name === "Agent") this.refreshRunningAgentCount();
         }
         this.streamingBlocks.set(inner.index, { kind: "tool", toolId: block.id, partialJson: "" });
         /* Re-arm the gerund spinner. Tool execution is a silent server-side
@@ -1007,6 +1204,15 @@ export class TabController {
         const msg = this.getOrCreateStreamingAssistantMessage();
         msg.thinkingStreaming = false;
         await this.renderer.upsertMessage(msg);
+      } else if (slot?.kind === "tool") {
+        /* Tool input is now finalized. Start the subagent tracker if this
+           is a Task tool — by spawn time the CLI has already begun running
+           the subagent, so kicking off the JSONL watcher here gives us the
+           earliest window before any nested events land. */
+        const msgId = this.toolToMessage.get(slot.toolId);
+        const msg = msgId ? this.state.messages.find(m => m.id === msgId) : undefined;
+        const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
+        if (tool && msg) this.maybeStartSubagentTracker(tool, msg);
       }
       this.streamingBlocks.delete(inner.index);
       /* If a tool block is still streaming after this text/thinking block
@@ -1055,9 +1261,16 @@ export class TabController {
       const existing = msg.toolCalls.find(t => t.id === tu.id);
       if (existing) {
         existing.input = tu.input;
+        /* Late-arriving final input may be the first place a Task tool's
+           prompt is fully populated in non-streaming mode. Try to start a
+           tracker; maybeStart is idempotent. */
+        this.maybeStartSubagentTracker(existing, msg);
       } else {
-        msg.toolCalls.push({ id: tu.id, name: tu.name, input: tu.input, status: "running" });
+        const newTool: ToolCall = { id: tu.id, name: tu.name, input: tu.input, status: "running" };
+        msg.toolCalls.push(newTool);
         this.toolToMessage.set(tu.id, msg.id);
+        this.maybeStartSubagentTracker(newTool, msg);
+        if (tu.name === "Task" || tu.name === "Agent") this.refreshRunningAgentCount();
       }
     }
 
@@ -1093,13 +1306,14 @@ export class TabController {
   /* Interleaved thinking can produce two adjacent assistant passes where the
      first is a partial preamble ("I'll build the…"), gets interrupted by a
      thinking block, and the second pass re-emits the same opening in full
-     ("I'll build the… file now."). The two render as duplicate bubbles each
-     with their own "Thought for Ns" footer. When the second pass finalizes,
-     fold the earlier preamble into it: drop the older bubble from state +
-     DOM, sum the durations, and prefer the longer thinking trace (the long
-     pass's reasoning is the substantive one; the short pass after it is
-     usually a sanity-check). Guarded so it never collapses a real preamble
-     that was followed by a tool call, or short single-character prefixes. */
+     ("I'll build the… file now."). The degenerate case is when the second
+     pass re-emits the identical sentence verbatim — same text, two bubbles,
+     two "Thought for Ns" footers. When the second pass finalizes, fold the
+     earlier preamble into it: drop the older bubble from state + DOM, sum
+     the durations, and prefer the longer thinking trace (the long pass's
+     reasoning is the substantive one; the short pass after it is usually a
+     sanity-check). Guarded so it never collapses a real preamble that was
+     followed by a tool call, or short single-character prefixes. */
   private maybeMergePrefixPreamble(current: ChatMessage) {
     const idx = this.state.messages.findIndex(m => m.id === current.id);
     if (idx <= 0) return;
@@ -1110,7 +1324,7 @@ export class TabController {
     const prevText = prev.content.trim();
     const currText = current.content.trim();
     if (prevText.length < 20) return;
-    if (prevText.length >= currText.length) return;
+    if (prevText.length > currText.length) return;
     if (!currText.startsWith(prevText)) return;
 
     if (prev.durationMs !== undefined) {
@@ -1135,6 +1349,9 @@ export class TabController {
     };
     msg.toolCalls.push(tool);
     this.toolToMessage.set(event.id, msg.id);
+    /* Non-streaming fallback path. In stream mode the tracker has already
+       been started from content_block_stop; this maybeStart no-ops then. */
+    this.maybeStartSubagentTracker(tool, msg);
     await this.renderer.upsertMessage(msg);
   }
 
@@ -1149,7 +1366,103 @@ export class TabController {
     tool.status = event.is_error ? "errored" : "completed";
     tool.isError = !!event.is_error;
     tool.result = this.flattenContent(event.content);
+    /* Finalize subagent tracking on Task/Agent tool completion: stop the
+       tailer, compute duration, and flip nestedStatus. Leaves nestedEvents
+       in place so the user can keep scrolling through what the subagent
+       did. Tool name is "Task" on Claude Code 2.1.141 and "Agent" on
+       2.1.143+. */
+    if (tool.name === "Task" || tool.name === "Agent") {
+      const tracker = this.subagentTrackers.get(event.tool_use_id);
+      if (tracker) {
+        void tracker.stop();
+        this.subagentTrackers.delete(event.tool_use_id);
+      }
+      const spawnedAt = this.subagentSpawnTimes.get(event.tool_use_id);
+      if (spawnedAt !== undefined) {
+        tool.nestedDurationMs = Date.now() - spawnedAt;
+        this.subagentSpawnTimes.delete(event.tool_use_id);
+      }
+      tool.nestedStatus = event.is_error ? "failed" : "completed";
+      this.refreshRunningAgentCount();
+    }
     await this.renderer.upsertMessage(msg);
+  }
+
+  /* Starts a SubagentSessionTracker for a Task/Agent tool, idempotent per
+     tool id. Triggered from three places: content_block_stop (streaming),
+     handleAssistant (final assistant event), and handleToolUse (non-
+     streaming). All three reach the same point once tool.input.prompt is
+     populated; first call wins. Tool name is "Task" on Claude Code 2.1.141
+     and "Agent" on 2.1.143+. */
+  private maybeStartSubagentTracker(tool: ToolCall, _msg: ChatMessage): void {
+    if (tool.name !== "Task" && tool.name !== "Agent") return;
+    if (this.subagentTrackers.has(tool.id)) return;
+    if (!this.state.sessionId) return;
+    const cwd = this.plugin.getVaultPath();
+    if (!cwd) return;
+    const promptVal = (tool.input as { prompt?: unknown })?.prompt;
+    const parentPrompt = typeof promptVal === "string" ? promptVal : "";
+
+    tool.nestedStatus = "spawning";
+    tool.nestedEvents = tool.nestedEvents ?? [];
+    this.subagentSpawnTimes.set(tool.id, Date.now());
+
+    const tracker = new SubagentSessionTracker({
+      cwd,
+      parentSessionId: this.state.sessionId,
+      parentToolUseId: tool.id,
+      parentPrompt,
+      onUpdate: (update) => this.applySubagentUpdate(tool.id, update),
+      subprocessManager: this.plugin.subprocessManager,
+    });
+    this.subagentTrackers.set(tool.id, tracker);
+    tracker.start();
+  }
+
+  /* Applies one tracker update to the corresponding ToolCall: appends
+     events (with cap), promotes status, applies nested tool_use status
+     updates, and triggers a renderer pass. Tolerant of late updates
+     arriving after the tool_result already finalized — the nestedStatus
+     check prevents the "running" status from clobbering "completed". */
+  private applySubagentUpdate(toolId: string, update: SubagentTrackerUpdate): void {
+    const msgId = this.toolToMessage.get(toolId);
+    if (!msgId) return;
+    const msg = this.state.messages.find(m => m.id === msgId);
+    if (!msg || !msg.toolCalls) return;
+    const tool = msg.toolCalls.find(t => t.id === toolId);
+    if (!tool) return;
+
+    if (update.sessionId && !tool.nestedSessionId) {
+      tool.nestedSessionId = update.sessionId;
+      if (tool.nestedStatus === "spawning") tool.nestedStatus = "running";
+    }
+
+    if (update.events.length > 0) {
+      tool.nestedEvents = tool.nestedEvents ?? [];
+      for (const e of update.events) tool.nestedEvents.push(e);
+      if (tool.nestedEvents.length > NESTED_EVENTS_CAP) {
+        const overflow = tool.nestedEvents.length - NESTED_EVENTS_CAP;
+        tool.nestedTruncatedCount = (tool.nestedTruncatedCount ?? 0) + overflow;
+        tool.nestedEvents = tool.nestedEvents.slice(overflow);
+      }
+    }
+
+    if (update.toolUseUpdates) {
+      for (const u of update.toolUseUpdates) {
+        const entry = tool.nestedEvents?.find(
+          (e): e is Extract<NestedSubagentEvent, { kind: "tool_use" }> =>
+            e.kind === "tool_use" && e.id === u.id,
+        );
+        if (entry) {
+          entry.status = u.status;
+          entry.result = u.result;
+          entry.isError = u.isError;
+        }
+      }
+    }
+
+    void this.renderer.upsertMessage(msg);
+    this.onStateChangeCb();
   }
 
   private handleControlRequest(event: ControlRequestEvent) {
@@ -1174,6 +1487,28 @@ export class TabController {
     this.statusIndicator.hide();
     this.clearStreamingPointer();
     this.passStartedAt = null;
+    /* Turn-end reconciliation for Task/Agent tools. If the model produced
+       a final synthesis (we're in handleResult), every subagent it relied
+       on must have returned a tool_result — otherwise the model couldn't
+       have written the answer. In practice though, a few tool_result events
+       can be missed by handleToolResult (out-of-order delivery, parser
+       skipping a synthetic user envelope, a state restore mid-turn). Without
+       a sweep those tools linger at status=running, leaving the Agents pill
+       stuck on a non-zero count after the turn settles. Force-close them. */
+    let swept = 0;
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      for (const t of m.toolCalls) {
+        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
+          t.status = "completed";
+          if (t.nestedStatus !== "completed" && t.nestedStatus !== "failed") {
+            t.nestedStatus = "completed";
+          }
+          swept++;
+        }
+      }
+    }
+    if (swept > 0) this.refreshRunningAgentCount();
     /* Turn settled. StateEmitter auto-transitions complete -> ready after
        10s (matches the daemon's COMPLETE_TIMEOUT_S), and the animator daemon
        times ready -> idle after 60s. */
@@ -1370,35 +1705,167 @@ export class TabController {
     this.streamingAssistantMessageId = null;
   }
 
-  /* Rank vault files for an @-mention query. Simple heuristic: prefer
-     basename matches over path matches, then prefer prefix matches over
-     substring matches. Cap at 20 results. Claude Code understands `@<path>`
-     references natively (the CLI expands them into file content). */
+  /* Walk all messages and count Task/Agent tool calls still in flight
+     (status === "running"). Cheap O(messages × toolCalls), called on every
+     tool start/finish — counts grow slowly in practice so the walk is fine.
+     "Task" matches Claude Code 2.1.141 and earlier; "Agent" matches 2.1.143+
+     where the tool was renamed. */
+  private refreshRunningAgentCount(): void {
+    let running = 0;
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      for (const t of m.toolCalls) {
+        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
+          running++;
+        }
+      }
+    }
+    this.inputBox.setRunningAgentCount(running);
+  }
+
+  /* Best-effort vault-path resolution for items dropped from the Obsidian
+     file explorer. Tries the path as-is first (full vault path from a file
+     drag), then a wikilink-style resolution for bare names (handles drags
+     of a [[Note]]). Returns true when a vault item was found and pinned —
+     the InputBox uses this to decide whether to skip its text-insert
+     fallback. The pill bar handles file-vs-folder rendering via its own
+     vault lookup, so this method doesn't need to distinguish kinds. */
+  private tryPinVaultPath(path: string): boolean {
+    const direct = this.app.vault.getAbstractFileByPath(path);
+    if (direct instanceof TFile || direct instanceof TFolder) {
+      this.activeFileIndicator.addPinnedPath(direct.path);
+      return true;
+    }
+    /* Wikilink fallback: resolve bare note names like "MyNote" against the
+       metadata cache. Sources from the active file's path so relative
+       resolution works the same as Obsidian's built-in link resolution. */
+    const activePath = this.app.workspace.getActiveFile()?.path ?? "";
+    const dest = this.app.metadataCache.getFirstLinkpathDest(path, activePath);
+    if (dest) {
+      this.activeFileIndicator.addPinnedPath(dest.path);
+      return true;
+    }
+    return false;
+  }
+
+  /* Reads Obsidian's internal drag state. The file-explorer drag populates
+     `app.dragManager.draggable` with the dragged TFile/TFolder (or a
+     `files` array for multi-select) but typically leaves the HTML5
+     dataTransfer empty, so this is the only reliable way to detect that
+     a vault drag is in flight from inside our dragover/drop handlers. The
+     `dragManager` field is internal (not in the public Obsidian d.ts), so
+     we narrow through `unknown` rather than reaching for `any`. */
+  private readDragManagerItems(): Array<TFile | TFolder> {
+    const dm = (this.app as unknown as {
+      dragManager?: {
+        draggable?: {
+          file?: unknown;
+          files?: unknown[];
+          source?: unknown;
+          type?: unknown;
+        };
+      };
+    }).dragManager;
+    const draggable = dm?.draggable;
+    if (!draggable) return [];
+    const collected: Array<TFile | TFolder> = [];
+    if (draggable.file instanceof TFile || draggable.file instanceof TFolder) {
+      collected.push(draggable.file);
+    }
+    if (Array.isArray(draggable.files)) {
+      for (const f of draggable.files) {
+        if (f instanceof TFile || f instanceof TFolder) collected.push(f);
+      }
+    }
+    return collected;
+  }
+
+  private isVaultDragActive(): boolean {
+    return this.readDragManagerItems().length > 0;
+  }
+
+  /* Consumes the active Obsidian drag (if any) by pinning every dragged
+     TFile/TFolder. Returns true when at least one item was pinned so the
+     InputBox knows to skip its text/plain fallback. Files and folders both
+     route through the same pin call — ActiveFileIndicator picks the icon
+     and color per item via its own vault lookup. */
+  private tryConsumeVaultDrag(): boolean {
+    const items = this.readDragManagerItems();
+    if (items.length === 0) return false;
+    for (const item of items) {
+      this.activeFileIndicator.addPinnedPath(item.path);
+    }
+    return true;
+  }
+
+  /* Rank vault files AND folders for an @-mention query. Simple heuristic:
+     prefer basename matches over path matches, then prefer prefix matches
+     over substring matches. Cap at 20 results. Claude Code understands
+     `@<path>` references natively for files (the CLI expands them into file
+     content); folders are routed to onPinFolder instead and become pinned
+     pills rather than text references. */
   private queryFileSuggestions(query: string): Suggestion[] {
     const q = query.toLowerCase();
-    const files = this.app.vault.getFiles();
-    type Scored = { file: TFile; score: number };
+    type Scored = { kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string; score: number };
     const scored: Scored[] = [];
-    for (const f of files) {
-      const base = f.basename.toLowerCase();
-      const path = f.path.toLowerCase();
-      let score = -1;
-      if (q.length === 0) {
-        /* Empty query: show recently modified files first. */
-        score = f.stat.mtime;
-      } else if (base.startsWith(q)) score = 1000 - f.path.length;
-      else if (base.includes(q)) score = 800 - f.path.length;
-      else if (path.includes(q)) score = 400 - f.path.length;
-      if (score >= 0) scored.push({ file: f, score });
+
+    const scoreOf = (name: string, path: string, mtime: number): number => {
+      const base = name.toLowerCase();
+      const lpath = path.toLowerCase();
+      if (q.length === 0) return mtime;
+      if (base.startsWith(q)) return 1000 - path.length;
+      if (base.includes(q)) return 800 - path.length;
+      if (lpath.includes(q)) return 400 - path.length;
+      return -1;
+    };
+
+    for (const f of this.app.vault.getFiles()) {
+      const score = scoreOf(f.basename, f.path, f.stat.mtime);
+      if (score >= 0) scored.push({
+        kind: "file", path: f.path, name: f.basename, mtime: f.stat.mtime, ext: f.extension, score,
+      });
     }
+    /* Walk every folder. The vault root is named "" — skip it so the user
+       can't pin "the entire vault" by accident. Folder mtime isn't directly
+       exposed, so use 0 as a neutral sort key when the query is empty
+       (folders bunch at the bottom of the empty-query list, which matches
+       Obsidian's quick-switcher behavior). */
+    const walkFolders = (folder: TFolder) => {
+      for (const child of folder.children) {
+        if (child instanceof TFolder) {
+          if (child.path !== "" && child.path !== "/") {
+            const score = scoreOf(child.name, child.path, 0);
+            if (score >= 0) scored.push({
+              kind: "folder", path: child.path, name: child.name, mtime: 0, ext: "", score,
+            });
+          }
+          walkFolders(child);
+        }
+      }
+    };
+    walkFolders(this.app.vault.getRoot());
+
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, 20).map(({ file }) => ({
-      id: file.path,
-      primary: file.basename,
-      secondary: file.path,
-      icon: file.extension === "md" ? "file-text" : "file",
-      insert: `@${file.path}`,
-    }));
+    return scored.slice(0, 20).map((s): Suggestion => s.kind === "folder"
+      ? {
+          id: s.path,
+          primary: s.name,
+          secondary: s.path,
+          icon: "folder",
+          /* `insert` is unused for folders (acceptSuggestion routes them to
+             onPinFolder) but kept non-empty so it's safe if the callback is
+             absent and we fall back to text insertion. */
+          insert: `@${s.path}`,
+          kind: "folder",
+        }
+      : {
+          id: s.path,
+          primary: s.name,
+          secondary: s.path,
+          icon: s.ext === "md" ? "file-text" : "file",
+          insert: `@${s.path}`,
+          kind: "file",
+        });
   }
 
   /* Slash-command palette. Four sources merged:
@@ -1420,10 +1887,27 @@ export class TabController {
     const pluginCmds: Cmd[] = [
       { cmd: "/clear", desc: "Reset this tab — start a fresh Claude session", icon: "rotate-ccw" },
       { cmd: "/help",  desc: "Show plugin slash-command help", icon: "circle-help" },
+      { cmd: "/agent", desc: "Launch a subagent (Task tool) — pick from the discovered catalog", icon: "users", insert: "/agent " },
     ];
+
+    /* Per-agent entries so power users can fuzzy-match directly to a named
+       subagent. Inserted as `/agent <name>` so submit() routes them through
+       handlePluginSlashCommand below. */
+    const agentCmds: Cmd[] = this.plugin.subagentCatalog.agents.map(a => ({
+      cmd: `/agent ${a.name}`,
+      desc: a.description ?? `${a.source} subagent`,
+      icon: "users",
+      insert: `/agent ${a.name}`,
+    }));
 
     const pluginNameSet = new Set(pluginCmds.map(c => c.cmd.slice(1)));
     const seen = new Set<string>(pluginNameSet);
+    /* Block raw subagent names from being shadowed by skill/builtin entries
+       of the same name. The agent entries themselves carry the `/agent `
+       prefix so they don't collide with anything else, but we add their
+       bare names to the seen set as a courtesy in case someone names an
+       agent "clear" or similar. */
+    for (const a of this.plugin.subagentCatalog.agents) seen.add(`agent ${a.name}`);
 
     /* CLI init takes priority over disk-discovered list when present —
        it's the ground truth for what's loaded right now. */
@@ -1479,7 +1963,7 @@ export class TabController {
       }
     }
 
-    const commands = [...pluginCmds, ...skillCmds, ...builtinCmds];
+    const commands = [...pluginCmds, ...agentCmds, ...skillCmds, ...builtinCmds];
     const q = query.toLowerCase();
     return commands
       .filter(c => c.cmd.slice(1).toLowerCase().includes(q))

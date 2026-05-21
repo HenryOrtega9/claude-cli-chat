@@ -1,5 +1,5 @@
 import { App, Component, MarkdownRenderer, Notice, setIcon } from "obsidian";
-import type { ChatMessage, ToolCall } from "./state";
+import type { Attachment, ChatMessage, NestedSubagentEvent, ToolCall } from "./state";
 import { editOpsFromInput, renderDiff, renderWritePreview } from "./DiffRenderer";
 
 export type MessageActionCallbacks = {
@@ -258,13 +258,15 @@ export class MessageListRenderer {
       this.renderTodoList(toolEl, tool);
     }
 
-    /* Task tool (subagent invocation) — render the subagent type + the short
-       description above the collapsed prompt so the user can see at a glance
-       what was delegated, without having to expand. */
-    const isTask = tool.name === "Task";
+    /* Task / Agent tool (subagent invocation) — render the subagent type +
+       the short description above the collapsed prompt so the user can see
+       at a glance what was delegated, without having to expand. The tool
+       name varies by CLI version: Claude Code 2.1.141 emitted "Task";
+       2.1.143+ emits "Agent". Match both. */
+    const isSubagentSpawn = tool.name === "Task" || tool.name === "Agent";
     const existingSubagent = toolEl.querySelector(".claudian-subagent-summary");
     if (existingSubagent) existingSubagent.remove();
-    if (isTask) {
+    if (isSubagentSpawn) {
       this.renderSubagentSummary(toolEl, tool);
     }
 
@@ -439,22 +441,42 @@ export class MessageListRenderer {
        the bubble hugs the image nicely. */
     const liftAttachmentsAboveBubble = hasAttachments && hasUserText;
 
+    const renderAttachmentInto = (parent: HTMLElement, att: Attachment) => {
+      const kind = att.kind ?? "image";
+      if (kind === "image") {
+        if (att.data) {
+          const img = parent.createEl("img", { cls: "claudian-message-attachment" });
+          img.src = `data:${att.mediaType};base64,${att.data}`;
+          img.alt = att.filename ?? "Pasted image";
+          return;
+        }
+        /* Image attachment with no data — defensive path. Render as a chip
+           with the image icon so the user still sees "an image was here"
+           rather than misleading "file" iconography. */
+        const chip = parent.createDiv({ cls: "claudian-message-attachment claudian-message-attachment-file" });
+        const iconEl = chip.createSpan({ cls: "claudian-message-attachment-icon" });
+        setIcon(iconEl, "image");
+        const label = att.filename ?? "Image (data missing)";
+        chip.createSpan({ cls: "claudian-message-attachment-label", text: label, attr: { title: label } });
+        return;
+      }
+      /* pdf / text — render as a compact file chip. Same visual treatment for
+         both; only the icon differs so the user can scan-distinguish. */
+      const chip = parent.createDiv({ cls: "claudian-message-attachment claudian-message-attachment-file" });
+      const iconEl = chip.createSpan({ cls: "claudian-message-attachment-icon" });
+      setIcon(iconEl, kind === "pdf" ? "file-text" : "file");
+      const label = att.filename ?? (kind === "pdf" ? "document.pdf" : "file");
+      chip.createSpan({ cls: "claudian-message-attachment-label", text: label, attr: { title: label } });
+    };
+
     if (hasAttachments && !liftAttachmentsAboveBubble) {
       const attRow = el.createDiv({ cls: "claudian-message-attachments" });
-      for (const att of msg.attachments!) {
-        const img = attRow.createEl("img", { cls: "claudian-message-attachment" });
-        img.src = `data:${att.mediaType};base64,${att.data}`;
-        img.alt = "Pasted image";
-      }
+      for (const att of msg.attachments!) renderAttachmentInto(attRow, att);
     }
     if (liftAttachmentsAboveBubble && wrapper) {
       const bubbleRoot = el.parentElement;
       const attRow = createDiv({ cls: "claudian-message-attachments claudian-message-attachments-above" });
-      for (const att of msg.attachments!) {
-        const img = attRow.createEl("img", { cls: "claudian-message-attachment" });
-        img.src = `data:${att.mediaType};base64,${att.data}`;
-        img.alt = "Pasted image";
-      }
+      for (const att of msg.attachments!) renderAttachmentInto(attRow, att);
       if (bubbleRoot) wrapper.insertBefore(attRow, bubbleRoot);
       else wrapper.appendChild(attRow);
     }
@@ -669,25 +691,105 @@ export class MessageListRenderer {
 
   /* Render the Task tool's subagent_type + description prominently in a
      summary block above the collapsed prompt. The header's title text also
-     gets retitled to "Task → <subagent_type>" so the row scans clearly. */
+     gets retitled to "Task → <subagent_type>" so the row scans clearly.
+     When SubagentSessionTracker has populated nestedEvents, this also
+     renders a nested timeline of what the subagent did (text/thinking/tool
+     calls) plus a status line with elapsed duration. */
   private renderSubagentSummary(toolEl: HTMLElement, tool: ToolCall) {
     const input = tool.input as { subagent_type?: string; description?: string; prompt?: string };
     const subagentType = input.subagent_type ?? "agent";
     const description = input.description ?? "";
 
-    /* Retitle the header's tool name to make the subagent visible at a glance. */
+    /* Retitle the header's tool name to make the subagent visible at a glance.
+       Use the actual tool name as prefix so the row reads correctly across
+       CLI versions ("Task → general-purpose" vs "Agent → general-purpose"). */
     const nameEl = toolEl.querySelector(".claudian-tool-name") as HTMLElement | null;
-    if (nameEl) nameEl.setText(`Task → ${subagentType}`);
+    if (nameEl) nameEl.setText(`${tool.name} → ${subagentType}`);
 
-    if (!description) return;
+    const hasNestedSurface =
+      !!description ||
+      tool.nestedStatus !== undefined ||
+      (tool.nestedEvents && tool.nestedEvents.length > 0) ||
+      (tool.nestedTruncatedCount ?? 0) > 0;
+    if (!hasNestedSurface) return;
+
     const container = createDiv({ cls: "claudian-subagent-summary" });
-    container.createDiv({ cls: "claudian-subagent-description", text: description });
+    if (description) {
+      container.createDiv({ cls: "claudian-subagent-description", text: description });
+    }
+
+    /* Status line: state + duration when finalized. */
+    if (tool.nestedStatus) {
+      const statusLine = container.createDiv({
+        cls: `claudian-subagent-status-line is-${tool.nestedStatus}`,
+      });
+      statusLine.createSpan({ text: this.subagentStatusLabel(tool) });
+    }
+
+    /* Nested events timeline. */
+    if ((tool.nestedEvents && tool.nestedEvents.length > 0) || (tool.nestedTruncatedCount ?? 0) > 0) {
+      const events = container.createDiv({ cls: "claudian-subagent-events" });
+      if ((tool.nestedTruncatedCount ?? 0) > 0) {
+        events.createDiv({
+          cls: "claudian-subagent-events-truncated",
+          text: `+${tool.nestedTruncatedCount} earlier events dropped`,
+        });
+      }
+      for (const evt of tool.nestedEvents ?? []) {
+        this.renderNestedEvent(events, evt);
+      }
+    }
+
     const header = toolEl.querySelector(".claudian-tool-header");
     if (header && header.nextSibling) {
       toolEl.insertBefore(container, header.nextSibling);
     } else {
       toolEl.appendChild(container);
     }
+  }
+
+  private subagentStatusLabel(tool: ToolCall): string {
+    const dur = tool.nestedDurationMs;
+    const durStr = dur !== undefined ? ` · ${this.formatDuration(dur)}` : "";
+    switch (tool.nestedStatus) {
+      case "spawning": return "Spawning subagent…";
+      case "running":  return `Running${durStr}`;
+      case "completed": return `Completed${durStr}`;
+      case "failed":   return `Failed${durStr}`;
+      default: return "";
+    }
+  }
+
+  private renderNestedEvent(parent: HTMLElement, evt: NestedSubagentEvent) {
+    const row = parent.createDiv({ cls: "claudian-subagent-event" });
+    if (evt.kind === "text") {
+      row.createDiv({ cls: "claudian-subagent-event-text", text: evt.text });
+    } else if (evt.kind === "thinking") {
+      row.createDiv({ cls: "claudian-subagent-event-thinking", text: evt.text });
+    } else if (evt.kind === "tool_use") {
+      const toolRow = row.createDiv({ cls: "claudian-subagent-event-tool" });
+      toolRow.createSpan({ cls: "claudian-subagent-event-tool-name", text: evt.name });
+      const subject = this.nestedToolSubject(evt);
+      if (subject) toolRow.createSpan({ text: ` ${subject}` });
+      toolRow.createSpan({
+        cls: "claudian-subagent-event-tool-status",
+        text: ` [${evt.status}${evt.isError ? " · err" : ""}]`,
+      });
+    }
+  }
+
+  /* Best-effort subject string for a nested tool row. Mirrors subjectForTool's
+     intent — pick a short identifier (file_path / pattern / command) — but
+     stays scoped to the nested rendering so a future change in subjectForTool
+     doesn't accidentally reflow the timeline. */
+  private nestedToolSubject(evt: Extract<NestedSubagentEvent, { kind: "tool_use" }>): string | null {
+    const input = evt.input as { file_path?: string; path?: string; command?: string; pattern?: string; subagent_type?: string };
+    if (typeof input.file_path === "string") return input.file_path;
+    if (typeof input.path === "string") return input.path;
+    if (typeof input.command === "string") return input.command.length > 80 ? input.command.slice(0, 80) + "…" : input.command;
+    if (typeof input.pattern === "string") return input.pattern;
+    if (typeof input.subagent_type === "string") return input.subagent_type;
+    return null;
   }
 
   /* Explicit scroll trigger from upsertMessage. ResizeObserver handles

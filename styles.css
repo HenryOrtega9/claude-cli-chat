@@ -17,6 +17,12 @@
 .workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-container {
   --claudian-brand: #D97757;
   --claudian-brand-rgb: 217, 119, 87;
+  /* Claude palette blue — same tone used by the plan-mode pill (the only
+     other established blue accent in this plugin's UI). Exposed as a token
+     so folder pills, future blue accents, and any user CSS overrides can
+     share the same value. */
+  --claudian-blue: #5b8def;
+  --claudian-blue-rgb: 91, 141, 239;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -635,6 +641,31 @@ mark.claudian-search-mark.is-active {
   transition: background 800ms ease, color 800ms ease, border-color 800ms ease;
 }
 
+/* Folder pins — recolored in Claude blue so they're visually distinct from
+   file pins (brand orange). Same shape, sizing, and behavior; only the hue
+   changes so the bar reads as "files in orange, folders in blue" at a
+   glance. Sticky styling still works because .is-sticky targets the badge
+   visibility independently. */
+.claudian-file-pill.is-folder {
+  background: rgba(var(--claudian-blue-rgb), 0.12);
+  border-color: rgba(var(--claudian-blue-rgb), 0.4);
+  color: var(--claudian-blue);
+}
+.claudian-file-pill.is-folder:hover {
+  background: rgba(var(--claudian-blue-rgb), 0.18);
+}
+.claudian-file-pill.is-folder.is-pinned {
+  background: rgba(var(--claudian-blue-rgb), 0.18);
+  border-color: rgba(var(--claudian-blue-rgb), 0.5);
+  color: var(--claudian-blue);
+}
+.claudian-file-pill.is-folder.is-pinned:hover {
+  background: rgba(var(--claudian-blue-rgb), 0.28);
+}
+.claudian-file-pill.is-folder.is-pinned.is-sticky {
+  border-color: var(--claudian-blue);
+}
+
 /* ---- Per-message action toolbar -------------------------- */
 .claudian-message {
   position: relative;
@@ -838,6 +869,17 @@ mark.claudian-search-mark.is-active {
      adjacent assistant passes is the .claudian-messages `gap: 10px` plus
      intra-bubble tool margins. Same-bubble tool spacing is unchanged. */
   padding: 0;
+}
+/* Pass-boundary tightening for tool-only continuations. When the model's
+   first pass ends with a tool call and the next pass is also tool-only
+   (parallel Bash fan-out is the canonical case), the 10px .claudian-messages
+   gap reads as an awkward break against the ~2px intra-bubble tool margin
+   below it. Pull the lower wrapper up so the row-to-row rhythm matches the
+   rest of the tool stack. Scoped via :has() to assistant-after-assistant
+   pairs whose lower bubble has tool calls but no rendered text or thinking;
+   prose continuations keep the full gap. */
+.claudian-message-wrapper-assistant + .claudian-message-wrapper-assistant:has(> .claudian-message > .claudian-tool-call):not(:has(> .claudian-message > .claudian-message-content > .claudian-text-block:not(:empty))):not(:has(> .claudian-message > .claudian-message-content > .claudian-thinking-block)) {
+  margin-top: -8px;
 }
 .claudian-message-content {
   font-size: var(--font-text-size, 14px);
@@ -1083,6 +1125,14 @@ mark.claudian-search-mark.is-active {
 .claudian-input-wrapper:focus-within {
   border-color: rgba(var(--claudian-brand-rgb), 0.55);
 }
+/* Dragover affordance — toggled by InputBox when a file is dragged over the
+   wrapper. Brand-tinted border + faint background so the user gets visible
+   confirmation that releasing here will attach the file. Class is removed
+   on dragleave (whole-wrapper) and on drop. */
+.claudian-input-wrapper.is-drop-target {
+  border-color: rgba(var(--claudian-brand-rgb), 0.75);
+  background: rgba(var(--claudian-brand-rgb), 0.05);
+}
 .claudian-context-row {
   display: none;
 }
@@ -1162,6 +1212,74 @@ mark.claudian-search-mark.is-active {
   border-radius: 6px;
   border: 1px solid var(--background-modifier-border);
   object-fit: cover;
+}
+/* Non-image attachment chip rendered in-bubble (pdf, text). object-fit: cover
+   on the base rule above only matters for <img>; for the file-chip <div>
+   variant we override the sizing so it hugs its label. */
+.claudian-message-attachment-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  height: auto;
+  padding: 6px 10px;
+  background: var(--background-primary-alt);
+  font-size: 12px;
+  color: var(--text-normal);
+  object-fit: unset;
+}
+.claudian-message-attachment-icon {
+  display: inline-flex;
+  color: var(--claudian-brand);
+}
+.claudian-message-attachment-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-message-attachment-label {
+  font-family: var(--font-monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- "+" attach button (inline in bottom toolbar) ---------------------- */
+/* Lives in the bottom toolbar between the MCP/agents pills and the usage
+   donut. Sized to match the send button (26x26) so the row has consistent
+   icon-button proportions. Visually neutral by default to keep the send
+   button as the primary action; brand-tinted on hover/focus. */
+.claudian-attach-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+  user-select: none;
+}
+.claudian-attach-button:hover,
+.claudian-attach-button:focus-visible {
+  background: var(--background-modifier-hover);
+  color: var(--claudian-brand);
+  border-color: rgba(var(--claudian-brand-rgb), 0.5);
+  outline: none;
+}
+/* Slightly stronger ring for keyboard-only focus so it's distinguishable
+   from hover — :focus-visible only matches keyboard focus. */
+.claudian-attach-button:focus-visible {
+  box-shadow: 0 0 0 2px rgba(var(--claudian-brand-rgb), 0.35);
+}
+.claudian-attach-button svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-attach-input {
+  display: none;
 }
 
 /* ---- Remote Control pairing card ---------------------------------------- */
@@ -1919,4 +2037,290 @@ mark.claudian-search-mark.is-active {
 @keyframes claudian-status-pulse {
   0%, 100% { opacity: 0.35; transform: scale(0.85); }
   50%      { opacity: 1;    transform: scale(1.1); }
+}
+
+/* ---- Create Subagent modal --------------------------------- */
+.claudian-create-subagent-modal {
+  width: min(560px, 90vw);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.claudian-create-subagent-intro p {
+  margin: 0 0 8px 0;
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.claudian-create-subagent-intro-secondary {
+  color: var(--text-muted) !important;
+  font-size: 12px !important;
+}
+.claudian-create-subagent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 14px 0;
+}
+.claudian-create-subagent-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-normal);
+  letter-spacing: 0.01em;
+}
+.claudian-create-subagent-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.claudian-create-subagent-field input[type="text"],
+.claudian-create-subagent-field textarea,
+.claudian-create-subagent-field select {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font-interface);
+  font-size: 13px;
+}
+.claudian-create-subagent-field textarea {
+  font-family: var(--font-monospace);
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 140px;
+}
+.claudian-create-subagent-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ---- Subagent Manager modal -------------------------------- */
+.claudian-subagent-modal {
+  width: min(560px, 90vw);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.claudian-subagent-intro p {
+  margin: 0 0 12px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.claudian-subagent-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 12px 0;
+  flex-wrap: wrap;
+}
+.claudian-subagent-header-row h3 {
+  margin: 0;
+  flex: 1 1 auto;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.claudian-subagent-header-row button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.claudian-subagent-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-faint);
+  font-style: italic;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 8px;
+}
+.claudian-subagent-section-divider {
+  margin-top: 14px;
+  margin-bottom: 8px;
+  padding: 4px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.claudian-subagent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.claudian-subagent-row {
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.claudian-subagent-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.claudian-subagent-name {
+  font-weight: 600;
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+  font-size: 13px;
+}
+.claudian-subagent-plugin-tag {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.claudian-subagent-model-tag {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+}
+.claudian-subagent-row .claudian-subagent-description {
+  margin: 4px 0;
+  font-size: 12px;
+  color: var(--text-normal);
+}
+.claudian-subagent-tools {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.claudian-subagent-tools-label {
+  color: var(--text-faint);
+}
+.claudian-subagent-meta {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-faint);
+  word-break: break-all;
+  margin: 4px 0 8px 0;
+  line-height: 1.4;
+}
+.claudian-subagent-row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.claudian-subagent-row-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* ---- Subagent nested event timeline (Task tool) ------------ */
+/* Rendered inside .claudian-subagent-summary when Claude calls the Task
+   tool. The timeline shows the subagent's internal events (text deltas,
+   tool calls, thinking traces) tailed live from its session JSONL. */
+.claudian-subagent-events {
+  margin-top: 8px;
+  padding-left: 6px;
+  border-left: 1px dashed var(--background-modifier-border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.claudian-subagent-event {
+  font-size: 12px;
+  color: var(--text-normal);
+  line-height: 1.4;
+}
+.claudian-subagent-event-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.claudian-subagent-event-thinking {
+  font-style: italic;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.claudian-subagent-event-tool {
+  padding-left: 1.25em;
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-subagent-event-tool-name {
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-subagent-event-tool-status {
+  margin-left: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.claudian-subagent-events-truncated {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+.claudian-subagent-status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-subagent-status-line.is-spawning {
+  color: var(--text-faint);
+  font-style: italic;
+}
+.claudian-subagent-status-line.is-running {
+  color: var(--claudian-brand);
+}
+.claudian-subagent-status-line.is-failed {
+  color: var(--text-error);
+}
+
+/* ---- Agents pill in the input toolbar ---------------------- */
+.claudian-agents-pill {
+  cursor: pointer;
+}
+.claudian-agents-pill .claudian-toolbar-pill-value {
+  font-variant-numeric: tabular-nums;
+}
+/* Active-subagent indication. Toggled by InputBox.refreshAgentsPill when
+   one or more Task/Agent tools are in flight. Tinted with the Claude blue
+   token (the same blue used for folder pins, plan mode, and the Sonnet via
+   badge) and pulses subtly so the row reads as "something is happening"
+   from peripheral vision. */
+.claudian-agents-pill.is-running {
+  color: var(--claudian-blue);
+  background: rgba(var(--claudian-blue-rgb), 0.14);
+  animation: claudian-agents-pulse 1.6s ease-in-out infinite;
+}
+.claudian-agents-pill.is-running .claudian-toolbar-pill-value,
+.claudian-agents-pill.is-running .claudian-toolbar-pill-label {
+  color: var(--claudian-blue);
+}
+@keyframes claudian-agents-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(var(--claudian-blue-rgb), 0); }
+  50%      { box-shadow: 0 0 0 3px rgba(var(--claudian-blue-rgb), 0.2); }
+}
+
+/* ---- SubagentPicker SuggestModal --------------------------- */
+.claudian-subagent-pick-primary {
+  font-weight: 600;
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+}
+.claudian-subagent-pick-secondary {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.claudian-subagent-pick-description {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin-top: 2px;
+  font-style: italic;
 }

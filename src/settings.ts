@@ -8,6 +8,7 @@ import {
 } from "./permissions/PermissionsConfig";
 import { findRemoteControlPids } from "./claude/SubprocessManager";
 import { StateEmitter } from "./claude/StateEmitter";
+import { SubagentManagerModal } from "./view/SubagentManagerModal";
 
 /* Per-control debounce helper used to coalesce rapid text-input keystrokes
    into a single saveSettings() call. The synchronous in-memory state is
@@ -398,9 +399,44 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     this.renderSnippetsSection(containerEl);
 
+    this.renderSubagentsSection(containerEl);
+
     this.renderTC001Section(containerEl);
 
     this.renderProcessCleanupSection(containerEl);
+  }
+
+  /* Subagent definitions discovered on disk. Read-only catalog browser —
+     edits happen by opening the file in its default app. */
+  private renderSubagentsSection(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Subagents" });
+    containerEl.createEl("p", {
+      text:
+        "Markdown files with YAML frontmatter that Claude can invoke via the Task tool. " +
+        "Scanned from <vault>/.claude/agents, ~/.claude/agents, and installed-plugin agents/ dirs.",
+      cls: "setting-item-description",
+    });
+
+    const count = this.plugin.subagentCatalog.agents.length;
+    new Setting(containerEl)
+      .setName("Discovered subagents")
+      .setDesc(count === 0 ? "None discovered." : `${count} subagent${count === 1 ? "" : "s"} found.`)
+      .addButton(btn => {
+        btn.setButtonText("Manage subagents")
+          .setCta()
+          .onClick(() => {
+            new SubagentManagerModal(this.app, this.plugin).open();
+          });
+      })
+      .addExtraButton(btn => {
+        btn.setIcon("refresh-cw")
+          .setTooltip("Rescan disk for subagent definitions")
+          .onClick(() => {
+            this.plugin.refreshSubagentCatalog();
+            this.display();
+            new Notice(`Rescanned subagents: ${this.plugin.subagentCatalog.agents.length} discovered.`);
+          });
+      });
   }
 
   /* Ulanzi TC001 status display. v1 is plugin-only: terminal Claude Code

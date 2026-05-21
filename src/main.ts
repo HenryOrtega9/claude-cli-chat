@@ -6,6 +6,7 @@ import type { AssistantEvent, ResultEvent, StreamEvent } from "./claude/Events";
 import { Persistence } from "./storage/Persistence";
 import { CLAUDE_ASTERISK_ICON_SVG } from "./view/Welcome";
 import { discoverSkillsAndCommands, type DiscoveryResult } from "./claude/SkillDiscovery";
+import { discoverSubagents, type SubagentCatalog } from "./claude/SubagentDiscovery";
 import { StateEmitter } from "./claude/StateEmitter";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
@@ -22,11 +23,17 @@ export default class ClaudeChatPlugin extends Plugin {
      the CLI's system/init event. Re-runnable via refreshSkillCatalog() so
      freshly added skills can be picked up without a plugin reload. */
   skillCatalog: DiscoveryResult = { skills: [], commands: [] };
+  /* Disk-scanned subagent definitions from ~/.claude/agents and
+     <vault>/.claude/agents (plus any plugin-bundled agents/ dirs). Populated
+     on load so the `/agent` slash-command and the agents pill can list the
+     full catalog before the first CLI subprocess spawn. */
+  subagentCatalog: SubagentCatalog = { agents: [] };
 
   async onload() {
     await this.loadSettings();
     this.persistence = new Persistence(this.app);
     this.refreshSkillCatalog();
+    this.refreshSubagentCatalog();
 
     /* Register the Claude asterisk icon BEFORE any UI that references it.
        Obsidian's addIcon takes inner SVG content; the asterisk is pre-scaled
@@ -113,6 +120,16 @@ export default class ClaudeChatPlugin extends Plugin {
       /* eslint-disable no-console */
       console.warn("[claude-cli-chat] skill discovery failed:", err);
       this.skillCatalog = { skills: [], commands: [] };
+    }
+  }
+
+  refreshSubagentCatalog(): void {
+    try {
+      this.subagentCatalog = discoverSubagents(this.getVaultPath());
+    } catch (err) {
+      /* eslint-disable no-console */
+      console.warn("[claude-cli-chat] subagent discovery failed:", err);
+      this.subagentCatalog = { agents: [] };
     }
   }
 

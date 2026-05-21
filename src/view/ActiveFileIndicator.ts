@@ -1,4 +1,4 @@
-import { setIcon, TFile, type App, type EventRef } from "obsidian";
+import { setIcon, TFile, TFolder, type App, type EventRef } from "obsidian";
 import { VIEW_TYPE_CLAUDE_CHAT } from "./ClaudeChatView";
 
 /* Renders a row of file pills above the input box. The currently-active
@@ -148,6 +148,17 @@ export class ActiveFileIndicator {
     return [...this.stickyPaths];
   }
 
+  /* Add a single path to the pinned set (no-op if already pinned). Used by
+     external triggers like the @-mention popup picking a folder, where we
+     want to *append* rather than *replace* (setPinnedPaths replaces). Defaults
+     the new pin to non-sticky like the click handler does. */
+  addPinnedPath(path: string): void {
+    if (this.pinnedPaths.has(path)) return;
+    this.pinnedPaths.add(path);
+    this.renderPills();
+    this.emitChange();
+  }
+
   /* Externally-driven pin clear, used by TabController after submit to
      drop all non-sticky pins. Pass the post-submit set of paths that
      should remain. Both pinned and sticky sets are reset; the new sticky
@@ -267,8 +278,17 @@ export class ActiveFileIndicator {
     const pill = document.createElement("div");
     this.updatePillState(pill, path, isActive, pinned, sticky, fading);
     const iconEl = pill.createSpan({ cls: "claudian-file-pill-icon" });
-    const ext = path.split(".").pop() ?? "";
-    setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
+    /* Vault lookup distinguishes folder pins from file pins. Folders get the
+       folder icon + a `.is-folder` class that styles them in Claude blue
+       instead of the brand orange. */
+    const node = this.app.vault.getAbstractFileByPath(path);
+    if (node instanceof TFolder) {
+      pill.addClass("is-folder");
+      setIcon(iconEl, "folder");
+    } else {
+      const ext = path.split(".").pop() ?? "";
+      setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
+    }
     const fileName = path.split("/").pop() ?? path;
     pill.createSpan({ cls: "claudian-file-pill-label", text: fileName });
     /* Sticky badge: a small pin glyph appended to the label so sticky pins
@@ -283,11 +303,15 @@ export class ActiveFileIndicator {
   }
 
   private updatePillState(pill: HTMLElement, path: string, isActive: boolean, pinned: boolean, sticky: boolean, fading: boolean) {
+    /* Vault check each refresh so a path that gets renamed file→folder (rare
+       but possible) ends up with the correct styling without DOM thrash. */
+    const isFolder = this.app.vault.getAbstractFileByPath(path) instanceof TFolder;
     pill.className = "claudian-file-pill"
       + (pinned ? " is-pinned" : "")
       + (sticky ? " is-sticky" : "")
       + (isActive ? " is-active-file" : "")
-      + (fading ? " is-fading-pin" : "");
+      + (fading ? " is-fading-pin" : "")
+      + (isFolder ? " is-folder" : "");
     /* Tooltip surfaces the next click's behavior since shift-click is a
        hidden interaction without a keyboard hint. Three states match the
        three branches in handlePillClick: unpinned, pinned-one-shot,

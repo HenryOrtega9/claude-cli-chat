@@ -1,4 +1,4 @@
-import { setIcon } from "obsidian";
+import { setIcon, Notice } from "obsidian";
 import {
   MODEL_LABELS,
   EFFORT_LABELS,
@@ -18,6 +18,62 @@ import { CLAUDE_ASTERISK_DATA_URI } from "./Welcome";
 import type { Attachment } from "./state";
 import type { ActiveSelection } from "./SelectionTracker";
 
+/* btoa() needs a binary string. Building one with String.fromCharCode(...arr)
+   blows the call stack on large images, so feed it in chunks. */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(binary);
+}
+
+/* Common image MIME types — Finder drops sometimes give an empty `file.type`
+   (especially for less-common formats), so we sniff the extension as a fallback
+   so the file still rides as an image block instead of getting decoded as text. */
+const EXT_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  svg: "image/svg+xml",
+  heic: "image/heic",
+  heif: "image/heif",
+  pdf: "application/pdf",
+};
+
+function guessMimeFromName(name: string): string {
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  return EXT_MIME[ext] ?? "";
+}
+
+/* Cap on bytes a single attachment may carry. Base64 inflates by ~4/3, and
+   text attachments get re-embedded into wireText, so very large files would
+   blow past Claude's per-turn input limit and waste tokens regardless. 10MB
+   is comfortably above typical PDFs/screenshots and well under any model's
+   per-turn budget. */
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+/* Pulls a candidate vault path out of an arbitrary drag payload. Handles
+   the formats Obsidian's drag source produces:
+   - bare path (file explorer):   `MBA/Note.md`
+   - wikilink:                    `[[Note]]`
+   - wikilink with alias:         `[[Note|Alias]]`
+   - wikilink with subpath/alias: `[[Note#Section|Alias]]`
+   Returns null for things that obviously aren't a single path (multi-line,
+   empty, has internal whitespace at line bounds). The caller still has to
+   verify the result resolves in the vault — this only extracts the candidate. */
+function extractVaultPathCandidate(text: string): string | null {
+  const t = text.trim();
+  if (!t || t.includes("\n")) return null;
+  const wl = t.match(/^\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]+)?\]\]$/);
+  if (wl) return wl[1].trim();
+  return t;
+}
+
 export type SubmitPayload = {
   text: string;
   attachments: Attachment[];
@@ -33,6 +89,11 @@ export type Suggestion = {
   secondary?: string;  // muted subtitle (path, hint, etc.)
   icon?: string;       // Obsidian icon name
   insert: string;      // text to insert at the trigger position
+  /* When set to "folder", acceptSuggestion routes the selection to the
+     onPinFolder callback (rendering as a pinned pill at the top) instead of
+     inserting `insert` into the textarea. Files and slash commands continue
+     to use text insertion. Other kinds are reserved for future use. */
+  kind?: "file" | "folder" | "command" | "skill";
 };
 
 export type InputBoxCallbacks = {
@@ -55,6 +116,36 @@ export type InputBoxCallbacks = {
      keeps working without it but the chip will reappear on the next cursor
      move in the source editor. */
   onSelectionDismissed?: () => void;
+  /* Fired when the user clicks the agents pill in the bottom toolbar.
+     Caller (TabController) is expected to open the SubagentPicker. Optional —
+     when undefined the pill stays hidden regardless of catalog count. */
+  onAgentLaunch?: () => void;
+  /* Fired when a folder is picked from the @-mention popup. Caller
+     (TabController) is expected to add the folder path to the pinned-pill
+     bar. Without this callback the folder suggestion silently no-ops on
+     accept — InputBox doesn't know how to render pinned items itself. */
+  onPinFolder?: (path: string) => void;
+  /* Fired when something with a text/plain payload is dropped on the input
+     and InputBox wants to know whether it's a vault item that should be
+     pinned (as opposed to free text that should be inserted at the cursor).
+     Return true if the path was recognized and pinned — InputBox will then
+     skip its text-insertion fallback. Return false to fall through. Used by
+     the Obsidian file-explorer drag path (files and folders both route here;
+     pill rendering picks the kind via vault lookup). */
+  onTryPinVaultPath?: (path: string) => boolean;
+  /* Called from `dragover` so InputBox can decide whether to preventDefault
+     (and show the drop-target affordance) when the browser-level dataTransfer
+     is empty. Obsidian's file-explorer drags often don't populate
+     `dataTransfer.types` at all — the dragged TFile/TFolder lives on
+     `app.dragManager.draggable` instead. Without this hook the dragover skips
+     preventDefault, the browser rejects the target, and the `drop` event
+     never fires. TabController implements it by peeking at the dragManager. */
+  onIsVaultDragActive?: () => boolean;
+  /* Called from `drop` BEFORE the text/plain fallback. Lets TabController
+     consume the drop directly from `app.dragManager.draggable` (the canonical
+     source for files/folders dragged from Obsidian's file explorer). Return
+     true if the drag was consumed and pinned. Pairs with onIsVaultDragActive. */
+  onTryConsumeVaultDrag?: () => boolean;
 };
 
 /* Payload TabController hands to InputBox.setCostSurface() to populate the
@@ -112,6 +203,20 @@ export class InputBox {
      so empty tabs stay quiet. See setCostSurface(). */
   private costPill: HTMLElement;
   private costPillText: HTMLElement;
+  /* Agents pill — shows the count of discovered subagent definitions and
+     opens the SubagentPicker on click. Hidden when the catalog is empty or
+     when the parent hasn't wired onAgentLaunch. */
+  private agentsPill: HTMLElement | null = null;
+  private agentsPillValue: HTMLElement | null = null;
+  /* Two distinct numbers feed the pill:
+     - agentsCount: total user-defined subagents discovered on disk (catalog
+       size — set by TabController on mount and on /agent refresh).
+     - runningAgentsCount: Task/Agent tools currently in-flight in this tab.
+       Updated by TabController whenever a Task tool starts or completes.
+     The pill is visible when either is > 0, so an empty catalog with a live
+     subagent in flight still surfaces activity. */
+  private agentsCount = 0;
+  private runningAgentsCount = 0;
   /* Hover popup anchored to the costPill, showing per-server MCP details
      and an enable/disable checkbox per server. Built lazily on first
      hover and re-rendered when setCostSurface lands a new payload.
@@ -123,6 +228,11 @@ export class InputBox {
      re-render itself when shown without needing a fresh data load. */
   private costPayload: CostSurfacePayload | null = null;
   private sendBtn: HTMLElement;
+  /* Floating "+" button at the bottom-left of the textarea — opens the native
+     OS file picker. Pairs with the Finder drop handler so both ingest paths
+     land in the same addFiles() pipeline. */
+  private attachBtn: HTMLElement;
+  private hiddenFileInput: HTMLInputElement;
   private callbacks: InputBoxCallbacks;
   private currentModel: ModelKey;
   private currentEffort: EffortLevel;
@@ -184,11 +294,51 @@ export class InputBox {
     });
     this.textarea.addEventListener("paste", e => this.handlePaste(e));
 
-    /* Drop handler on the wrapper covers both the textarea and the chip row. */
+    /* Drop handler on the wrapper covers both the textarea and the chip row.
+       Adds a `.is-drop-target` class during a file drag so the user gets
+       visible feedback that the drop will be accepted. `dragenter` /
+       `dragleave` fire per-child as the cursor moves through descendants —
+       gating on `containsFiles` keeps the affordance off for non-file drags
+       (vault @-mention drags, text selections from other apps). */
+    const containsFiles = (e: DragEvent) =>
+      !!e.dataTransfer && Array.from(e.dataTransfer.types ?? []).includes("Files");
     this.wrapper.addEventListener("dragover", e => {
-      if (e.dataTransfer?.types?.length) e.preventDefault();
+      /* Obsidian's file-explorer drag leaves dataTransfer.types empty (the
+         payload lives on app.dragManager.draggable). Without preventDefault
+         on dragover the browser rejects the target and the drop event never
+         fires — so we ask the parent whether an Obsidian vault drag is
+         currently in flight and accept on that signal too. */
+      const vaultDrag = this.callbacks.onIsVaultDragActive?.() ?? false;
+      if (e.dataTransfer?.types?.length || vaultDrag) e.preventDefault();
+      if (containsFiles(e) || vaultDrag) this.wrapper.addClass("is-drop-target");
     });
-    this.wrapper.addEventListener("drop", e => this.handleDrop(e));
+    this.wrapper.addEventListener("dragleave", e => {
+      /* Fired on every child boundary. Only clear when leaving the wrapper
+         entirely — relatedTarget is null or outside when truly leaving. */
+      const related = e.relatedTarget as Node | null;
+      if (!related || !this.wrapper.contains(related)) {
+        this.wrapper.removeClass("is-drop-target");
+      }
+    });
+    this.wrapper.addEventListener("drop", e => {
+      this.wrapper.removeClass("is-drop-target");
+      this.handleDrop(e);
+    });
+
+    /* Hidden <input type=file> kept at wrapper-level so the attach button
+       (which now lives in the bottom toolbar — see further down) can trigger
+       it via .click(). Both the picker and Finder drops route through
+       addFiles(). */
+    this.hiddenFileInput = this.wrapper.createEl("input", {
+      cls: "claudian-attach-input",
+      attr: { type: "file", multiple: "true" },
+    });
+    this.hiddenFileInput.addEventListener("change", () => {
+      const files = Array.from(this.hiddenFileInput.files ?? []);
+      /* Clear so re-picking the same file fires change again. */
+      this.hiddenFileInput.value = "";
+      if (files.length > 0) void this.addFiles(files);
+    });
 
     /* Floating "42k / 1000k" chip — positioned absolutely just above the
        toolbar, right side. Hidden until the first usage snapshot arrives. */
@@ -265,6 +415,31 @@ export class InputBox {
     });
     this.costPillText = this.costPill.createSpan({ cls: "claudian-toolbar-pill-value" });
     this.costPill.style.display = "none";
+
+    /* Agents pill — persistent toolbar entry. Always visible when the parent
+       wired onAgentLaunch (which becomes "open Create-subagent dialog" by
+       contract; legacy name kept to avoid churning the callback API). The
+       value shows running count when subagents are in flight, otherwise
+       catalog size — so an empty-catalog tab reads "Agents 0" inviting the
+       user to click and create one. */
+    if (this.callbacks.onAgentLaunch) {
+      this.agentsPill = this.bottomToolbar.createSpan({
+        cls: "claudian-toolbar-pill claudian-agents-pill",
+        attr: {
+          "aria-label": "Create a subagent",
+          title: "Create a subagent definition. Click to open the creation dialog.",
+        },
+      });
+      this.agentsPill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Agents" });
+      this.agentsPillValue = this.agentsPill.createSpan({ cls: "claudian-toolbar-pill-value", text: "0" });
+      this.agentsPill.addEventListener("click", e => {
+        e.stopPropagation();
+        this.callbacks.onAgentLaunch?.();
+      });
+      /* Paint the initial value so the pill doesn't read blank before the
+         first setAgentCount/setRunningAgentCount lands. */
+      this.refreshAgentsPill();
+    }
     /* Popup-trigger wiring: enter shows, leave schedules a close that the
        popup's own enter handler cancels — that handoff is what lets the
        cursor travel from pill to popup without the popup vanishing
@@ -281,6 +456,34 @@ export class InputBox {
         this.closeCostPopupNow();
       } else {
         this.openCostPopup();
+      }
+    });
+
+    /* Attach button — small icon button in the bottom toolbar. Sits between
+       the MCP/agents pills and the usage donut, so it reads as "things you
+       add to this turn" alongside the cost-surface controls. Clicking opens
+       the OS file picker; the same addFiles() pipeline also receives Finder
+       drops. Keyboard accessible via role + tabindex (span, not <button>,
+       to keep visual parity with the toolbar pills). */
+    this.attachBtn = this.bottomToolbar.createSpan({
+      cls: "claudian-attach-button",
+      attr: {
+        "aria-label": "Attach file",
+        title: "Attach file from your computer",
+        role: "button",
+        tabindex: "0",
+      },
+    });
+    setIcon(this.attachBtn, "plus");
+    this.attachBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      this.openFilePicker();
+    });
+    this.attachBtn.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        this.openFilePicker();
       }
     });
 
@@ -390,6 +593,50 @@ export class InputBox {
     if (this.costPopup && this.costPopup.style.display !== "none") {
       this.renderCostPopupContent();
     }
+  }
+
+  /* Updates the catalog count (user-defined subagents on disk). Visibility
+     is decided by the combined catalog+running state in refreshAgentsPill. */
+  setAgentCount(count: number): void {
+    this.agentsCount = count;
+    this.refreshAgentsPill();
+  }
+
+  /* Updates the running count (Task/Agent tools currently in flight in this
+     tab). Drives the .is-running tone on the pill and forces visibility even
+     when the catalog is empty, so users see subagent activity at a glance. */
+  setRunningAgentCount(count: number): void {
+    this.runningAgentsCount = count;
+    this.refreshAgentsPill();
+  }
+
+  private refreshAgentsPill(): void {
+    if (!this.agentsPill || !this.agentsPillValue) return;
+    const catalog = this.agentsCount;
+    const running = this.runningAgentsCount;
+    /* Pill is persistent — always shown when the parent wired onAgentLaunch
+       (we only get here if the constructor created the element). Four display
+       states; the rest button is what the user clicks to open the Create
+       dialog regardless of count. */
+    let valueText: string;
+    let title: string;
+    if (running > 0 && catalog > 0) {
+      valueText = `${running} / ${catalog}`;
+      title = `${running} subagent${running === 1 ? "" : "s"} running · ${catalog} in catalog. Click to create a new one (use /agent to launch an existing one).`;
+    } else if (running > 0) {
+      valueText = String(running);
+      title = `${running} subagent${running === 1 ? "" : "s"} running. Click to create a new one (use /agent to launch an existing one).`;
+    } else if (catalog > 0) {
+      valueText = String(catalog);
+      title = `${catalog} subagent${catalog === 1 ? "" : "s"} in catalog. Click to create another (use /agent to launch an existing one).`;
+    } else {
+      valueText = "0";
+      title = "No subagents yet. Click to create your first one.";
+    }
+    this.agentsPillValue.setText(valueText);
+    this.agentsPill.setAttribute("title", title);
+    this.agentsPill.toggleClass("is-running", running > 0);
+    this.agentsPill.style.display = "";
   }
 
   private openCostPopup() {
@@ -1023,6 +1270,23 @@ export class InputBox {
     if (!this.suggestion) return;
     const item = this.suggestion.items[this.suggestion.activeIndex];
     if (!item) return;
+    /* Folders are sideloaded into the pinned-pill bar rather than typed into
+       the textarea. We still strip the `@query` fragment the user typed
+       (otherwise it lingers as orphaned text) but the pill bar becomes the
+       canonical reference. If the caller didn't wire onPinFolder we fall
+       through to plain text insertion so the popup remains useful. */
+    if (item.kind === "folder" && this.callbacks.onPinFolder) {
+      const cursor = this.textarea.selectionStart ?? this.textarea.value.length;
+      const before = this.textarea.value.slice(0, this.suggestion.triggerStart);
+      const after = this.textarea.value.slice(cursor);
+      this.textarea.value = before + after;
+      this.textarea.selectionStart = this.textarea.selectionEnd = before.length;
+      this.callbacks.onPinFolder(item.id);
+      this.hideSuggestion();
+      this.autoResize();
+      this.textarea.focus();
+      return;
+    }
     const cursor = this.textarea.selectionStart ?? this.textarea.value.length;
     const before = this.textarea.value.slice(0, this.suggestion.triggerStart);
     const after = this.textarea.value.slice(cursor);
@@ -1041,7 +1305,7 @@ export class InputBox {
     this.suggestion = null;
   }
 
-  private handlePaste(e: ClipboardEvent) {
+  private async handlePaste(e: ClipboardEvent) {
     const items = e.clipboardData?.items;
     if (!items) return;
     const imageItems = Array.from(items).filter(it => it.kind === "file" && it.type.startsWith("image/"));
@@ -1052,36 +1316,126 @@ export class InputBox {
        presence, silently dropping the text. Instead: only preventDefault when
        the clipboard is image-only. When text is also present, let the browser
        handle the text paste normally and process the image asynchronously into
-       the attachment list (FileReader is already async, so the text paste
+       the attachment list (Blob.arrayBuffer() is async, so the text paste
        lands first regardless). */
     const hasText = Array.from(items).some(it => it.kind === "string" && it.type === "text/plain");
     if (!hasText) e.preventDefault();
     for (const item of imageItems) {
       const file = item.getAsFile();
       if (!file) continue;
-      const reader = new FileReader();
-      reader.onload = () => {
+      /* Avoid FileReader: in some Obsidian/Electron renderer configurations
+         the FileReader instance is missing readAsDataURL, which silently
+         broke image paste. Blob.arrayBuffer() works universally. */
+      try {
+        const buf = await file.arrayBuffer();
         if (this.destroyed) return;
-        const result = reader.result as string;
-        const comma = result.indexOf(",");
-        const data = comma >= 0 ? result.slice(comma + 1) : result;
-        this.attachments.push({ mediaType: file.type, data });
+        const data = bytesToBase64(new Uint8Array(buf));
+        this.attachments.push({ kind: "image", mediaType: file.type, data });
         this.renderAttachmentChips();
-      };
-      reader.readAsDataURL(file);
+      } catch (err) {
+        console.error("claude-cli-chat: failed to read pasted image", err);
+      }
     }
   }
 
   private handleDrop(e: DragEvent) {
     const dt = e.dataTransfer;
     if (!dt) return;
+    /* Always swallow the drop if dataTransfer carries anything — without
+       this Electron may navigate to a dropped file:// URL or open it in a
+       new window. Matches the dragover preventDefault gate. We also swallow
+       when an Obsidian vault drag is active (which leaves dt.types empty). */
+    const vaultDrag = this.callbacks.onIsVaultDragActive?.() ?? false;
+    if (dt.types?.length || vaultDrag) e.preventDefault();
+    /* Finder drops carry File objects on dt.files. Take that path first.
+       Falls through to the text/plain branch only when no files were
+       dropped — that branch still handles vault file drag-ins (which arrive
+       as a path string) and editor selection drops. */
+    const files = Array.from(dt.files ?? []);
+    if (files.length > 0) {
+      void this.addFiles(files);
+      return;
+    }
+    /* Obsidian internal drags (file explorer): the TFile/TFolder lives on
+       app.dragManager.draggable, not on the dataTransfer. Ask the parent
+       to consume the drop from there before falling through to text/plain
+       (which Obsidian sometimes populates with a wikilink, sometimes not). */
+    if (this.callbacks.onTryConsumeVaultDrag?.()) return;
     const text = dt.getData("text/plain");
     if (!text) return;
-    e.preventDefault();
+    /* Obsidian's file explorer puts the vault-relative path on text/plain
+       when you drag a note or folder. Strip wikilink wrappers and alias
+       suffixes so [[Foo|Bar]] resolves the same as a bare Foo path. If the
+       result resolves to a vault item, route through the pin callback —
+       the pill bar handles file-vs-folder styling via its own vault lookup.
+       Anything else (external app text, multi-line, unresolved path) falls
+       through to the original cursor-insert behavior. */
+    const candidate = extractVaultPathCandidate(text);
+    if (candidate && this.callbacks.onTryPinVaultPath?.(candidate)) return;
     const sel = this.textarea.selectionStart ?? this.textarea.value.length;
     const prevChar = this.textarea.value.charAt(sel - 1);
     const needsSpace = sel > 0 && prevChar && !/\s/.test(prevChar);
     this.insertAtCursor((needsSpace ? " " : "") + text + " ");
+  }
+
+  private openFilePicker() {
+    this.hiddenFileInput.click();
+  }
+
+  /* Shared ingest path for both the + button and Finder drops. Decides per
+     file whether it rides as an image block, a PDF document block, or as
+     inlined text. Anything that fails the size cap or can't be decoded
+     surfaces a Notice and is skipped so one bad file doesn't abort the rest. */
+  private async addFiles(files: File[]) {
+    for (const file of files) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        new Notice(`${file.name} is too large (max 10MB)`);
+        continue;
+      }
+      try {
+        const att = await this.fileToAttachment(file);
+        if (this.destroyed) return;
+        this.attachments.push(att);
+      } catch (err) {
+        console.error("claude-cli-chat: failed to attach file", file.name, err);
+        const msg = err instanceof Error ? err.message : String(err);
+        new Notice(`Couldn't attach ${file.name}: ${msg}`);
+      }
+    }
+    if (this.destroyed) return;
+    this.renderAttachmentChips();
+  }
+
+  private async fileToAttachment(file: File): Promise<Attachment> {
+    const mime = file.type || guessMimeFromName(file.name);
+    if (mime.startsWith("image/")) {
+      const buf = await file.arrayBuffer();
+      return {
+        kind: "image",
+        mediaType: mime,
+        data: bytesToBase64(new Uint8Array(buf)),
+        filename: file.name,
+      };
+    }
+    if (mime === "application/pdf") {
+      const buf = await file.arrayBuffer();
+      return {
+        kind: "pdf",
+        mediaType: "application/pdf",
+        data: bytesToBase64(new Uint8Array(buf)),
+        filename: file.name,
+      };
+    }
+    /* Everything else is best-effort text. Binaries will look like noise to
+       Claude but won't crash the pipeline — the user explicitly chose this
+       file, so we let them try rather than silently rejecting. */
+    const content = await file.text();
+    return {
+      kind: "text",
+      mediaType: mime || "text/plain",
+      content,
+      filename: file.name,
+    };
   }
 
   /* Push the active editor selection into the input as a pinned chip.
@@ -1136,9 +1490,29 @@ export class InputBox {
     this.attachments.forEach((att, i) => {
       const chip = this.contextRow.createDiv({ cls: "claudian-context-chip" });
       const iconEl = chip.createSpan({ cls: "claudian-context-chip-icon" });
-      setIcon(iconEl, "image");
-      const subtype = att.mediaType.split("/")[1] || "image";
-      chip.createSpan({ cls: "claudian-context-chip-label", text: `${subtype.toUpperCase()} attachment` });
+      const kind = att.kind ?? "image";
+      let iconName: string;
+      let label: string;
+      if (kind === "image") {
+        iconName = "image";
+        if (att.filename) label = att.filename;
+        else {
+          const subtype = att.mediaType.split("/")[1] || "image";
+          label = `${subtype.toUpperCase()} attachment`;
+        }
+      } else if (kind === "pdf") {
+        iconName = "file-text";
+        label = att.filename ?? "document.pdf";
+      } else {
+        iconName = "file";
+        label = att.filename ?? "text file";
+      }
+      setIcon(iconEl, iconName);
+      chip.createSpan({
+        cls: "claudian-context-chip-label",
+        text: label,
+        attr: att.filename ? { title: att.filename } : {},
+      });
       const remove = chip.createSpan({ cls: "claudian-context-chip-remove", attr: { "aria-label": "Remove", title: "Remove" } });
       setIcon(remove, "x");
       remove.addEventListener("click", e => {
