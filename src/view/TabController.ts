@@ -10,7 +10,8 @@ import { ActiveFileIndicator } from "./ActiveFileIndicator";
 import { SelectionTracker, type ActiveSelection } from "./SelectionTracker";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
-import { resolveModelId, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet } from "../settings";
+import { resolveModelId, trustedFolderAllowPatterns, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
+import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
 import { RemoteControlSession, sessionFilePathFor } from "../claude/RemoteControlSession";
 import { JsonlTailer } from "../claude/JsonlTailer";
 import { SubagentSessionTracker, type SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
@@ -194,6 +195,10 @@ export class TabController {
         onTryPinVaultPath: path => this.tryPinVaultPath(path),
         onIsVaultDragActive: () => this.isVaultDragActive(),
         onTryConsumeVaultDrag: () => this.tryConsumeVaultDrag(),
+        onListTrustedFolders: () => this.plugin.settings.trustedFolders ?? [],
+        onToggleTrustedFolder: (path, enabled) => void this.toggleTrustedFolder(path, enabled),
+        onAddTrustedFolder: path => void this.addTrustedFolder(path),
+        onRemoveTrustedFolder: path => void this.removeTrustedFolder(path),
       },
       {
         model: (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel,
@@ -732,11 +737,18 @@ export class TabController {
       ? this.plugin.settings.envSnippets.find(s => s.id === this.state.envSnippetId)
       : undefined;
     /* Compose the vault-wide addendum (always applies in this vault) with the
-       per-tab snippet addendum (overlay). Either or both may be empty. */
+       per-tab snippet addendum (overlay) and the trusted-folders hint. Any
+       of the three may be empty. Trusted-folders hint is gated by the
+       trustedFoldersInSystemPrompt setting (default on); it lists only
+       enabled entries so disabled-but-remembered folders don't leak into
+       discoverability. The hint is read-only discovery context — actual
+       permission to read those paths comes from .claude/settings.json's
+       allowlist, written when the user toggled the folder on. */
     const vaultAddendum = (this.plugin.settings.vaultSystemPromptAddendum ?? "").trim();
     const snippetAddendum = (snippet?.systemPromptAddendum ?? "").trim();
+    const trustedAddendum = this.buildTrustedFoldersAddendum();
     const composedAddendum =
-      [vaultAddendum, snippetAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
+      [vaultAddendum, snippetAddendum, trustedAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
     const opts = spawnOptionsFromSettings(this.plugin.settings, cwd, this.state.sessionId ?? undefined, {
       model: resolveModelId(modelKey),
       effort: effortKey,
@@ -1796,6 +1808,79 @@ export class TabController {
       this.activeFileIndicator.addPinnedPath(item.path);
     }
     return true;
+  }
+
+  /* One-line system-prompt block listing every enabled trusted folder.
+     Returns "" when the feature is off, no folders are trusted, or none
+     are currently enabled — caller filters empty entries before joining,
+     so an empty string is the right neutral value. Kept terse: each folder
+     is one bullet line so the addendum costs a handful of tokens, not a
+     paragraph. */
+  private buildTrustedFoldersAddendum(): string {
+    if (!this.plugin.settings.trustedFoldersInSystemPrompt) return "";
+    const enabled = (this.plugin.settings.trustedFolders ?? []).filter(f => f.enabled);
+    if (enabled.length === 0) return "";
+    const lines = enabled.map(f => `- ${f.path}`);
+    return [
+      "Trusted folders outside the vault (Read/Glob/Grep are pre-approved here — use them on demand instead of expecting file contents inline):",
+      ...lines,
+    ].join("\n");
+  }
+
+  /* Adds a folder to the user's trusted-folder list. New entries default to
+     `enabled: true` so the picker → checkbox handoff is one step (you
+     picked it, you want it on). Idempotent: re-adding an already-present
+     path quietly bumps it to enabled rather than appending a duplicate.
+     Writes the matching Read/Glob/Grep allowlist patterns so the CLI
+     auto-approves filesystem reads under the folder on the very next tool
+     call — no session restart needed for permissions to take effect. The
+     system-prompt hint, however, only refreshes on the next spawn (see
+     ensureSession's composedAddendum). */
+  private async addTrustedFolder(rawPath: string): Promise<void> {
+    const path = rawPath.replace(/\/+$/, "");
+    if (!path) return;
+    const list = this.plugin.settings.trustedFolders ?? [];
+    const existing = list.find(f => f.path === path);
+    if (existing) {
+      if (!existing.enabled) await this.toggleTrustedFolder(path, true);
+      return;
+    }
+    list.push({ path, enabled: true });
+    this.plugin.settings.trustedFolders = list;
+    await this.plugin.saveSettings();
+    await this.plugin.permissionsStore.addAllowMany(trustedFolderAllowPatterns(path));
+    new Notice(`Trusted ${path}`);
+  }
+
+  private async toggleTrustedFolder(rawPath: string, enabled: boolean): Promise<void> {
+    const path = rawPath.replace(/\/+$/, "");
+    const list = this.plugin.settings.trustedFolders ?? [];
+    const entry = list.find(f => f.path === path);
+    if (!entry) return;
+    entry.enabled = enabled;
+    this.plugin.settings.trustedFolders = list;
+    await this.plugin.saveSettings();
+    const patterns = trustedFolderAllowPatterns(path);
+    if (enabled) {
+      await this.plugin.permissionsStore.addAllowMany(patterns);
+    } else {
+      for (const p of patterns) await this.plugin.permissionsStore.removeAllow(p);
+    }
+  }
+
+  /* Removes the folder from the list entirely. Always clears the allowlist
+     patterns whether the entry was enabled or not — keeps state consistent
+     if someone hand-edited settings.json out of sync. */
+  private async removeTrustedFolder(rawPath: string): Promise<void> {
+    const path = rawPath.replace(/\/+$/, "");
+    const list = this.plugin.settings.trustedFolders ?? [];
+    const idx = list.findIndex(f => f.path === path);
+    if (idx < 0) return;
+    list.splice(idx, 1);
+    this.plugin.settings.trustedFolders = list;
+    await this.plugin.saveSettings();
+    const patterns = trustedFolderAllowPatterns(path);
+    for (const p of patterns) await this.plugin.permissionsStore.removeAllow(p);
   }
 
   /* Rank vault files AND folders for an @-mention query. Simple heuristic:

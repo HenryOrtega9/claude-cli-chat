@@ -12,6 +12,7 @@ import {
   type ModelKey,
   type EffortLevel,
   type PermissionMode,
+  type TrustedFolder,
 } from "../settings";
 import type { UsageSnapshot } from "../claude/Events";
 import { CLAUDE_ASTERISK_DATA_URI } from "./Welcome";
@@ -146,6 +147,15 @@ export type InputBoxCallbacks = {
      source for files/folders dragged from Obsidian's file explorer). Return
      true if the drag was consumed and pinned. Pairs with onIsVaultDragActive. */
   onTryConsumeVaultDrag?: () => boolean;
+  /* Trusted-folder bridge. InputBox renders the list inside the attach
+     popup; the parent (TabController) owns the persisted state and the
+     permissions writes. Callbacks let the popup query the list on each
+     open (no state sync needed) and request mutations. All are optional —
+     when undefined, the popup degrades to "Pick a file…" only. */
+  onListTrustedFolders?: () => TrustedFolder[];
+  onToggleTrustedFolder?: (path: string, enabled: boolean) => void;
+  onAddTrustedFolder?: (path: string) => void;
+  onRemoveTrustedFolder?: (path: string) => void;
 };
 
 /* Payload TabController hands to InputBox.setCostSurface() to populate the
@@ -233,6 +243,9 @@ export class InputBox {
      land in the same addFiles() pipeline. */
   private attachBtn: HTMLElement;
   private hiddenFileInput: HTMLInputElement;
+  /* Mirror of hiddenFileInput but with webkitdirectory set — surfaces the
+     OS directory chooser for the "Add folder…" row in the attach popup. */
+  private hiddenDirInput!: HTMLInputElement;
   private callbacks: InputBoxCallbacks;
   private currentModel: ModelKey;
   private currentEffort: EffortLevel;
@@ -338,6 +351,43 @@ export class InputBox {
       /* Clear so re-picking the same file fires change again. */
       this.hiddenFileInput.value = "";
       if (files.length > 0) void this.addFiles(files);
+    });
+
+    /* Hidden directory picker for the "Add folder…" row in the attach
+       popup. webkitdirectory is the Electron-supported way to surface the
+       OS folder chooser without pulling in @electron/remote. The browser
+       hands back File objects for every entry under the chosen folder; we
+       only need the first one's `.path` (Electron extension on File) to
+       derive the absolute folder path by stripping its webkitRelativePath
+       tail. */
+    this.hiddenDirInput = this.wrapper.createEl("input", {
+      cls: "claudian-attach-input",
+      attr: { type: "file", webkitdirectory: "true", directory: "true" },
+    });
+    this.hiddenDirInput.addEventListener("change", () => {
+      const files = Array.from(this.hiddenDirInput.files ?? []);
+      this.hiddenDirInput.value = "";
+      if (files.length === 0) return;
+      const first = files[0] as File & { path?: string };
+      const rel = first.webkitRelativePath ?? "";
+      const abs = first.path ?? "";
+      if (!abs || !rel) {
+        new Notice("Couldn't read the folder path.");
+        return;
+      }
+      /* webkitRelativePath is "<folderName>/<...children>"; strip that tail
+         from the absolute path to get the folder itself. The trailing /
+         is implicit between abs's prefix and rel; len(rel)+1 covers it. */
+      const folderPath = abs.slice(0, Math.max(0, abs.length - rel.length - 1));
+      if (!folderPath) {
+        new Notice("Couldn't resolve the folder's absolute path.");
+        return;
+      }
+      this.callbacks.onAddTrustedFolder?.(folderPath);
+      /* Re-open the popup so the user sees the new entry land without
+         needing a second click. Defer one tick so the file-input close
+         doesn't swallow the popup-mount. */
+      window.setTimeout(() => this.openAttachPopup(), 0);
     });
 
     /* Floating "42k / 1000k" chip — positioned absolutely just above the
@@ -477,13 +527,13 @@ export class InputBox {
     setIcon(this.attachBtn, "plus");
     this.attachBtn.addEventListener("click", e => {
       e.stopPropagation();
-      this.openFilePicker();
+      this.toggleAttachPopup();
     });
     this.attachBtn.addEventListener("keydown", e => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         e.stopPropagation();
-        this.openFilePicker();
+        this.toggleAttachPopup();
       }
     });
 
@@ -1036,6 +1086,115 @@ export class InputBox {
       });
     }
     this.anchorPopup(popup, this.effortPill);
+  }
+
+  /* Attach popup — anchored to the + button. Mirrors the
+     model/effort/mode popup pattern but carries two sections:
+       1) "Pick a file…" row that fires the OS file picker (current
+          behavior of the bare + button, preserved here).
+       2) Trusted folders list with per-row checkboxes that toggle
+          Read/Glob/Grep allowlist patterns for that absolute path,
+          plus an "Add folder…" row that surfaces the OS directory
+          chooser. The list persists across sessions in plugin settings.
+
+     Toggling the same + click again closes the popup (true toggle, same
+     contract as the toolbar pills). */
+  private toggleAttachPopup() {
+    if (this.openPopup) {
+      const wasAttach = this.openPopup.el.classList.contains("claudian-popup-attach");
+      this.closePopup();
+      if (wasAttach) return;
+    }
+    this.openAttachPopup();
+  }
+
+  private openAttachPopup() {
+    if (this.openPopup) this.closePopup();
+    const popup = this.createPopup("claudian-popup-attach");
+
+    /* "Pick a file…" — first row so it stays the keyboard-default action
+       and dominates muscle memory for users who just want what + used to
+       do. Routes through the same hiddenFileInput / addFiles pipeline as
+       Finder drops. */
+    const pickRow = popup.createDiv({ cls: "claudian-popup-row claudian-popup-row-action" });
+    const pickIcon = pickRow.createSpan({ cls: "claudian-popup-row-icon" });
+    setIcon(pickIcon, "folder-open");
+    pickRow.createSpan({ cls: "claudian-popup-row-label", text: "Pick a file…" });
+    pickRow.addEventListener("click", e => {
+      e.stopPropagation();
+      this.closePopup();
+      this.openFilePicker();
+    });
+
+    /* Trusted folders section — only renders when the parent wired the
+       list callback. Without onListTrustedFolders, the popup degrades
+       gracefully to "Pick a file…" alone. */
+    const list = this.callbacks.onListTrustedFolders?.() ?? null;
+    if (list !== null) {
+      popup.createDiv({ cls: "claudian-popup-divider" });
+      popup.createDiv({ cls: "claudian-popup-section-header", text: "Trusted folders" });
+
+      if (list.length === 0) {
+        popup.createDiv({
+          cls: "claudian-popup-section-empty",
+          text: "None yet — add a folder below to let Claude read it on demand.",
+        });
+      } else {
+        for (const folder of list) {
+          this.renderTrustedFolderRow(popup, folder);
+        }
+      }
+
+      const addRow = popup.createDiv({ cls: "claudian-popup-row claudian-popup-row-action" });
+      const addIcon = addRow.createSpan({ cls: "claudian-popup-row-icon" });
+      setIcon(addIcon, "plus");
+      addRow.createSpan({ cls: "claudian-popup-row-label", text: "Add folder…" });
+      addRow.addEventListener("click", e => {
+        e.stopPropagation();
+        this.hiddenDirInput.click();
+      });
+    }
+
+    this.anchorPopup(popup, this.attachBtn);
+  }
+
+  /* One row per trusted folder. Checkbox toggles enabled/disabled (which in
+     turn writes/removes the permission patterns). The label shows the
+     folder's basename for scannability; the full absolute path lives in the
+     row's title attribute and as the secondary line under the basename when
+     space allows. Trash button removes the entry entirely. */
+  private renderTrustedFolderRow(popup: HTMLElement, folder: TrustedFolder) {
+    const row = popup.createDiv({
+      cls: "claudian-popup-row claudian-popup-row-folder" + (folder.enabled ? " is-enabled" : ""),
+    });
+    row.setAttr("title", folder.path);
+
+    const checkbox = row.createEl("input", {
+      cls: "claudian-popup-row-checkbox",
+      attr: { type: "checkbox" },
+    });
+    checkbox.checked = folder.enabled;
+    checkbox.addEventListener("click", e => e.stopPropagation());
+    checkbox.addEventListener("change", () => {
+      this.callbacks.onToggleTrustedFolder?.(folder.path, checkbox.checked);
+      row.toggleClass("is-enabled", checkbox.checked);
+    });
+
+    const labels = row.createDiv({ cls: "claudian-popup-row-labels" });
+    const basename = folder.path.split("/").filter(Boolean).pop() ?? folder.path;
+    labels.createSpan({ cls: "claudian-popup-row-label", text: basename });
+    labels.createSpan({ cls: "claudian-popup-row-sublabel", text: folder.path });
+
+    const removeBtn = row.createSpan({
+      cls: "claudian-popup-row-remove",
+      attr: { "aria-label": "Remove folder", title: "Remove from trusted folders" },
+    });
+    setIcon(removeBtn, "x");
+    removeBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      this.callbacks.onRemoveTrustedFolder?.(folder.path);
+      row.remove();
+    });
   }
 
   private createPopup(extraClass: string): HTMLElement {

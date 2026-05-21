@@ -1614,6 +1614,108 @@ mark.claudian-search-mark.is-active {
   color: var(--text-muted);
 }
 
+/* ---- Attach popup (+ button) ----------------------------- */
+/* Wider than the model/effort popups because trusted-folder rows carry a
+   folder name plus its full absolute path. Capped so a long $HOME path
+   doesn't make the popup wider than the input wrapper itself. */
+.claudian-popup-attach {
+  min-width: 280px;
+  max-width: 420px;
+  padding: 4px;
+}
+.claudian-popup-attach .claudian-popup-row-action {
+  /* "Pick a file…" and "Add folder…" rows lead with an icon; align the
+     icon to the start so the label reads as a normal menu item. */
+  font-weight: 500;
+}
+.claudian-popup-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--background-modifier-border);
+}
+.claudian-popup-section-header {
+  padding: 6px 8px 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.claudian-popup-section-empty {
+  padding: 4px 8px 8px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.claudian-popup-row-folder {
+  /* Folder rows do NOT trigger an action on click — the checkbox owns the
+     interaction. Drop the hover background tint that the default
+     .claudian-popup-row gets so the row reads as a settings entry, not a
+     clickable menu item. */
+  cursor: default;
+  padding: 4px 8px;
+}
+.claudian-popup-row-folder:hover {
+  background: transparent;
+}
+.claudian-popup-row-checkbox {
+  margin: 0;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.claudian-popup-row-labels {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.claudian-popup-row-folder .claudian-popup-row-label {
+  font-size: 12px;
+  line-height: 1.2;
+  /* Single-line truncation for long folder names. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-popup-row-folder .claudian-popup-row-sublabel {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-popup-row-folder:not(.is-enabled) .claudian-popup-row-label,
+.claudian-popup-row-folder:not(.is-enabled) .claudian-popup-row-sublabel {
+  /* Disabled folders read muted so the active set is scannable at a
+     glance. Path stays visible because the user may still want to remove
+     or re-enable. */
+  opacity: 0.55;
+}
+.claudian-popup-row-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.6;
+  transition: opacity 100ms ease, background 100ms ease, color 100ms ease;
+}
+.claudian-popup-row-remove:hover {
+  opacity: 1;
+  color: var(--text-error, var(--text-normal));
+  background: var(--background-modifier-hover);
+}
+.claudian-popup-row-remove svg {
+  width: 12px;
+  height: 12px;
+}
+
 /* Mode pill is rendered as a *filled chip* in the two-row layout —
    visually loud because Mode is the highest-blast-radius runtime control.
    Normal/Accept Edits get a neutral surface (still readable but quiet);

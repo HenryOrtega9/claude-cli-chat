@@ -8,6 +8,7 @@ import { CLAUDE_ASTERISK_ICON_SVG } from "./view/Welcome";
 import { discoverSkillsAndCommands, type DiscoveryResult } from "./claude/SkillDiscovery";
 import { discoverSubagents, type SubagentCatalog } from "./claude/SubagentDiscovery";
 import { StateEmitter } from "./claude/StateEmitter";
+import { PermissionsConfigStore } from "./permissions/PermissionsConfig";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
@@ -28,9 +29,15 @@ export default class ClaudeChatPlugin extends Plugin {
      on load so the `/agent` slash-command and the agents pill can list the
      full catalog before the first CLI subprocess spawn. */
   subagentCatalog: SubagentCatalog = { agents: [] };
+  /* Shared allowlist writer for <vault>/.claude/settings.json. Used by the
+     settings tab and by the per-tab attach popup's trusted-folder toggle.
+     Holding a single store ensures the serialized write chain is shared so
+     concurrent toggles from different UI surfaces don't race. */
+  permissionsStore!: PermissionsConfigStore;
 
   async onload() {
     await this.loadSettings();
+    this.permissionsStore = new PermissionsConfigStore(this.app);
     this.persistence = new Persistence(this.app);
     this.refreshSkillCatalog();
     this.refreshSubagentCatalog();

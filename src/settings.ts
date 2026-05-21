@@ -114,6 +114,18 @@ export function nextPermissionMode(current: PermissionMode): PermissionMode {
   return PERMISSION_MODE_ORDER[(idx + 1) % PERMISSION_MODE_ORDER.length];
 }
 
+/* A folder outside the vault that the plugin has been granted "trusted"
+   status for. When `enabled`, the corresponding Read/Glob/Grep allowlist
+   patterns are present in <vault>/.claude/settings.json so Claude can read
+   anything under this path without prompting. When disabled, the patterns
+   are removed; the folder stays in the list so the user can re-enable with
+   one click instead of re-picking it. Path is absolute and normalized
+   (trailing slash stripped). */
+export type TrustedFolder = {
+  path: string;
+  enabled: boolean;
+};
+
 /* Reusable bundle of settings (model + effort + permission mode + an
    optional system-prompt addendum). Lets the user switch between work
    contexts — "Coding", "Research", "Vault writing" — with one click. */
@@ -144,6 +156,16 @@ export type ClaudeChatSettings = {
      per-tab env snippet's addendum (both apply if both set). Functionally
      equivalent to a vault-scoped CLAUDE.md addition. */
   vaultSystemPromptAddendum: string;
+  /* Folders outside the vault that the user has explicitly trusted so
+     Claude can read from them on demand via the Read/Glob/Grep tools. Each
+     entry persists across sessions; toggling `enabled` adds or removes the
+     matching `Read(<path>/**)` etc. patterns from .claude/settings.json's
+     allowlist. Default empty — the user opts in folder by folder. */
+  trustedFolders: TrustedFolder[];
+  /* When true, the list of enabled trusted folders is appended to every
+     spawn's system prompt so Claude knows where it can look on demand
+     without needing the user to mention paths explicitly. Default on. */
+  trustedFoldersInSystemPrompt: boolean;
   /* Ulanzi TC001 status display integration. When enabled, the plugin
      drives a 32x8 LED matrix on the LAN: state changes (thinking,
      needs_permission, complete, ready, idle) are pushed to the device
@@ -165,9 +187,24 @@ export const DEFAULT_SETTINGS: ClaudeChatSettings = {
   envSnippets: [],
   autoGenerateTitles: true,
   vaultSystemPromptAddendum: "",
+  trustedFolders: [],
+  trustedFoldersInSystemPrompt: true,
   tc001Enabled: false,
   tc001Ip: "192.168.1.50",
 };
+
+/* Build the allowlist patterns that grant Read/Glob/Grep access to anything
+   under an absolute folder path. Centralized so the add and remove paths use
+   the same shape — divergence here would silently leave dangling permission
+   entries the user can't see without opening settings.json by hand. */
+export function trustedFolderAllowPatterns(absolutePath: string): string[] {
+  const normalized = absolutePath.replace(/\/+$/, "");
+  return [
+    `Read(${normalized}/**)`,
+    `Glob(${normalized}/**)`,
+    `Grep(${normalized}/**)`,
+  ];
+}
 
 export function makeSnippetId(): string {
   return `snip-${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
