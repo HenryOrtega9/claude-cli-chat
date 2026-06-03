@@ -53,12 +53,7 @@ async function extractPptxText(buffer: ArrayBuffer): Promise<string> {
     const re = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(xml)) !== null) {
-      const txt = m[1]
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'");
+      const txt = decodeXmlEntities(m[1]);
       if (txt.trim()) runs.push(txt);
     }
     out.push(`--- Slide ${i + 1} ---`);
@@ -78,12 +73,20 @@ async function extractDocxText(buffer: ArrayBuffer): Promise<string> {
 }
 
 function decodeXmlEntities(s: string): string {
+  /* Decode the four other named entities and numeric/hex character refs
+     first, then &amp; LAST. Decoding &amp; first would re-interpret its
+     output (e.g. "&amp;lt;" -> "&lt;" -> "<"), corrupting text that
+     legitimately encodes a literal escaped sequence. Numeric refs like
+     &#10; (in-cell line breaks) and &#x2014; (em-dash) are legal OOXML
+     and must be decoded too. */
   return s
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&amp;/g, "&");
 }
 
 /* Column index from an A1-style ref: A->0, B->1, ..., Z->25, AA->26. */

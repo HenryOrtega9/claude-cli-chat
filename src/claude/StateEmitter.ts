@@ -69,6 +69,19 @@ class StateEmitterImpl {
     }
   }
 
+  /* Teardown for plugin unload/reload. Clears the heartbeat interval (a raw
+     setInterval, so Obsidian's registerInterval cleanup does not cover it) and
+     disables emission. Without this, a reload/quit while a held state is active
+     leaves the 5s heartbeat firing /api/switch POSTs against a dead instance,
+     and reloads stack orphaned intervals. Idempotent. */
+  dispose(): void {
+    this.enabled = false;
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
   /* Emit a state change. De-dupes against the last emitted state so callers
      can fire freely on every stream event without flooding the device. */
   setState(state: DisplayState): void {

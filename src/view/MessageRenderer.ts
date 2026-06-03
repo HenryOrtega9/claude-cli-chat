@@ -37,6 +37,11 @@ export class MessageListRenderer {
      on every streaming delta, so a user-collapsed block doesn't auto-reopen
      on the next token. Absent = use the streaming default. */
   private thinkingOpenOverride = new Map<string, boolean>();
+  /* Sticky per-tool override for the subagent timeline toggle, keyed by Task
+     tool id. Same rationale as thinkingOpenOverride: the subagent summary is
+     rebuilt on every nested-event delta, so a user-expanded (or collapsed)
+     timeline must survive the rebuild. Absent = use the default (collapsed). */
+  private subagentEventsOpenOverride = new Map<string, boolean>();
   private stickToBottom = true;
   private resizeObserver: ResizeObserver | null = null;
   private intersectionObserver: IntersectionObserver | null = null;
@@ -101,6 +106,13 @@ export class MessageListRenderer {
     this.liveEls.clear();
     this.toolEls.clear();
     this.thinkingOpenOverride.clear();
+    this.subagentEventsOpenOverride.clear();
+    /* Clear render chains too: a doUpsert queued behind an in-flight
+       MarkdownRenderer.render await would otherwise re-run after reset, miss
+       the now-empty liveEls, and re-append a fresh bubble — resurrecting a
+       message /clear was meant to remove. Dropping the chain map detaches the
+       stale promise so a late render can't re-enter the cleared container. */
+    this.renderChains.clear();
     this.stickToBottom = true;
     /* Container was emptied above; re-insert the tracked tail element so the
        status pill survives /clear and new-chat resets. */
@@ -173,7 +185,10 @@ export class MessageListRenderer {
     const entry = this.liveEls.get(id);
     if (!entry) return;
     for (const [toolId, toolEl] of Array.from(this.toolEls)) {
-      if (entry.root.contains(toolEl)) this.toolEls.delete(toolId);
+      if (entry.root.contains(toolEl)) {
+        this.toolEls.delete(toolId);
+        this.subagentEventsOpenOverride.delete(toolId);
+      }
     }
     entry.root.remove();
     this.liveEls.delete(id);
@@ -214,9 +229,13 @@ export class MessageListRenderer {
       this.toolEls.set(tool.id, toolEl);
 
       /* Click the header to toggle. Default is collapsed — content is shown
-         only on demand so giant Read/Skill results don't dominate the chat. */
+         only on demand so giant Read/Skill results don't dominate the chat.
+         Record the user's intent via `is-user-toggled` so the running-tool
+         auto-expand guard below leaves their choice alone across the per-delta
+         rebuild — without it a user-collapsed running row snaps back open. */
       header.addEventListener("click", () => {
         toolEl!.toggleClass("is-expanded", !toolEl!.hasClass("is-expanded"));
+        toolEl!.addClass("is-user-toggled");
       });
     }
     const subjectEl = toolEl.querySelector(".claudian-tool-subject") as HTMLElement;
@@ -235,7 +254,18 @@ export class MessageListRenderer {
 
     /* Auto-expand on first sight while running (so the user sees what's about
        to execute) and on error (so they don't have to click to find what
-       failed). Collapse on successful completion. */
+       failed). Collapse on successful completion. Exception: Task/Agent spawns
+       render their own summary (description + live timeline) above the content,
+       so auto-expanding their raw prompt JSON just adds noise — leave it
+       collapsed and let the summary carry the live state. */
+    const isSpawn = tool.name === "Task" || tool.name === "Agent";
+    /* A terminal transition (error or completion) is a fresh system-driven
+       state change, so clear the user's running-tool toggle intent and let the
+       error/complete rules below decide expansion. While still running the
+       flag is preserved so a user-collapsed row stays collapsed. */
+    if (tool.isError || tool.status === "completed") {
+      toolEl.removeClass("is-user-toggled");
+    }
     if (tool.isError) {
       toolEl.addClass("is-expanded");
     } else if (tool.status === "completed") {
@@ -244,7 +274,7 @@ export class MessageListRenderer {
          state. Since toggling a not-yet-expanded element just adds the class,
          absence of `is-expanded` here means we should leave it absent. */
       /* no-op: keep current state */
-    } else if (tool.status === "running" && !toolEl.hasClass("is-user-toggled")) {
+    } else if (tool.status === "running" && !isSpawn && !toolEl.hasClass("is-user-toggled")) {
       toolEl.addClass("is-expanded");
     }
 
@@ -706,11 +736,9 @@ export class MessageListRenderer {
     const nameEl = toolEl.querySelector(".claudian-tool-name") as HTMLElement | null;
     if (nameEl) nameEl.setText(`${tool.name} → ${subagentType}`);
 
-    const hasNestedSurface =
-      !!description ||
-      tool.nestedStatus !== undefined ||
-      (tool.nestedEvents && tool.nestedEvents.length > 0) ||
-      (tool.nestedTruncatedCount ?? 0) > 0;
+    const eventCount = (tool.nestedEvents?.length ?? 0) + (tool.nestedTruncatedCount ?? 0);
+    const hasEvents = eventCount > 0;
+    const hasNestedSurface = !!description || tool.nestedStatus !== undefined || hasEvents;
     if (!hasNestedSurface) return;
 
     const container = createDiv({ cls: "claudian-subagent-summary" });
@@ -718,17 +746,65 @@ export class MessageListRenderer {
       container.createDiv({ cls: "claudian-subagent-description", text: description });
     }
 
-    /* Status line: state + duration when finalized. */
-    if (tool.nestedStatus) {
-      const statusLine = container.createDiv({
-        cls: `claudian-subagent-status-line is-${tool.nestedStatus}`,
+    /* Default the timeline collapsed so a busy subagent doesn't flood the
+       chat with its internal steps. The toggle row + current-activity preview
+       keep the live state legible at a glance; expand for the full timeline.
+       A user's explicit toggle (stored per tool id) overrides the default and
+       survives the per-delta rebuild. */
+    const override = this.subagentEventsOpenOverride.get(tool.id);
+    const isOpen = hasEvents && (override !== undefined ? override : false);
+    container.toggleClass("is-events-open", isOpen);
+
+    /* Toggle row: chevron (only when there's a timeline to expand) + status
+       label + step count + a running pulse. Clicking it flips the timeline. */
+    if (tool.nestedStatus || hasEvents) {
+      const toggle = container.createDiv({
+        cls: `claudian-subagent-toggle is-${tool.nestedStatus ?? "running"}`,
       });
-      statusLine.createSpan({ text: this.subagentStatusLabel(tool) });
+      if (hasEvents) {
+        const chevron = toggle.createSpan({ cls: "claudian-subagent-chevron" });
+        setIcon(chevron, "chevron-down");
+      }
+      toggle.createSpan({
+        cls: "claudian-subagent-toggle-label",
+        text: this.subagentStatusLabel(tool) || "Running",
+      });
+      if (hasEvents) {
+        toggle.createSpan({
+          cls: "claudian-subagent-step-count",
+          text: `${eventCount} step${eventCount === 1 ? "" : "s"}`,
+        });
+      }
+      if (tool.nestedStatus === "running" || tool.nestedStatus === "spawning") {
+        toggle.createSpan({ cls: "claudian-subagent-pulse" });
+      }
+      if (hasEvents) {
+        toggle.addEventListener("click", () => {
+          const next = !container.hasClass("is-events-open");
+          container.toggleClass("is-events-open", next);
+          this.subagentEventsOpenOverride.set(tool.id, next);
+          if (next) this.scrollToBottom();
+        });
+      }
     }
 
-    /* Nested events timeline. */
-    if ((tool.nestedEvents && tool.nestedEvents.length > 0) || (tool.nestedTruncatedCount ?? 0) > 0) {
-      const events = container.createDiv({ cls: "claudian-subagent-events" });
+    /* Collapsed view: a single live line showing the subagent's latest step,
+       so the user still sees "what is it doing now" without the wall of text.
+       Only while the subagent is live — once it finishes, the status label +
+       step count carry the summary and a "current step" line would mislead. */
+    const isLive = tool.nestedStatus !== "completed" && tool.nestedStatus !== "failed";
+    if (hasEvents && !isOpen && isLive) {
+      const current = this.latestActivity(tool);
+      if (current) {
+        container.createDiv({ cls: "claudian-subagent-current", text: current });
+      }
+    }
+
+    /* Full nested events timeline. Always built when events exist; CSS hides
+       the wrapper unless the summary carries `is-events-open`. */
+    if (hasEvents) {
+      const eventsWrap = container.createDiv({ cls: "claudian-subagent-events-wrap" });
+      const events = eventsWrap.createDiv({ cls: "claudian-subagent-events" });
       if ((tool.nestedTruncatedCount ?? 0) > 0) {
         events.createDiv({
           cls: "claudian-subagent-events-truncated",
@@ -789,6 +865,31 @@ export class MessageListRenderer {
     if (typeof input.command === "string") return input.command.length > 80 ? input.command.slice(0, 80) + "…" : input.command;
     if (typeof input.pattern === "string") return input.pattern;
     if (typeof input.subagent_type === "string") return input.subagent_type;
+    return null;
+  }
+
+  /* One-line summary of the subagent's most recent step, shown while the
+     timeline is collapsed. Mirrors the timeline's own formatting (tool name +
+     subject, or the first line of a text/thinking delta) but kept to a single
+     truncated line so the collapsed summary stays compact. */
+  private latestActivity(tool: ToolCall): string | null {
+    const events = tool.nestedEvents;
+    if (!events || events.length === 0) return null;
+    const last = events[events.length - 1];
+    const oneLine = (s: string, n = 72) => {
+      const flat = s.replace(/\s+/g, " ").trim();
+      return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
+    };
+    if (last.kind === "text" || last.kind === "thinking") {
+      const text = oneLine(last.text);
+      return text || null;
+    }
+    if (last.kind === "tool_use") {
+      const subject = this.nestedToolSubject(last);
+      const base = subject ? `${last.name} ${subject}` : last.name;
+      const tail = last.status === "running" ? "…" : "";
+      return oneLine(base) + tail;
+    }
     return null;
   }
 

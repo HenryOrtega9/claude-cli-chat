@@ -67,6 +67,14 @@ export type SpawnOptions = {
   includePartialMessages: boolean;
   /** Text appended to the system prompt via `--append-system-prompt`. */
   appendSystemPrompt?: string;
+  /** Incognito tabs: launch with `--no-session-persistence` so the CLI writes
+      no session transcript to ~/.claude/projects. */
+  noSessionPersistence?: boolean;
+  /** Per-vault MCP deny rules (`mcp__<server>` patterns). Passed via
+      `--settings` so they apply only to this plugin's subprocesses, never to
+      the user's other Claude Code instances. Each pattern removes that
+      server's tools from the model's advertised tool list. */
+  mcpDenyPatterns?: string[];
 };
 
 export type TabSessionStatus = "starting" | "ready" | "running" | "exited" | "error";
@@ -186,10 +194,20 @@ export class TabSession {
       "--add-dir", opts.cwd,
     ];
     if (opts.includePartialMessages) args.push("--include-partial-messages");
+    if (opts.noSessionPersistence) args.push("--no-session-persistence");
     if (opts.model) args.push("--model", opts.model);
     if (opts.effort) args.push("--effort", opts.effort);
     if (opts.appendSystemPrompt && opts.appendSystemPrompt.trim().length > 0) {
       args.push("--append-system-prompt", opts.appendSystemPrompt);
+    }
+    /* Per-vault MCP disable. `--settings` accepts an inline JSON string and
+       layers on top of the user's own settings; deny rules union across
+       layers and win over allow, so this hides the named servers' tools
+       without touching ~/.claude.json or any shared settings file. Only
+       emitted when something is actually disabled so a fully-enabled vault
+       spawns byte-for-byte as before. */
+    if (opts.mcpDenyPatterns && opts.mcpDenyPatterns.length > 0) {
+      args.push("--settings", JSON.stringify({ permissions: { deny: opts.mcpDenyPatterns } }));
     }
     if (opts.sessionId) args.push("--resume", opts.sessionId);
     return args;
@@ -437,6 +455,8 @@ export function spawnOptionsFromSettings(
     effort?: string;
     permissionMode?: ClaudeChatSettings["permissionMode"];
     appendSystemPrompt?: string;
+    noSessionPersistence?: boolean;
+    mcpDenyPatterns?: string[];
   }
 ): SpawnOptions {
   return {
@@ -448,5 +468,7 @@ export function spawnOptionsFromSettings(
     permissionMode: overrides?.permissionMode ?? settings.permissionMode,
     includePartialMessages: settings.includePartialMessages,
     appendSystemPrompt: overrides?.appendSystemPrompt,
+    noSessionPersistence: overrides?.noSessionPersistence,
+    mcpDenyPatterns: overrides?.mcpDenyPatterns,
   };
 }

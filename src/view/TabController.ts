@@ -1,4 +1,4 @@
-import { Notice, TFile, TFolder, type App, type Component } from "obsidian";
+import { Notice, TFile, TFolder, type App, type Component, type EventRef } from "obsidian";
 import { MessageListRenderer } from "./MessageRenderer";
 import { ApprovalArea, type ApprovalDecision } from "./ApprovalModal";
 import { InputBox, type SubmitPayload, type Suggestion } from "./InputBox";
@@ -10,13 +10,14 @@ import { ActiveFileIndicator } from "./ActiveFileIndicator";
 import { SelectionTracker, type ActiveSelection } from "./SelectionTracker";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
-import { resolveModelId, trustedFolderAllowPatterns, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
+import { resolveModelId, trustedFolderAllowPatterns, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
 import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
-import { RemoteControlSession, sessionFilePathFor } from "../claude/RemoteControlSession";
+import { RemoteControlSession, sessionFilePathFor, projectDirFor } from "../claude/RemoteControlSession";
+import { rm } from "node:fs/promises";
 import { JsonlTailer } from "../claude/JsonlTailer";
 import { SubagentSessionTracker, type SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
 import { generateTitle } from "../claude/TitleGenerator";
-import { MCPConfigStore } from "../mcp/MCPConfig";
+import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
 import { SubagentPicker } from "./SubagentPicker";
 import { CreateSubagentModal } from "./CreateSubagentModal";
 import type { SubagentEntry } from "../claude/SubagentDiscovery";
@@ -59,6 +60,13 @@ export class TabController {
   private component: Component;
   private session: TabSession | null = null;
   private remoteSession: RemoteControlSession | null = null;
+  /* Session ids this tab has used while incognito. `--no-session-persistence`
+     suppresses the transcript but the CLI still writes a one-line `ai-title`
+     record (and any subagent session files) keyed by session id. We delete
+     those on teardown so an incognito tab truly leaves nothing on disk. Only
+     ever holds ids belonging to THIS tab, so deletion never touches another
+     tab's files in the shared project dir. */
+  private incognitoSessionIds = new Set<string>();
   /* Set true at the start of cancelStream() so the SIGTERM-driven exit event
      gets handled as a clean cancel (italic prompt) instead of an error. */
   private userCancelInitiated = false;
@@ -92,13 +100,35 @@ export class TabController {
      when the tool_result arrives. */
   private subagentSpawnTimes = new Map<string, number>();
 
+  /* Cached @-mention index: a flat snapshot of every vault file and folder.
+     Built lazily on first use and invalidated on vault create/delete/rename so
+     queryFileSuggestions doesn't re-walk the whole vault tree and re-allocate
+     N entries on every keystroke. Scoring and sorting still run per query; only
+     the O(N) enumeration is memoized. File mtime is snapshotted too, so the
+     empty-query "recently modified" ordering can lag a content edit until the
+     next structural change — an accepted trade for the typing-latency win. */
+  private mentionIndex: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> | null = null;
+  private mentionIndexRefs: EventRef[] = [];
+
   /* Optional fork handler — provided by ClaudeChatView so the controller can
      ask the view to create a new tab branching from a given message id. */
   onForkRequest?: (sourceTab: TabController, messageId: string) => void;
+  /* Set by the view. Fired when the user toggles incognito on a still-empty
+     tab so the view can reconcile disk state (delete any persisted file when
+     turning on, resume persistence when turning off). */
+  onIncognitoToggle?: (tabId: string, incognito: boolean) => void;
 
   /* Set to true while teardownSession() is executing so re-entrant callers
      (e.g. an onExit firing mid-dispose) don't double-dispose. */
   private tearingDown = false;
+
+  /* In-flight teardown started by restartSubprocess() (fire-and-forget so the
+     picker callback stays sync). ensureSession() awaits this before spawning
+     so a model/effort/mode change followed by a quick submit can't race the
+     not-yet-exited subprocess: spawn() returns a still-"running" session if
+     the old process hasn't died, reusing the stale model and double-binding
+     listeners. Awaiting the dispose closes that ~2s window. */
+  private pendingRestartTeardown: Promise<void> | null = null;
 
   /* Tracks whether handleError has already pushed an error bubble for the
      current pass. onError and onExit can both fire for the same failure
@@ -122,6 +152,17 @@ export class TabController {
     this.component = component;
     this.state = state ?? makeTabState();
     this.onStateChangeCb = onStateChange;
+
+    /* Invalidate the cached @-mention index when the vault tree changes. Torn
+       down in destroy() via offref so the listeners don't outlive the tab.
+       Content "modify" is intentionally not watched — it would rebuild the
+       index mid-edit and defeat the cache; only structural changes matter. */
+    const invalidateMentionIndex = () => { this.mentionIndex = null; };
+    this.mentionIndexRefs.push(
+      this.app.vault.on("create", invalidateMentionIndex),
+      this.app.vault.on("delete", invalidateMentionIndex),
+      this.app.vault.on("rename", invalidateMentionIndex),
+    );
 
     this.root = parent.createDiv({ cls: "claudian-tab-content" });
 
@@ -182,6 +223,7 @@ export class TabController {
         onModelChange: model => this.handleModelChange(model),
         onEffortChange: effort => this.handleEffortChange(effort),
         onPermissionModeChange: mode => this.handlePermissionModeChange(mode),
+        onIncognitoChange: incognito => this.handleIncognitoChange(incognito),
         onMentionQuery: query => this.queryFileSuggestions(query),
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
@@ -204,8 +246,15 @@ export class TabController {
         model: (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel,
         effort: (this.state.effort as EffortLevel | undefined) ?? this.plugin.settings.defaultEffort,
         permissionMode: (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode,
+        incognito: this.state.incognito,
       }
     );
+    /* Lock the incognito choice if this tab already has history or a session
+       (e.g. restored from disk, or forked). The --no-session-persistence flag
+       can only be applied at spawn time, so it can't change retroactively. */
+    if (this.state.messages.length > 0 || this.state.sessionId !== null) {
+      this.inputBox.setIncognitoLocked(true);
+    }
     /* Initial paint for the agents pill — visible whenever the catalog has
        at least one entry. Re-painted in handlePluginSlashCommand after the
        catalog refreshes. */
@@ -279,6 +328,8 @@ export class TabController {
        race against our own teardown. teardownSession() awaits SIGTERM and
        the eventual process-exit. */
     if (this.remoteSession) this.plugin.subprocessManager.unregisterRemote(this.state.id);
+    for (const ref of this.mentionIndexRefs) this.app.vault.offref(ref);
+    this.mentionIndexRefs = [];
     await this.teardownSession("destroy");
     const remoteWork = this.remoteSession ? [this.remoteSession.dispose()] : [];
     const tailerWork = this.jsonlTailer ? [this.jsonlTailer.stop()] : [];
@@ -293,6 +344,13 @@ export class TabController {
 
   async switchMode(mode: TabMode): Promise<void> {
     if (this.mode === mode) return;
+    /* Remote Control tails the session JSONL, which an incognito tab never
+       writes (--no-session-persistence). Block the switch rather than start a
+       remote session that can never receive events. */
+    if (mode === "remote" && this.state.incognito) {
+      new Notice("Incognito chats are local-only — Remote Control needs the session file that incognito disables.", 6000);
+      return;
+    }
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] switchMode tab=${this.state.id} ${this.mode} -> ${mode}`);
 
@@ -340,6 +398,14 @@ export class TabController {
       if (s) {
         try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
       }
+      /* The CLI writes an `ai-title` residue file even under
+         --no-session-persistence. Once the process has exited (dispose above
+         awaited it), purge this incognito tab's session files. Only on
+         terminal teardowns — "restart"/"cancel"/"switch" keep chatting and
+         the residue is cleaned on the eventual destroy/clear. */
+      if (this.state.incognito && (reason === "destroy" || reason === "clear")) {
+        await this.cleanupIncognitoSessionFiles();
+      }
       /* Stop any in-flight subagent JSONL trackers so they don't keep
          pinging the disk after the parent session is gone. Fire and
          forget; releasing the session-file claim happens inside stop(). */
@@ -364,6 +430,24 @@ export class TabController {
     }
   }
 
+  /* Delete every on-disk file the CLI wrote for this incognito tab's sessions:
+     the per-session `<id>.jsonl` (which holds the ai-title) and the `<id>/`
+     subdirectory (subagent transcripts). Best-effort and idempotent — rm with
+     `force` never throws on a missing path. Only this tab's session ids are in
+     the set, so we never touch another tab's files in the shared project dir. */
+  private async cleanupIncognitoSessionFiles(): Promise<void> {
+    if (this.incognitoSessionIds.size === 0) return;
+    const cwd = this.plugin.getVaultPath();
+    const ids = Array.from(this.incognitoSessionIds);
+    this.incognitoSessionIds.clear();
+    const work: Promise<unknown>[] = [];
+    for (const id of ids) {
+      work.push(rm(sessionFilePathFor(cwd, id), { force: true }).catch(() => {}));
+      work.push(rm(`${projectDirFor(cwd)}/${id}`, { force: true, recursive: true }).catch(() => {}));
+    }
+    await Promise.all(work);
+  }
+
   /* Reload the cost-surface pill: count pinned files for this tab and read
      MCP server config (both enabled and disabled) from
      <vault>/.claude/mcp.json. Public so the parent view can re-trigger
@@ -382,14 +466,30 @@ export class TabController {
     const pinCount = (this.state.pinnedFilePaths ?? []).length;
     let mcpServers: Array<{ name: string; enabled: boolean; tools: string[] }> = [];
     try {
-      const store = new MCPConfigStore(this.app);
-      const all = await store.listAllServers();
+      const disabled = new Set(await new MCPConfigStore(this.app).getDisabledServerNames());
       const toolMap = this.state.mcpToolsByServer ?? {};
-      mcpServers = all.map(s => ({
-        name: s.name,
-        enabled: s.enabled,
-        tools: s.enabled ? (toolMap[s.name] ?? []) : [],
-      }));
+      /* Authoritative server set from the CLI (cached). Tool counts come from
+         this tab's init event, keyed by the sanitized server name. A disabled
+         server is denied at spawn, so its tools never arrive — show it with an
+         empty list regardless. */
+      const list = await this.plugin.getMcpServers().catch(() => []);
+      if (list.length > 0) {
+        mcpServers = list.map(s => {
+          const enabled = !disabled.has(s.name);
+          return {
+            name: s.name,
+            enabled,
+            tools: enabled ? (toolMap[sanitizeMcpServerName(s.name)] ?? []) : [],
+          };
+        });
+      } else {
+        /* No list yet (CLI slow/unavailable). Fall back to whatever the
+           runtime announced: enabled servers from the init tool map, plus the
+           disabled names so they stay visible and re-enableable. */
+        const fromRuntime = Object.keys(toolMap).map(sid => ({ name: sid, enabled: true, tools: toolMap[sid] }));
+        const fromDisabled = Array.from(disabled).map(name => ({ name, enabled: false, tools: [] as string[] }));
+        mcpServers = [...fromRuntime, ...fromDisabled];
+      }
     } catch {
       /* ignore — leave mcpServers empty */
     }
@@ -400,16 +500,19 @@ export class TabController {
     });
   }
 
-  /* Toggle a server's enabled state and refresh the pill. The mcp.json
-     change won't take effect until the CLI subprocess respawns (next
-     /clear or new tab); we surface that via a Notice so the user knows
-     to restart if they want the change to land immediately. */
+  /* Toggle a server's per-vault enabled state and refresh the pill. Disabling
+     records the server name so the next spawn passes an `mcp__<server>` deny
+     rule (scoped to this plugin's subprocesses — other Claude Code instances
+     are untouched). The change lands on the next subprocess respawn (/clear
+     or new tab); we surface that via a Notice and refresh the cached deny
+     patterns so the next spawn reads the new value. */
   public async setMcpEnabled(name: string, enabled: boolean): Promise<void> {
     try {
-      const changed = await new MCPConfigStore(this.app).setEnabled(name, enabled);
+      const changed = await new MCPConfigStore(this.app).setServerDisabled(name, !enabled);
       if (changed) {
+        await this.plugin.refreshMcpDenyPatterns();
         new Notice(
-          `${enabled ? "Enabled" : "Disabled"} MCP server "${name}". Restart this chat (/clear) for the change to take effect.`,
+          `${enabled ? "Enabled" : "Disabled"} MCP server "${name}" for this vault. Restart this chat (/clear) for the change to take effect.`,
           6000
         );
       }
@@ -725,12 +828,36 @@ export class TabController {
     setWelcomeVisible(this.welcomeEl, this.state.messages.length === 0);
   }
 
-  private ensureSession(): TabSession {
+  private async ensureSession(): Promise<TabSession> {
     if (this.session && this.session.status !== "exited") return this.session;
+    /* Await any in-flight restart teardown so the old subprocess has fully
+       exited (and been dropped from SubprocessManager's session map) before we
+       spawn. Otherwise spawn() finds the not-yet-exited session and returns it
+       on the OLD model, and we'd re-bind listeners onto a stale session. */
+    if (this.pendingRestartTeardown) {
+      const pending = this.pendingRestartTeardown;
+      this.pendingRestartTeardown = null;
+      await pending;
+    }
     const cwd = this.plugin.getVaultPath();
-    const modelKey = (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel;
-    const effortKey = (this.state.effort as EffortLevel | undefined) ?? this.plugin.settings.defaultEffort;
-    const modeKey = (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode;
+    /* Validate persisted enum fields before trusting them. On disk these are
+       `string | undefined`, so a hand-edited file or a key removed in a later
+       plugin version would otherwise cast straight through — an unknown model
+       key makes resolveModelId() return undefined and the CLI silently spawns
+       on its default model. Fall back to the configured default whenever the
+       stored value isn't a currently-known key. */
+    const sm = this.state.model;
+    const modelKey: ModelKey = sm !== undefined && Object.prototype.hasOwnProperty.call(MODEL_IDS, sm)
+      ? (sm as ModelKey)
+      : this.plugin.settings.defaultModel;
+    const se = this.state.effort;
+    const effortKey: EffortLevel = se !== undefined && (EFFORT_ORDER as readonly string[]).includes(se)
+      ? (se as EffortLevel)
+      : this.plugin.settings.defaultEffort;
+    const spm = this.state.permissionMode;
+    const modeKey: PermissionMode = spm !== undefined && (PERMISSION_MODE_ORDER as readonly string[]).includes(spm)
+      ? (spm as PermissionMode)
+      : this.plugin.settings.permissionMode;
     /* If a snippet is applied, look it up at spawn time so edits to the
        snippet's systemPromptAddendum take effect on the next restart. */
     const snippet = this.state.envSnippetId
@@ -749,13 +876,26 @@ export class TabController {
     const trustedAddendum = this.buildTrustedFoldersAddendum();
     const composedAddendum =
       [vaultAddendum, snippetAddendum, trustedAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
-    const opts = spawnOptionsFromSettings(this.plugin.settings, cwd, this.state.sessionId ?? undefined, {
+    /* Incognito sessions are never persisted, so `--resume` would point at a
+       transcript that doesn't exist. On respawn (model/effort/mode change)
+       start a fresh session instead — context is lost, which is the accepted
+       incognito trade-off, rather than attempting a doomed resume. */
+    const resumeId = this.state.incognito ? undefined : (this.state.sessionId ?? undefined);
+    const opts = spawnOptionsFromSettings(this.plugin.settings, cwd, resumeId, {
       model: resolveModelId(modelKey),
       effort: effortKey,
       permissionMode: modeKey,
       appendSystemPrompt: composedAddendum,
+      noSessionPersistence: this.state.incognito,
+      /* Per-vault MCP disables, read from the plugin's in-memory cache (kept
+         fresh by refreshMcpDenyPatterns on every toggle). Empty unless the
+         user switched a server off in the MCP manager. */
+      mcpDenyPatterns: this.plugin.mcpDenyPatterns,
     });
     this.session = this.plugin.subprocessManager.spawn(this.state.id, opts);
+    /* The incognito decision is now baked into the live subprocess — lock the
+       pill so it can't change for the rest of this tab's life. */
+    this.inputBox.setIncognitoLocked(true);
     this.session.onEvent(e => this.onEvent(e));
     this.session.onExit((code, signal) => this.onExit(code, signal));
     this.session.onError(err => this.onErrorRaw(err));
@@ -772,7 +912,13 @@ export class TabController {
   private lastStderr = "";
 
   private restartSubprocess() {
-    void this.teardownSession("restart");
+    /* Capture the teardown promise (still fire-and-forget here) so the next
+       ensureSession() can await the old subprocess's actual exit before
+       spawning. Without this, a quick submit during the ~2s SIGTERM window
+       would get the stale (still-running) session back from spawn() on the old
+       model, with listeners re-bound. A swallowed rejection keeps this
+       non-throwing for the unawaited path. */
+    this.pendingRestartTeardown = this.teardownSession("restart").catch(() => {});
     this.lastStderr = "";
   }
 
@@ -795,6 +941,16 @@ export class TabController {
     this.state.updatedAt = Date.now();
     this.restartSubprocess();
     this.onStateChangeCb();
+  }
+
+  /* Toggle incognito on a still-empty tab. The InputBox only fires this while
+     its pill is unlocked (no live session), so we never flip a tab that has
+     already spawned. The view reconciles disk state via onIncognitoToggle:
+     deleting any file written while the tab was a normal empty tab. */
+  private handleIncognitoChange(incognito: boolean) {
+    this.state.incognito = incognito || undefined;
+    this.state.updatedAt = Date.now();
+    this.onIncognitoToggle?.(this.state.id, incognito);
   }
 
   /* Apply an environment snippet — overwrites model + effort + permission
@@ -949,7 +1105,7 @@ export class TabController {
        follow-up turns and when the setting is off. */
     void this.maybeGenerateTitle();
 
-    const session = this.ensureSession();
+    const session = await this.ensureSession();
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] submit -> session.status=${session.status}`);
     /* Claude Code stream-json mode does NOT emit `system/init` until it has
@@ -1017,7 +1173,11 @@ export class TabController {
         const sys = event as SystemInitEvent | SystemApiRetryEvent | { type: "system"; subtype: string };
         if (sys.subtype === "init") {
           const init = sys as SystemInitEvent;
-          if (init.session_id) this.state.sessionId = init.session_id;
+          if (init.session_id) {
+            this.state.sessionId = init.session_id;
+            /* Remember this id so teardown can delete its on-disk residue. */
+            if (this.state.incognito) this.incognitoSessionIds.add(init.session_id);
+          }
           /* Cache the slash-command and skill lists the CLI just announced.
              Reset on every spawn — when the user switches model / effort /
              permission mode the subprocess restarts and a new init arrives
@@ -1538,6 +1698,13 @@ export class TabController {
 
   private async maybeGenerateTitle() {
     if (this.titleGenerationStarted) return;
+    /* Incognito tabs must touch no disk. generateTitle spawns a throwaway
+       `claude --print --no-session-persistence` subprocess whose own session
+       id is never captured in incognitoSessionIds, so the ai-title residue it
+       writes (wire-format gotcha #6) would never be cleaned up — a privacy
+       leak summarizing the chat. Skip title-gen entirely; the synchronous
+       first-message-prefix title set in submit() is the incognito fallback. */
+    if (this.state.incognito) return;
     if (!this.plugin.settings.autoGenerateTitles) return;
     /* Only fire on the very first turn. After that the title is either the
        user's choice or a previous title-gen result — don't overwrite. */
@@ -1672,6 +1839,12 @@ export class TabController {
 
   private onErrorRaw(err: Error) {
     void this.handleError({ type: "error", subtype: "spawn_error", message: err.message });
+    /* Persist the error bubble. Unlike the onEvent "error" case (followed by
+       the trailing onStateChangeCb) and onExit (which calls it directly), the
+       raw spawn-error path has no other persistence trigger — an ENOENT spawn
+       failure emits "error" without an "exit", so without this the bubble is
+       shown live but never written to disk and vanishes on reload. */
+    this.onStateChangeCb();
   }
 
   /* Tracks which message ID is the current "in-flight" assistant bubble so
@@ -1883,12 +2056,40 @@ export class TabController {
     for (const p of patterns) await this.plugin.permissionsStore.removeAllow(p);
   }
 
+  /* Lazily build and memoize the flat file+folder index that backs the
+     @-mention query. Invalidated by the vault create/delete/rename listeners
+     wired in the constructor, so it survives across keystrokes. The vault root
+     (path "") is skipped so the user can't pin "the entire vault"; folders
+     carry mtime 0 (folder mtime isn't exposed) so they bunch at the bottom of
+     the empty-query list, matching Obsidian's quick-switcher behavior. */
+  private getMentionIndex(): Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> {
+    if (this.mentionIndex) return this.mentionIndex;
+    const index: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> = [];
+    for (const f of this.app.vault.getFiles()) {
+      index.push({ kind: "file", path: f.path, name: f.basename, mtime: f.stat.mtime, ext: f.extension });
+    }
+    const walkFolders = (folder: TFolder) => {
+      for (const child of folder.children) {
+        if (child instanceof TFolder) {
+          if (child.path !== "" && child.path !== "/") {
+            index.push({ kind: "folder", path: child.path, name: child.name, mtime: 0, ext: "" });
+          }
+          walkFolders(child);
+        }
+      }
+    };
+    walkFolders(this.app.vault.getRoot());
+    this.mentionIndex = index;
+    return index;
+  }
+
   /* Rank vault files AND folders for an @-mention query. Simple heuristic:
      prefer basename matches over path matches, then prefer prefix matches
      over substring matches. Cap at 20 results. Claude Code understands
      `@<path>` references natively for files (the CLI expands them into file
      content); folders are routed to onPinFolder instead and become pinned
-     pills rather than text references. */
+     pills rather than text references. Reads the memoized getMentionIndex()
+     so a keystroke costs one scored pass, not a full vault re-traversal. */
   private queryFileSuggestions(query: string): Suggestion[] {
     const q = query.toLowerCase();
     type Scored = { kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string; score: number };
@@ -1904,31 +2105,10 @@ export class TabController {
       return -1;
     };
 
-    for (const f of this.app.vault.getFiles()) {
-      const score = scoreOf(f.basename, f.path, f.stat.mtime);
-      if (score >= 0) scored.push({
-        kind: "file", path: f.path, name: f.basename, mtime: f.stat.mtime, ext: f.extension, score,
-      });
+    for (const entry of this.getMentionIndex()) {
+      const score = scoreOf(entry.name, entry.path, entry.mtime);
+      if (score >= 0) scored.push({ ...entry, score });
     }
-    /* Walk every folder. The vault root is named "" — skip it so the user
-       can't pin "the entire vault" by accident. Folder mtime isn't directly
-       exposed, so use 0 as a neutral sort key when the query is empty
-       (folders bunch at the bottom of the empty-query list, which matches
-       Obsidian's quick-switcher behavior). */
-    const walkFolders = (folder: TFolder) => {
-      for (const child of folder.children) {
-        if (child instanceof TFolder) {
-          if (child.path !== "" && child.path !== "/") {
-            const score = scoreOf(child.name, child.path, 0);
-            if (score >= 0) scored.push({
-              kind: "folder", path: child.path, name: child.name, mtime: 0, ext: "", score,
-            });
-          }
-          walkFolders(child);
-        }
-      }
-    };
-    walkFolders(this.app.vault.getRoot());
 
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, 20).map((s): Suggestion => s.kind === "folder"

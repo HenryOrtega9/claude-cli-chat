@@ -135,6 +135,13 @@ export type TabState = {
   /* Discovered slash commands + skills from the most recent system/init
      event. Refreshed on every (re)spawn. Used to populate the slash-command
      suggestion popup. Not persisted — re-derived on next subprocess spawn. */
+  /* Incognito ("temporary chat") flag. Runtime-only — NEVER written to the
+     persisted StoredTab, so an incognito tab leaves nothing in the vault and
+     vanishes on reload. Chosen before the first message; once a session
+     spawns the choice is locked. When set, the CLI is launched with
+     --no-session-persistence so it writes no ~/.claude session JSONL either,
+     and all vault writes for this tab are skipped. */
+  incognito?: boolean;
   availableSlashCommands?: string[];
   availableSkills?: string[];
   /* MCP tools the CLI announced in the most recent system/init event,
@@ -168,7 +175,7 @@ function makeId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 }
 
-export function makeTabState(): TabState {
+export function makeTabState(opts?: { incognito?: boolean }): TabState {
   const now = Date.now();
   return {
     id: makeId("tab"),
@@ -179,6 +186,7 @@ export function makeTabState(): TabState {
     messages: [],
     pendingApprovals: new Map(),
     busy: false,
+    incognito: opts?.incognito || undefined,
   };
 }
 

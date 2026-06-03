@@ -43,6 +43,11 @@ export class ActiveFileIndicator {
      feedback instead of a snap. Cleared by a timer set during the same
      setPinnedPaths call. */
   private fadingPaths: Set<string> = new Set();
+  /* Pending fade timers (one per fading path). Tracked so destroy() can
+     cancel them; otherwise a timer scheduled within 850ms of teardown
+     fires after the root is detached and runs renderPills() on a dead
+     element. */
+  private fadeTimers = new Map<string, number>();
   private currentActiveFile: TFile | null = null;
   private eventRef: EventRef | null = null;
   private deleteRef: EventRef | null = null;
@@ -132,6 +137,11 @@ export class ActiveFileIndicator {
       this.app.vault.offref(this.renameRef);
       this.renameRef = null;
     }
+    /* Cancel any in-flight pin-fade timers so their callbacks don't run
+       renderPills() against the detached root after teardown. */
+    for (const timer of this.fadeTimers.values()) window.clearTimeout(timer);
+    this.fadeTimers.clear();
+    this.fadingPaths.clear();
     this.root.remove();
   }
 
@@ -186,11 +196,13 @@ export class ActiveFileIndicator {
          class removal happens after the property animation completes,
          so the pill doesn't get yanked back to fast-transition mode
          mid-fade if anything else re-renders it. */
-      setTimeout(() => {
+      const timer = window.setTimeout(() => {
+        this.fadeTimers.delete(oldPath);
         if (!this.fadingPaths.has(oldPath)) return;
         this.fadingPaths.delete(oldPath);
         this.renderPills();
       }, 850);
+      this.fadeTimers.set(oldPath, timer);
     }
     this.pinnedPaths = nextSet;
     /* Intersect sticky with the new pinned set so we never carry a

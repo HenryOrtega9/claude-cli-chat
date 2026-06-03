@@ -168,12 +168,13 @@ export function discoverSkillsAndCommands(vaultPath: string): DiscoveryResult {
   const skills: DiscoveredEntry[] = [];
   const commands: DiscoveredEntry[] = [];
 
-  skills.push(...listSkillsIn(join(home, ".claude/skills"), "user"));
-  commands.push(...listCommandsIn(join(home, ".claude/commands"), "user"));
-
-  if (vaultPath) {
-    skills.push(...listSkillsIn(join(vaultPath, ".claude/skills"), "project"));
-    commands.push(...listCommandsIn(join(vaultPath, ".claude/commands"), "project"));
+  /* Push lowest-priority sources first because dedupByName is last-writer-wins
+     (see comment there). Built-ins are the floor, then plugin, then user, then
+     project, so a project-scoped entry overrides a user one, which overrides a
+     plugin one, which overrides a CLI built-in of the same name — matching the
+     CLI's resolution order and the sibling SubagentDiscovery. */
+  for (const b of BUILTIN_COMMANDS) {
+    commands.push({ name: b.name, description: b.description, source: "builtin" });
   }
 
   for (const { pluginName, installPath } of listInstalledPluginDirs()) {
@@ -181,8 +182,12 @@ export function discoverSkillsAndCommands(vaultPath: string): DiscoveryResult {
     commands.push(...listCommandsIn(join(installPath, "commands"), "plugin", pluginName));
   }
 
-  for (const b of BUILTIN_COMMANDS) {
-    commands.push({ name: b.name, description: b.description, source: "builtin" });
+  skills.push(...listSkillsIn(join(home, ".claude/skills"), "user"));
+  commands.push(...listCommandsIn(join(home, ".claude/commands"), "user"));
+
+  if (vaultPath) {
+    skills.push(...listSkillsIn(join(vaultPath, ".claude/skills"), "project"));
+    commands.push(...listCommandsIn(join(vaultPath, ".claude/commands"), "project"));
   }
 
   /* De-dup by name within each list. Later entries (e.g. user override of a

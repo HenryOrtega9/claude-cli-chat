@@ -1,6 +1,7 @@
 import { setIcon, Notice } from "obsidian";
 import {
   MODEL_LABELS,
+  MODEL_GROUPS,
   EFFORT_LABELS,
   effortLevelsForModel,
   contextWindowForModel,
@@ -18,6 +19,33 @@ import type { UsageSnapshot } from "../claude/Events";
 import { CLAUDE_ASTERISK_DATA_URI } from "./Welcome";
 import type { Attachment } from "./state";
 import type { ActiveSelection } from "./SelectionTracker";
+
+/* Resolve a picked File to its absolute on-disk path inside Obsidian's
+   Electron environment. Two APIs may apply:
+     - `File.path` (Electron-specific extension) — available through
+       Electron 31. Removed in Electron 32+.
+     - `webUtils.getPathForFile(file)` — the replacement, available from
+       Electron 28 onward via `require("electron").webUtils`.
+   We try `.path` first because it's a free check on older builds, then
+   fall back to webUtils. Returns "" when neither yields a path so the
+   caller can surface a precise error to the user rather than a generic
+   "couldn't read" — most often that means the renderer isn't seeing the
+   `electron` module (sandboxed context, packaged build without node
+   integration), which calls for a different remedy than a code fix. */
+function resolveElectronFilePath(file: File): string {
+  const fromExtension = (file as File & { path?: string }).path;
+  if (fromExtension) return fromExtension;
+  try {
+    const electron = (window as unknown as { require?: (id: string) => unknown }).require?.("electron") as
+      | { webUtils?: { getPathForFile?: (file: File) => string } }
+      | undefined;
+    const resolved = electron?.webUtils?.getPathForFile?.(file);
+    if (resolved) return resolved;
+  } catch (err) {
+    console.warn("[claude-cli-chat] electron.webUtils.getPathForFile threw:", err);
+  }
+  return "";
+}
 
 /* btoa() needs a binary string. Building one with String.fromCharCode(...arr)
    blows the call stack on large images, so feed it in chunks. */
@@ -102,6 +130,9 @@ export type InputBoxCallbacks = {
   onModelChange: (model: ModelKey) => void;
   onEffortChange: (effort: EffortLevel) => void;
   onPermissionModeChange: (mode: PermissionMode) => void;
+  /* Fired when the user toggles the incognito pill. Only fires while the pill
+     is unlocked (no live session yet). */
+  onIncognitoChange: (incognito: boolean) => void;
   /* Return vault file matches for an @-mention query. Caller (TabController)
      reads from app.vault and ranks. Limit to ~20 results. */
   onMentionQuery: (query: string) => Suggestion[];
@@ -204,6 +235,12 @@ export class InputBox {
   private effortPillValue: HTMLElement;
   private modePill: HTMLElement;
   private modePillValue: HTMLElement;
+  /* Incognito ("temporary chat") toggle pill. Active = this tab persists
+     nothing. Editable only before the first message; locked once a session
+     exists (the --no-session-persistence decision is fixed at spawn time). */
+  private incognitoPill: HTMLElement;
+  private currentIncognito = false;
+  private incognitoLocked = false;
   private usageChip: HTMLElement;
   private usageDonutCircle: SVGCircleElement;
   private usagePercentEl: HTMLElement;
@@ -274,12 +311,13 @@ export class InputBox {
     container: HTMLElement,
     settings: ClaudeChatSettings,
     callbacks: InputBoxCallbacks,
-    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode }
+    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode; incognito?: boolean }
   ) {
     this.callbacks = callbacks;
     this.currentModel = initial?.model ?? settings.defaultModel;
     this.currentEffort = initial?.effort ?? settings.defaultEffort;
     this.currentMode = initial?.permissionMode ?? settings.permissionMode;
+    this.currentIncognito = initial?.incognito ?? false;
 
     this.root = container.createDiv({ cls: "claudian-input-container" });
     this.wrapper = this.root.createDiv({ cls: "claudian-input-wrapper" });
@@ -357,9 +395,11 @@ export class InputBox {
        popup. webkitdirectory is the Electron-supported way to surface the
        OS folder chooser without pulling in @electron/remote. The browser
        hands back File objects for every entry under the chosen folder; we
-       only need the first one's `.path` (Electron extension on File) to
-       derive the absolute folder path by stripping its webkitRelativePath
-       tail. */
+       only need the first one's absolute path (resolved via the
+       Electron-specific `File.path` extension on older Electron, or
+       `webUtils.getPathForFile(file)` on Electron 32+ where `File.path`
+       was removed) to derive the folder by stripping its
+       webkitRelativePath tail. */
     this.hiddenDirInput = this.wrapper.createEl("input", {
       cls: "claudian-attach-input",
       attr: { type: "file", webkitdirectory: "true", directory: "true" },
@@ -368,11 +408,16 @@ export class InputBox {
       const files = Array.from(this.hiddenDirInput.files ?? []);
       this.hiddenDirInput.value = "";
       if (files.length === 0) return;
-      const first = files[0] as File & { path?: string };
+      const first = files[0];
       const rel = first.webkitRelativePath ?? "";
-      const abs = first.path ?? "";
-      if (!abs || !rel) {
-        new Notice("Couldn't read the folder path.");
+      if (!rel) {
+        new Notice("Couldn't read the folder path (no webkitRelativePath).");
+        return;
+      }
+      const abs = resolveElectronFilePath(first);
+      if (!abs) {
+        new Notice("Couldn't read the folder path (Electron didn't expose an absolute path).");
+        console.error("[claude-cli-chat] No File.path and no webUtils.getPathForFile available for picked folder; first file:", first);
         return;
       }
       /* webkitRelativePath is "<folderName>/<...children>"; strip that tail
@@ -414,6 +459,23 @@ export class InputBox {
       this.toggleModePopup();
     });
 
+    /* Incognito pill — sits right of the mode pill. A binary toggle (no
+       popup): click flips temporary-chat on/off. Disabled once a session
+       exists, since --no-session-persistence is fixed at spawn time. */
+    this.incognitoPill = this.topToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-incognito-pill",
+      attr: {
+        "aria-label": "Incognito (temporary chat) — leaves nothing on disk",
+        title: "Incognito — temporary chat that is never saved to history or disk",
+      },
+    });
+    this.incognitoPill.createSpan({ cls: "claudian-toolbar-pill-value", text: "🕶" });
+    this.incognitoPill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Incognito" });
+    this.incognitoPill.addEventListener("click", e => {
+      e.stopPropagation();
+      this.toggleIncognito();
+    });
+
     this.topToolbar.createDiv({ cls: "claudian-input-toolbar-spacer" });
 
     /* Model pill — Claude logo popup on click. Sits at the right edge of
@@ -450,6 +512,7 @@ export class InputBox {
     this.refreshModelPill();
     this.refreshEffortPill();
     this.refreshModePill();
+    this.refreshIncognitoPill();
 
     /* Cost-surface pill — sits between effort and usage. Shows pinned-file
        count + connected MCP server count, both of which ride on every turn's
@@ -989,6 +1052,26 @@ export class InputBox {
     else if (this.currentMode === "auto") this.modePill.addClass("mode-auto");
   }
 
+  private refreshIncognitoPill() {
+    this.incognitoPill.toggleClass("is-active", this.currentIncognito);
+    this.incognitoPill.toggleClass("is-disabled", this.incognitoLocked);
+  }
+
+  private toggleIncognito() {
+    if (this.incognitoLocked) return;
+    this.currentIncognito = !this.currentIncognito;
+    this.refreshIncognitoPill();
+    this.callbacks.onIncognitoChange(this.currentIncognito);
+  }
+
+  /* Lock/unlock the incognito pill. TabController locks once a session exists
+     (the decision is fixed at spawn time) and on restore of a tab that already
+     has history. */
+  setIncognitoLocked(locked: boolean) {
+    this.incognitoLocked = locked;
+    this.refreshIncognitoPill();
+  }
+
   private toggleModePopup() {
     if (this.openPopup) {
       const wasMode = this.openPopup.el.classList.contains("claudian-popup-mode");
@@ -1031,21 +1114,23 @@ export class InputBox {
       if (wasModel) return;
     }
     const popup = this.createPopup("claudian-popup-model");
-    popup.createDiv({ cls: "claudian-popup-header", text: "CLAUDE" });
-    for (const key of Object.keys(MODEL_LABELS) as ModelKey[]) {
-      const row = popup.createDiv({
-        cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
-      });
-      const icon = row.createSpan({ cls: "claudian-popup-row-icon" });
-      const img = icon.createEl("img");
-      img.src = CLAUDE_ASTERISK_DATA_URI;
-      img.alt = "";
-      row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
-      row.addEventListener("click", e => {
-        e.stopPropagation();
-        this.selectModel(key);
-        this.closePopup();
-      });
+    for (const group of MODEL_GROUPS) {
+      popup.createDiv({ cls: "claudian-popup-header", text: group.header });
+      for (const key of group.keys) {
+        const row = popup.createDiv({
+          cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
+        });
+        const icon = row.createSpan({ cls: "claudian-popup-row-icon" });
+        const img = icon.createEl("img");
+        img.src = CLAUDE_ASTERISK_DATA_URI;
+        img.alt = "";
+        row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+        row.addEventListener("click", e => {
+          e.stopPropagation();
+          this.selectModel(key);
+          this.closePopup();
+        });
+      }
     }
     this.anchorPopup(popup, this.modelPill);
   }
@@ -1258,12 +1343,17 @@ export class InputBox {
       if (e.key === "Escape") this.closePopup();
     };
     /* Defer attaching so the click that opened the popup doesn't immediately
-       close it via the document listener firing in the same tick. */
+       close it via the document listener firing in the same tick. Guard the
+       deferred attach: if the box was destroyed or a different popup opened
+       during this tick, closePopup already ran (for this popup or the one that
+       replaced it) and these handlers would leak on document with nothing left
+       to remove them. */
+    this.openPopup = { el: popup, outsideHandler, keyHandler };
     window.setTimeout(() => {
+      if (this.destroyed || this.openPopup?.el !== popup) return;
       document.addEventListener("mousedown", outsideHandler);
       document.addEventListener("keydown", keyHandler);
     }, 0);
-    this.openPopup = { el: popup, outsideHandler, keyHandler };
   }
 
   private closePopup() {
@@ -1479,6 +1569,10 @@ export class InputBox {
        lands first regardless). */
     const hasText = Array.from(items).some(it => it.kind === "string" && it.type === "text/plain");
     if (!hasText) e.preventDefault();
+    /* Snapshot the array identity so a submit() that lands mid-decode (which
+       rebinds this.attachments to a fresh array for the next message) doesn't
+       cause the decoded image to ride on the next turn. */
+    const target = this.attachments;
     for (const item of imageItems) {
       const file = item.getAsFile();
       if (!file) continue;
@@ -1487,7 +1581,7 @@ export class InputBox {
          broke image paste. Blob.arrayBuffer() works universally. */
       try {
         const buf = await file.arrayBuffer();
-        if (this.destroyed) return;
+        if (this.destroyed || this.attachments !== target) return;
         const data = bytesToBase64(new Uint8Array(buf));
         this.attachments.push({ kind: "image", mediaType: file.type, data });
         this.renderAttachmentChips();
@@ -1546,6 +1640,10 @@ export class InputBox {
      inlined text. Anything that fails the size cap or can't be decoded
      surfaces a Notice and is skipped so one bad file doesn't abort the rest. */
   private async addFiles(files: File[]) {
+    /* Snapshot the array identity so a submit() that lands mid-decode (which
+       rebinds this.attachments to a fresh array for the next message) doesn't
+       cause the decoded file to ride on the next turn. */
+    const target = this.attachments;
     for (const file of files) {
       if (file.size > MAX_ATTACHMENT_BYTES) {
         new Notice(`${file.name} is too large (max 10MB)`);
@@ -1553,7 +1651,7 @@ export class InputBox {
       }
       try {
         const att = await this.fileToAttachment(file);
-        if (this.destroyed) return;
+        if (this.destroyed || this.attachments !== target) return;
         this.attachments.push(att);
       } catch (err) {
         console.error("claude-cli-chat: failed to attach file", file.name, err);

@@ -1108,6 +1108,70 @@ mark.claudian-search-mark.is-active {
   border-color: var(--text-error, #dc3545);
 }
 
+/* AskUserQuestion picker --------------------------------------- */
+.claudian-askuser-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 6px 0 4px;
+}
+.claudian-askuser-question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--background-primary-alt);
+  border-radius: 6px;
+}
+.claudian-askuser-prompt {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-askuser-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.claudian-askuser-option:hover {
+  background: var(--background-modifier-hover);
+}
+.claudian-askuser-option input[type="radio"],
+.claudian-askuser-option input[type="checkbox"] {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+.claudian-askuser-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.claudian-askuser-option-label {
+  font-size: 13px;
+  color: var(--text-normal);
+}
+.claudian-askuser-option-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.claudian-askuser-other-input {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 13px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* ---- Input box -------------------------------------------- */
 .claudian-input-container {
   padding: 6px 14px 28px 14px;
@@ -1567,6 +1631,11 @@ mark.claudian-search-mark.is-active {
   color: var(--text-faint);
   text-transform: uppercase;
 }
+/* Second and later section headers (e.g. the model picker's OPUS / SONNET /
+   HAIKU groups) get a little breathing room above; the first stays flush. */
+.claudian-popup-header:not(:first-child) {
+  margin-top: 6px;
+}
 .claudian-popup-row {
   display: flex;
   align-items: center;
@@ -1751,6 +1820,46 @@ mark.claudian-search-mark.is-active {
   background: rgba(220, 53, 69, 0.22);
 }
 .claudian-mode-pill.mode-bypass .claudian-toolbar-pill-value { color: #dc3545; }
+
+/* ---- Incognito pill -------------------------------------------------
+   Binary toggle (no popup). Quiet when off; tinted violet when on so the
+   "this leaves nothing behind" state reads at a glance. Greyed + non-
+   interactive once locked (a live session has fixed the choice). */
+.claudian-incognito-pill {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  opacity: 0.7;
+}
+.claudian-incognito-pill:hover {
+  background: var(--background-modifier-hover);
+  opacity: 1;
+}
+.claudian-incognito-pill .claudian-toolbar-pill-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.claudian-incognito-pill .claudian-toolbar-pill-value {
+  color: var(--text-muted);
+  filter: grayscale(1);
+}
+.claudian-incognito-pill.is-active {
+  background: rgba(139, 92, 246, 0.2);
+  opacity: 1;
+}
+.claudian-incognito-pill.is-active .claudian-toolbar-pill-label { color: #a78bfa; }
+.claudian-incognito-pill.is-active .claudian-toolbar-pill-value { filter: none; }
+.claudian-incognito-pill.is-disabled {
+  cursor: default;
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* Incognito tabs in the tab bar get a violet ring so they're distinguishable
+   from persisted tabs at a glance. */
+.claudian-tab-badge-incognito {
+  border-color: #8b5cf6;
+}
 
 /* ---- Context window indicators --------------------------- */
 /* Hover-revealed "Nk / Mk" tooltip on the donut pill. Sits inside
@@ -2364,23 +2473,81 @@ mark.claudian-search-mark.is-active {
   color: var(--text-faint);
   font-style: italic;
 }
-.claudian-subagent-status-line {
+/* Toggle row that gates the nested timeline. Reads as one compact status
+   line (chevron · state · N steps · pulse) and the whole row is clickable. */
+.claudian-subagent-toggle {
   display: flex;
   align-items: center;
   gap: 6px;
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-muted);
+  cursor: default;
+  user-select: none;
 }
-.claudian-subagent-status-line.is-spawning {
+.claudian-subagent-toggle:has(.claudian-subagent-chevron) {
+  cursor: pointer;
+}
+.claudian-subagent-toggle:has(.claudian-subagent-chevron):hover {
+  color: var(--text-normal);
+}
+.claudian-subagent-toggle.is-spawning {
   color: var(--text-faint);
   font-style: italic;
 }
-.claudian-subagent-status-line.is-running {
+.claudian-subagent-toggle.is-running {
   color: var(--claudian-brand);
 }
-.claudian-subagent-status-line.is-failed {
+.claudian-subagent-toggle.is-failed {
   color: var(--text-error);
+}
+.claudian-subagent-chevron {
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+  transition: transform 150ms ease;
+  transform: rotate(-90deg);
+}
+.claudian-subagent-summary.is-events-open .claudian-subagent-chevron {
+  transform: rotate(0deg);
+}
+.claudian-subagent-toggle-label {
+  font-weight: 500;
+}
+.claudian-subagent-step-count {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.claudian-subagent-step-count::before {
+  content: "· ";
+}
+.claudian-subagent-pulse {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: claudian-status-pulse 1.2s ease-in-out infinite;
+}
+
+/* Collapsed live preview: the subagent's latest step on a single line. */
+.claudian-subagent-current {
+  margin-top: 3px;
+  padding-left: 19px;
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The full timeline is hidden until the summary is toggled open. */
+.claudian-subagent-events-wrap {
+  display: none;
+}
+.claudian-subagent-summary.is-events-open .claudian-subagent-events-wrap {
+  display: block;
 }
 
 /* ---- Agents pill in the input toolbar ---------------------- */

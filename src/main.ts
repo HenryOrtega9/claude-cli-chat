@@ -1,7 +1,9 @@
 import { FileSystemAdapter, Plugin, WorkspaceLeaf, addIcon } from "obsidian";
 import { ClaudeChatView, VIEW_TYPE_CLAUDE_CHAT } from "./view/ClaudeChatView";
-import { ClaudeChatSettingTab, DEFAULT_SETTINGS, autodetectUserName, type ClaudeChatSettings } from "./settings";
+import { ClaudeChatSettingTab, DEFAULT_SETTINGS, autodetectClaudePath, autodetectUserName, type ClaudeChatSettings } from "./settings";
 import { SubprocessManager, spawnOptionsFromSettings } from "./claude/SubprocessManager";
+import { MCPConfigStore } from "./mcp/MCPConfig";
+import { listMcpServersViaCli, type ParsedMcpServer } from "./mcp/McpServerList";
 import type { AssistantEvent, ResultEvent, StreamEvent } from "./claude/Events";
 import { Persistence } from "./storage/Persistence";
 import { CLAUDE_ASTERISK_ICON_SVG } from "./view/Welcome";
@@ -35,9 +37,27 @@ export default class ClaudeChatPlugin extends Plugin {
      concurrent toggles from different UI surfaces don't race. */
   permissionsStore!: PermissionsConfigStore;
 
+  /* `mcp__<server>` deny rules for servers the user disabled for this vault,
+     cached in memory so the synchronous spawn path (ensureSession) can read
+     them without an await. Refreshed on load and whenever a toggle lands.
+     The CLI applies them via `--settings`, scoped to our subprocesses only. */
+  mcpDenyPatterns: string[] = [];
+
+  /* Cached result of `claude mcp list` — the authoritative set of servers the
+     spawned chat actually loads (our vault .claude/mcp.json is not a CLI
+     source). Populated lazily; the MCP manager modal forces a refresh on
+     open. An in-flight promise coalesces concurrent callers (e.g. several
+     cost-surface refreshes) onto a single child process. */
+  private mcpServerListCache: ParsedMcpServer[] | null = null;
+  private mcpServerListInflight: Promise<ParsedMcpServer[]> | null = null;
+
   async onload() {
     await this.loadSettings();
     this.permissionsStore = new PermissionsConfigStore(this.app);
+    /* Prime the deny cache before any tab can spawn so disabled servers are
+       hidden from the very first turn. Best-effort: a read failure just
+       leaves every server enabled. */
+    await this.refreshMcpDenyPatterns();
     this.persistence = new Persistence(this.app);
     this.refreshSkillCatalog();
     this.refreshSubagentCatalog();
@@ -110,6 +130,7 @@ export default class ClaudeChatPlugin extends Plugin {
   }
 
   async onunload() {
+    StateEmitter.dispose();
     await this.persistence?.flush();
     await this.subprocessManager.killAll();
   }
@@ -118,6 +139,33 @@ export default class ClaudeChatPlugin extends Plugin {
     const adapter = this.app.vault.adapter;
     if (adapter instanceof FileSystemAdapter) return adapter.getBasePath();
     return "";
+  }
+
+  /* Recompute the cached per-vault MCP deny patterns from the on-disk
+     disable list. Call after any toggle so the next spawn picks up the
+     change; the user still needs to restart the chat (/clear) for a live
+     subprocess to reload. */
+  async refreshMcpDenyPatterns(): Promise<void> {
+    try {
+      this.mcpDenyPatterns = await new MCPConfigStore(this.app).getDenyPatterns();
+    } catch {
+      this.mcpDenyPatterns = [];
+    }
+  }
+
+  /* Authoritative list of MCP servers the CLI loads, via `claude mcp list`.
+     Returns the cache unless `force` is set; coalesces concurrent fetches.
+     Throws are left to the caller — UI surfaces treat a failure as "no list
+     available" and fall back to runtime data. */
+  async getMcpServers(force = false): Promise<ParsedMcpServer[]> {
+    if (!force && this.mcpServerListCache) return this.mcpServerListCache;
+    if (this.mcpServerListInflight) return this.mcpServerListInflight;
+    const claudePath = this.settings.claudePath || autodetectClaudePath() || "claude";
+    const job = listMcpServersViaCli(claudePath)
+      .then(list => { this.mcpServerListCache = list; return list; })
+      .finally(() => { this.mcpServerListInflight = null; });
+    this.mcpServerListInflight = job;
+    return job;
   }
 
   refreshSkillCatalog(): void {
@@ -185,6 +233,13 @@ export default class ClaudeChatPlugin extends Plugin {
     const cwd = opts?.cwd ?? this.getVaultPath() ?? process.cwd();
     const spawnOpts = spawnOptionsFromSettings(this.settings, cwd, undefined, {
       appendSystemPrompt: systemPrompt,
+      mcpDenyPatterns: this.mcpDenyPatterns,
+      /* Headless has no approval UI and wires no control_request handler. If
+         we inherited the user's default permission mode, any tool the model
+         attempts would emit a control_request that never gets answered,
+         stalling the subprocess until the timeout. Run non-interactive so
+         tool use proceeds without an approval round-trip. */
+      permissionMode: "bypassPermissions",
     });
     const session = this.subprocessManager.spawn(tabId, spawnOpts);
 
@@ -207,28 +262,39 @@ export default class ClaudeChatPlugin extends Plugin {
       }, timeoutMs);
 
       session.onEvent((e: StreamEvent) => {
-        if (e.type === "assistant") {
-          const ae = e as AssistantEvent;
-          for (const block of ae.message.content) {
-            if (block.type === "text") assistantText += block.text;
+        /* `e` is unvalidated CLI wire data (JSON.parse-d, not schema-checked),
+           so any field access below can throw on a malformed/future shape.
+           Route any throw to finish() instead of letting it escape this
+           listener — otherwise the timer never clears and the promise hangs
+           until the timeout, masking the real parse failure. */
+        try {
+          if (e.type === "assistant") {
+            const ae = e as AssistantEvent;
+            const blocks = Array.isArray(ae.message?.content) ? ae.message.content : [];
+            for (const block of blocks) {
+              if (block.type === "text") assistantText += block.text;
+            }
+          } else if (e.type === "result") {
+            const re = e as ResultEvent;
+            if (re.is_error) {
+              finish(null, new Error(`Claude returned error: ${re.subtype}`));
+              return;
+            }
+            if (typeof re.result === "string" && re.result.length > 0) {
+              finish(re.result);
+            } else if (re.result && typeof re.result === "object") {
+              const blocks = Array.isArray(re.result.content) ? re.result.content : [];
+              const textBlocks = blocks
+                .filter((b): b is { type: "text"; text: string } => b.type === "text")
+                .map((b) => b.text)
+                .join("");
+              finish(textBlocks || assistantText);
+            } else {
+              finish(assistantText);
+            }
           }
-        } else if (e.type === "result") {
-          const re = e as ResultEvent;
-          if (re.is_error) {
-            finish(null, new Error(`Claude returned error: ${re.subtype}`));
-            return;
-          }
-          if (typeof re.result === "string" && re.result.length > 0) {
-            finish(re.result);
-          } else if (re.result && typeof re.result === "object") {
-            const textBlocks = re.result.content
-              .filter((b): b is { type: "text"; text: string } => b.type === "text")
-              .map((b) => b.text)
-              .join("");
-            finish(textBlocks || assistantText);
-          } else {
-            finish(assistantText);
-          }
+        } catch (err) {
+          finish(null, err instanceof Error ? err : new Error(String(err)));
         }
       });
       session.onError((err) => finish(null, err));

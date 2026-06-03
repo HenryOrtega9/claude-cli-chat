@@ -35,7 +35,8 @@ function debounced<A extends unknown[]>(fn: (...args: A) => void, ms: number): (
    itself does the model selection; the underlying Opus path still gets
    1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
-  "opus-1m": "claude-opus-4-7[1m]",
+  "opus-1m": "claude-opus-4-8[1m]",
+  "opus-4-7-1m": "claude-opus-4-7[1m]",
   "opus-4-6-1m": "claude-opus-4-6[1m]",
   "opus-plan": "opusplan",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
@@ -45,12 +46,23 @@ export const MODEL_IDS = {
 export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
-  "opus-1m": "Opus 4.7 1M",
+  "opus-1m": "Opus 4.8 1M",
+  "opus-4-7-1m": "Opus 4.7 1M",
   "opus-4-6-1m": "Opus 4.6 1M",
   "opus-plan": "Opus Plan",
   "sonnet-1m": "Sonnet 4.6 1M",
   "haiku": "Haiku",
 };
+
+/* Ordered sections for the model-picker popup; each renders under its own
+   header. Opus variants (including the opus-plan alias, which routes to Opus)
+   are grouped together, then Sonnet, then Haiku. Keep in sync with MODEL_IDS:
+   every ModelKey must appear in exactly one group. */
+export const MODEL_GROUPS: { header: string; keys: ModelKey[] }[] = [
+  { header: "OPUS", keys: ["opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
+  { header: "SONNET", keys: ["sonnet-1m"] },
+  { header: "HAIKU", keys: ["haiku"] },
+];
 
 /* Effort levels mirror Claude Code CLI's `--effort` flag (v2.1.141:
    low, medium, high, xhigh, max). xhigh is Opus-only — the UI hides it
@@ -66,10 +78,10 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   Opus today (Opus 4.7, Opus 4.6, and opus-plan which routes to Opus when
-   in plan mode); everything else shows the standard four. */
+   Opus today (Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which routes to
+   Opus when in plan mode); everything else shows the standard four. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "opus-1m" || model === "opus-4-6-1m" || model === "opus-plan") return EFFORT_ORDER;
+  if (model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
@@ -79,7 +91,7 @@ export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
    resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "opus-1m" || model === "opus-4-6-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 

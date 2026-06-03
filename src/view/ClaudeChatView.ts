@@ -166,13 +166,22 @@ export class ClaudeChatView extends ItemView {
   }
 
   private saveIndex() {
+    /* Don't let an incognito tab's id leak into the index as activeTabId —
+       it isn't in the persisted tabs list, so persist it as null rather than
+       a dangling reference. */
+    const activeTab = this.tabs.find(t => t.state.id === this.activeTabId);
+    const activeTabId = activeTab && !activeTab.state.incognito ? this.activeTabId : null;
     void this.plugin.persistence.saveIndex({
-      activeTabId: this.activeTabId,
-      tabs: this.tabs.map(t => ({
-        id: t.state.id,
-        title: t.state.title,
-        sessionId: t.state.sessionId,
-      })),
+      activeTabId,
+      /* Incognito tabs are excluded from the index so they never get written
+         to tabs.json and thus never restore on reload. */
+      tabs: this.tabs
+        .filter(t => !t.state.incognito)
+        .map(t => ({
+          id: t.state.id,
+          title: t.state.title,
+          sessionId: t.state.sessionId,
+        })),
     });
   }
 
@@ -192,19 +201,24 @@ export class ClaudeChatView extends ItemView {
     this.createTab();
   }
 
-  private createTab(state?: TabState, opts: { skipSave?: boolean } = {}) {
+  private createTab(state?: TabState, opts: { skipSave?: boolean; incognito?: boolean } = {}) {
     const controller = new TabController(
       this.plugin,
       this.tabsContainer,
       this,
-      state ?? makeTabState(),
+      state ?? makeTabState({ incognito: opts.incognito }),
       () => {
         this.renderTabBar();
-        this.plugin.persistence.scheduleSaveTab(controller.state);
+        /* Incognito tabs never touch the vault. saveIndex() self-filters them,
+           so it stays safe to call unconditionally. */
+        if (!controller.state.incognito) {
+          this.plugin.persistence.scheduleSaveTab(controller.state);
+        }
         this.saveIndex();
       }
     );
     controller.onForkRequest = (src, messageId) => this.forkFromMessage(src, messageId);
+    controller.onIncognitoToggle = (tabId, incognito) => this.onIncognitoToggle(tabId, incognito);
     this.tabs.push(controller);
     this.selectTab(controller.state.id, { skipSave: true });
     if (!opts.skipSave) {
@@ -271,7 +285,8 @@ export class ClaudeChatView extends ItemView {
        as PPID=1 orphans (same failure mode that onClose's await pattern
        fixed for the bulk path). */
     await removed.destroy();
-    void this.plugin.persistence.deleteTab(tabId);
+    /* Incognito tabs have nothing on disk — skip the delete entirely. */
+    if (!removed.state.incognito) void this.plugin.persistence.deleteTab(tabId);
     if (this.tabs.length === 0) {
       this.createTab();
     } else if (this.activeTabId === tabId) {
@@ -287,8 +302,24 @@ export class ClaudeChatView extends ItemView {
       id: t.state.id,
       busy: t.isBusy(),
       hasPendingApproval: t.hasPendingApprovals(),
+      isIncognito: !!t.state.incognito,
     }));
     this.tabBar.render(badges, this.activeTabId);
+  }
+
+  /* Reconcile disk when a still-empty tab toggles incognito. Turning ON deletes
+     any file written while it was a normal empty tab (createTab wrote an index
+     entry; a debounced body write may also be in flight). Turning OFF resumes
+     normal persistence. saveIndex() re-derives the filtered index either way. */
+  private onIncognitoToggle(tabId: string, incognito: boolean) {
+    const tab = this.tabs.find(t => t.state.id === tabId);
+    if (incognito) {
+      void this.plugin.persistence.deleteTab(tabId);
+    } else if (tab) {
+      this.plugin.persistence.scheduleSaveTab(tab.state);
+    }
+    this.saveIndex();
+    this.renderTabBar();
   }
 
   private clearActiveTab() {
@@ -297,10 +328,10 @@ export class ClaudeChatView extends ItemView {
   }
 
   private showMcpManager() {
-    new MCPManagerModal(this.app, this.plugin.settings.claudePath, () => {
+    new MCPManagerModal(this.app, this.plugin, () => {
       /* When the modal closes, the active tab's cost-surface pill may be
-         stale (servers added/removed). Trigger a refresh so the count
-         reflects current mcp.json without needing a tab restart. */
+         stale (servers toggled on/off). Trigger a refresh so the count
+         reflects the current per-vault enabled set without a tab restart. */
       const active = this.tabs.find(t => t.state.id === this.activeTabId);
       if (active) void active.refreshCostSurface();
     }).open();

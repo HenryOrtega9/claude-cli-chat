@@ -102,7 +102,7 @@ export class SearchBar {
       if (this.refreshDebounceTimer !== null) window.clearTimeout(this.refreshDebounceTimer);
       this.refreshDebounceTimer = window.setTimeout(() => {
         this.refreshDebounceTimer = null;
-        if (this.visible) this.refreshMatches();
+        if (this.visible) this.refreshMatches(true);
       }, 50);
     });
     this.mutationObserver.observe(this.messagesContainer, { childList: true, subtree: true, characterData: true });
@@ -119,7 +119,13 @@ export class SearchBar {
     }
   }
 
-  private refreshMatches() {
+  /* fromObserver=true means this refresh was triggered by a streaming
+     re-render, not an explicit user action. In that case we preserve the
+     user's navigated position (clamped to the new match count) instead of
+     snapping back to match #1, and we suppress scrollIntoView so the viewport
+     isn't yanked away from where they're reading on every debounce tick. */
+  private refreshMatches(fromObserver = false) {
+    const prevActiveIndex = this.activeIndex;
     this.clearMarks();
     const query = this.input.value.trim();
     if (!query) {
@@ -152,8 +158,12 @@ export class SearchBar {
       if (!lower.includes(lowerQuery)) continue;
       this.wrapMatches(textNode, text, lower, lowerQuery);
     }
-    this.activeIndex = 0;
-    this.updateActive();
+    if (fromObserver && this.marks.length > 0) {
+      this.activeIndex = Math.min(prevActiveIndex, this.marks.length - 1);
+    } else {
+      this.activeIndex = 0;
+    }
+    this.updateActive(!fromObserver);
     this.updateCount();
   }
 
@@ -184,12 +194,12 @@ export class SearchBar {
     this.updateCount();
   }
 
-  private updateActive() {
+  private updateActive(scroll = true) {
     for (const m of this.marks) m.removeClass("is-active");
     const m = this.marks[this.activeIndex];
     if (m) {
       m.addClass("is-active");
-      m.scrollIntoView({ block: "center", behavior: "auto" });
+      if (scroll) m.scrollIntoView({ block: "center", behavior: "auto" });
     }
   }
 

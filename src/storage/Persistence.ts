@@ -254,7 +254,14 @@ export class Persistence {
        flush — the dispatch already removed the pending entry, so the
        only handle on it is in inflightSaves. */
     const inflight = Array.from(this.inflightSaves.values());
-    await Promise.allSettled([...triggered, ...inflight]);
+    const results = await Promise.allSettled([...triggered, ...inflight]);
+    /* allSettled never rejects, so without this a failed final write (disk
+       full, EACCES) would vanish silently on unload and the user would lose
+       their last edits with no signal. Surface the failures. */
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed.length > 0) {
+      console.warn(`[claude-cli-chat] ${failed.length} tab write(s) failed during flush`, failed.map(f => f.reason));
+    }
   }
 
   /* List stored tab files (used by the History dropdown). Returns metadata

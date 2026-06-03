@@ -37,6 +37,11 @@ import type { NestedSubagentEvent, ToolCall } from "../view/state";
 const POLL_INTERVAL_MS = 250;
 const POLL_MAX_ATTEMPTS = 240;  /* 60s total — well past the spawn race window */
 const PROMPT_MATCH_PREFIX_LEN = 64;
+/* Cap on how much of a candidate JSONL we read to inspect its first record.
+   A parent prompt larger than this is read only partially, so we fall back
+   to the short-prefix bidirectional match for those (and never cache the
+   size on such an inconclusive read). */
+const MAX_FIRST_RECORD_READ = 65536;
 
 export type SubagentTrackerUpdate = {
   /* Appended nested events. */
@@ -150,14 +155,28 @@ export class SubagentSessionTracker {
       try { size = statSync(fullPath).size; } catch { continue; }
       const lastSize = this.inspectedSizes.get(fullPath) ?? -1;
       if (size === lastSize) continue;
-      this.inspectedSizes.set(fullPath, size);
-      if (size === 0) continue;
-      if (this.firstRecordMatchesPrompt(fullPath, size)) {
+      if (size === 0) {
+        /* Don't cache size 0 — an empty file tells us nothing definitive
+           and we must re-inspect once it grows. */
+        continue;
+      }
+      const verdict = this.firstRecordMatchesPrompt(fullPath, size);
+      if (verdict === "match") {
+        this.inspectedSizes.set(fullPath, size);
         if (!this.opts.subprocessManager.claimSessionFile(fullPath)) continue;
         this.matchedPath = fullPath;
         this.attachTailer(fullPath);
         return;
       }
+      if (verdict === "no-match") {
+        /* Definitive: a fully-parsed user record whose prompt differs.
+           Cache so we skip this settled non-match on future polls. */
+        this.inspectedSizes.set(fullPath, size);
+      }
+      /* verdict === "inconclusive": the first record was incomplete or
+         un-parseable (e.g. a prompt larger than our read cap cut mid-line,
+         or a torn concurrent write). Do NOT cache the size, so we re-inspect
+         on the next poll even if the file doesn't grow. */
     }
     this.scheduleNextPoll();
   }
@@ -165,39 +184,81 @@ export class SubagentSessionTracker {
   /* Reads the head of a candidate JSONL and checks whether the first user
      record's text content shares a prefix with our parent Task tool's
      prompt. The CLI writes the parent's input.prompt verbatim as the first
-     user message of the subagent's session. */
-  private firstRecordMatchesPrompt(path: string, size: number): boolean {
+     user message of the subagent's session.
+
+     Returns:
+       "match"        — first user record's text is (a prefix of) our prompt.
+       "no-match"     — a fully-parsed first user record whose prompt differs.
+       "inconclusive" — couldn't read/parse a complete first user record
+                        (read cap cut mid-record, torn concurrent write, or
+                        no user record present yet). Caller must NOT cache the
+                        size on this verdict, so the file is re-inspected. */
+  private firstRecordMatchesPrompt(path: string, size: number): "match" | "no-match" | "inconclusive" {
     if (!this.opts.parentPrompt) {
       /* No prompt to match against — fall back to "newest unclaimed file"
          semantics, which means any new file matches. Last resort for Task
          calls whose input.prompt was empty (rare but possible). */
-      return true;
+      return "match";
     }
-    const readSize = Math.min(size, 16384);
+    const readSize = Math.min(size, MAX_FIRST_RECORD_READ);
     let buf: string;
     try {
       buf = readFileSync(path, { encoding: "utf8", flag: "r" }).slice(0, readSize);
     } catch {
-      return false;
+      return "inconclusive";
     }
     const lines = buf.split("\n");
-    /* Skip the last line — it may be partial under a concurrent write. */
+    /* Whether the buffer ended on a newline boundary — if not, the final
+       line is either a partial concurrent write or a record cut by our read
+       cap, and is not safe to treat as complete. */
+    const lastLineComplete = buf.endsWith("\n");
     const safeLines = lines.length > 1 ? lines.slice(0, -1) : lines;
     for (const line of safeLines) {
       const t = line.trim();
       if (!t) continue;
       let record: Record<string, unknown>;
-      try { record = JSON.parse(t); } catch { continue; }
+      try { record = JSON.parse(t); } catch { return "inconclusive"; }
       if (record.type !== "user") continue;
       const msg = record.message as { content?: unknown } | undefined;
       const text = extractFirstText(msg?.content);
       if (text === null) continue;
-      const parentPrefix = this.opts.parentPrompt.slice(0, PROMPT_MATCH_PREFIX_LEN).trim();
-      const recordPrefix = text.slice(0, PROMPT_MATCH_PREFIX_LEN).trim();
-      if (!parentPrefix || !recordPrefix) return false;
-      return recordPrefix.startsWith(parentPrefix) || parentPrefix.startsWith(recordPrefix);
+      return this.comparePrompt(text, lastLineComplete && size <= readSize);
     }
-    return false;
+    /* No complete user record found. If the buffer was fully read and ended
+       cleanly, there genuinely is no user record yet (or only non-user
+       records) — but the CLI always writes the user echo first, so this is a
+       transient pre-write state, not a settled non-match: stay inconclusive
+       so we re-inspect. */
+    return "inconclusive";
+  }
+
+  /* Compares a candidate first-record text against the parent prompt. When
+     we have the full record (not truncated by our read cap) we require the
+     record to START WITH the parent prompt prefix in one direction — the CLI
+     writes the parent prompt verbatim, so a real subagent's first user echo
+     is always a superset of (or equal to) the parent prompt. A long prefix
+     disambiguates concurrent Task calls whose prompts share a short header.
+     When the record was truncated we fall back to the shorter bidirectional
+     check, which is all we can verify. */
+  private comparePrompt(text: string, fullRecordAvailable: boolean): "match" | "no-match" {
+    const parent = this.opts.parentPrompt.trim();
+    const record = text.trim();
+    if (!parent || !record) return "no-match";
+    if (fullRecordAvailable) {
+      /* Compare up to the parent prompt's full length (bounded by our read
+         cap). The record should begin with the entire parent prompt. */
+      const bound = Math.min(parent.length, MAX_FIRST_RECORD_READ);
+      const parentPrefix = parent.slice(0, bound);
+      return record.startsWith(parentPrefix) ? "match" : "no-match";
+    }
+    /* Truncated record: only the short prefix is trustworthy. Keep the
+       bidirectional check as a last resort. */
+    const parentPrefix = parent.slice(0, PROMPT_MATCH_PREFIX_LEN);
+    const recordPrefix = record.slice(0, PROMPT_MATCH_PREFIX_LEN);
+    if (!parentPrefix || !recordPrefix) return "no-match";
+    return recordPrefix.startsWith(parentPrefix) || parentPrefix.startsWith(recordPrefix)
+      ? "match"
+      : "no-match";
   }
 
   private attachTailer(path: string): void {
