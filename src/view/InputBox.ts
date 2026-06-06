@@ -795,6 +795,15 @@ export class InputBox {
     }
     this.costPopup.style.bottom = `${wrapperRect.bottom - pillRect.top + 6}px`;
     this.costPopup.style.top = "";
+    /* Cap the height to the gap between the viewport top and the popup's
+       bottom edge (which sits just above the pill). The popup grows upward
+       from a bottom anchor, so without this a server with many tools — e.g.
+       webull's 68 — would overflow off the top of the screen with no way to
+       scroll to the hidden servers/footer. 8px keeps it off the very edge;
+       160px floor stops it collapsing to nothing in a tiny window. The inner
+       server list (.claudian-cost-popup-server-list) is the scroll region. */
+    const available = pillRect.top - 6 - 8;
+    this.costPopup.style.maxHeight = `${Math.max(160, available)}px`;
   }
 
   private scheduleCostPopupClose() {
@@ -901,6 +910,13 @@ export class InputBox {
     this.destroyed = true;
     if (this.openPopup) this.closePopup();
     if (this.suggestion) this.hideSuggestion();
+    /* The cost popup's 250ms close-grace timer is not owned by closePopup/
+       hideSuggestion. Left pending, it fires after teardown and touches the
+       already-detached costPopup node. */
+    if (this.costPopupHideTimer !== null) {
+      window.clearTimeout(this.costPopupHideTimer);
+      this.costPopupHideTimer = null;
+    }
   }
 
   /* Mounts an external element (e.g. the active-file pill bar) just
@@ -1368,6 +1384,11 @@ export class InputBox {
     /* When the suggestion popup is open, arrow keys + Enter/Tab navigate it.
        Esc closes it. Everything else falls through to normal typing. */
     if (this.suggestion) {
+      /* Mid-IME-composition, ArrowUp/Down move the IME candidate window and Esc
+         dismisses it — those keystrokes belong to the IME, not the popup. The
+         Enter/Tab branch below already guards on isComposing; do the same for
+         the whole block so a CJK/accent composition isn't hijacked. */
+      if (e.isComposing) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         this.moveSuggestion(1);

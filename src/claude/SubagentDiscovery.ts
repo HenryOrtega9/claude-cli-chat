@@ -59,6 +59,9 @@ function parseFrontmatterFull(content: string): {
   continuations: Record<string, string[]>;
   bodyText: string;
 } {
+  /* Strip a leading UTF-8 BOM so it can't push `---` off column 0 and make a
+     frontmatter-bearing agent parse as bodyless (losing tools/model overrides). */
+  if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return { fields: {}, continuations: {}, bodyText: content };
   const block = m[1];

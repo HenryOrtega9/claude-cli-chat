@@ -73,6 +73,16 @@ export class SearchBar {
 
   isOpen(): boolean { return this.visible; }
 
+  /* Tear down on tab close. Without this, a tab destroyed while search is open
+     leaks the MutationObserver (it survives target removal until disconnected)
+     and the pending debounce timer, both of which keep the messages container
+     and the whole SearchBar/TabController graph reachable across tab churn. */
+  destroy() {
+    this.detachMutationObserver();
+    this.clearMarks();
+    this.root.remove();
+  }
+
   /* Subscribe to DOM mutations inside the messages container so streaming
      re-renders that wipe our marks trigger an automatic re-highlight. Skips
      mutations that only touched <mark> nodes (those are our own work — the
@@ -125,6 +135,25 @@ export class SearchBar {
      snapping back to match #1, and we suppress scrollIntoView so the viewport
      isn't yanked away from where they're reading on every debounce tick. */
   private refreshMatches(fromObserver = false) {
+    /* Suspend the observer around our own DOM edits. wrapMatches/clearMarks
+       insert the non-matching text slices as plain text nodes whose parent is
+       the message bubble, not a <mark> — so the onlyMarks() filter in the
+       observer does NOT skip them, and every refresh would schedule another
+       refresh in 50ms: a perpetual self-feeding loop while a matching query is
+       open. Disconnecting drops the records our edits generate; refreshMatches
+       re-scans the whole container anyway, so nothing real is missed. */
+    const obs = this.mutationObserver;
+    if (obs) obs.disconnect();
+    try {
+      this.refreshMatchesInner(fromObserver);
+    } finally {
+      if (obs && this.visible) {
+        obs.observe(this.messagesContainer, { childList: true, subtree: true, characterData: true });
+      }
+    }
+  }
+
+  private refreshMatchesInner(fromObserver: boolean) {
     const prevActiveIndex = this.activeIndex;
     this.clearMarks();
     const query = this.input.value.trim();

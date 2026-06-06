@@ -159,6 +159,11 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
        with the optimizations above should be ~1.5-3s typically. */
     const timeout = setTimeout(() => {
       try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      /* Escalate to SIGKILL if SIGTERM is ignored (e.g. wedged mid-network
+         retry). We've already resolved(null), so without this a hung
+         `claude --print` survives as an orphan holding the API connection. The
+         kill is harmless if the process already exited. */
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 2000);
       console.warn(`[claude-cli-chat] title-gen TIMEOUT after ${Date.now() - t0}ms`);
       resolve(null);
     }, 30000);

@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import socket
 import sys
 import threading
 import time
@@ -60,6 +61,58 @@ BATTERY_FLASH_DURATION_S = int(os.environ.get("BATTERY_FLASH_DURATION_S", "4"))
 
 VALID_STATES        = ("idle", "ready", "thinking", "needs_permission", "complete")
 DEFAULT_STATE       = "idle"
+
+# Device address resolution. The hot 10 FPS push path must hit a RAW IP:
+# resolving an mDNS `.local` hostname on every reconnect is too slow and flaky
+# for the push loop (observed multi-second stalls that shred the framerate into
+# discrete static frames). TC001_IP may therefore be a raw IP OR a hostname; we
+# resolve it to a raw IP exactly ONCE at startup via resolve_device_ip() and the
+# push/switch path uses that resolved IP. TC001_FALLBACK_IP is the last-known raw
+# IP, used when the one-shot mDNS lookup stalls (keeps DHCP-drift resilience
+# without ever putting mDNS on the per-frame path).
+TC001_FALLBACK_IP   = os.environ.get("TC001_FALLBACK_IP", "")
+_DEVICE_IP          = TC001_IP  # raw IP for the push path; set by resolve_device_ip()
+
+
+def _looks_like_ip(addr: str) -> bool:
+    # `str.isdigit()` is True for non-ASCII digits (e.g. Arabic-Indic), which
+    # int() also parses — so guard with isascii() to avoid classifying a garbled
+    # env var as a raw IP and then feeding it straight into the request URL.
+    parts = addr.split(".")
+    return len(parts) == 4 and all(
+        p.isascii() and p.isdigit() and 0 <= int(p) <= 255 for p in parts
+    )
+
+
+def resolve_device_ip() -> str:
+    """Resolve TC001_IP to a raw IP once, at startup, into the _DEVICE_IP global.
+
+    A raw IP is used as-is. A hostname (e.g. mDNS `awtrix_xxxx.local`) is looked
+    up in a worker thread with a tight timeout so a slow or failing `.local`
+    resolver can never hang the daemon; on stall or failure we fall back to
+    TC001_FALLBACK_IP, then to the hostname itself as a last resort."""
+    global _DEVICE_IP
+    if _looks_like_ip(TC001_IP):
+        _DEVICE_IP = TC001_IP
+        return _DEVICE_IP
+    result: dict = {}
+
+    def _lookup() -> None:
+        try:
+            result["ip"] = socket.gethostbyname(TC001_IP)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_lookup, name="tc001-resolve", daemon=True)
+    th.start()
+    th.join(timeout=2.0)
+    if result.get("ip"):
+        _DEVICE_IP = result["ip"]
+    elif TC001_FALLBACK_IP:
+        _DEVICE_IP = TC001_FALLBACK_IP
+    else:
+        _DEVICE_IP = TC001_IP
+    return _DEVICE_IP
 
 # Palette (matches screens/preview.html)
 CRAB_BODY_RGB       = (217, 119, 87)    # #D97757
@@ -752,12 +805,17 @@ def _do_push_frame(state: str, draw_array: list) -> bool:
         "lifetime": 0,
     }
     try:
-        s.post(
-            f"http://{TC001_IP}/api/custom?name={state}",
+        resp = s.post(
+            f"http://{_DEVICE_IP}/api/custom?name={state}",
             json=payload,
             timeout=HTTP_TIMEOUT_S,
         )
-        return True
+        # AWTRIX returns HTTP 500 when a `draw` array exceeds ~100 items, and can
+        # 503 transiently under load. `requests` does NOT raise on 4xx/5xx, so
+        # without this check a rejected frame would be cached as "pushed" and the
+        # identical frame deduped forever — a silent stuck display. Treat any
+        # non-2xx/3xx as a failure so the pusher clears its dedup cache and retries.
+        return resp.status_code < 400
     except Exception:
         _reset_session()
         return False
@@ -770,7 +828,7 @@ def _do_switch_app(name: str) -> None:
         return
     try:
         s.post(
-            f"http://{TC001_IP}/api/switch",
+            f"http://{_DEVICE_IP}/api/switch",
             json={"name": name},
             timeout=HTTP_TIMEOUT_S,
         )
@@ -851,12 +909,14 @@ def run_daemon(state_file: str, preview: bool) -> None:
     The pusher thread owns all network I/O, so render cadence is decoupled
     from device/network latency."""
     t0_monotonic_ms = time.monotonic() * 1000
-    last_battery_flash = time.time()  # delay first flash by full interval
-    flash_end_t: Optional[float] = None  # wall-clock t when active battery flash should end
+    last_battery_flash = time.monotonic()  # delay first flash by full interval
+    flash_end_t: Optional[float] = None  # monotonic t when active battery flash should end
     prev_state: Optional[str] = None
 
     pusher: Optional[Pusher] = None
     if not preview:
+        resolve_device_ip()
+        print(f"[tc001] pushing to {TC001_IP} -> {_DEVICE_IP}", flush=True)
         pusher = Pusher()
         pusher.start()
 
@@ -877,12 +937,14 @@ def run_daemon(state_file: str, preview: bool) -> None:
             write_state_token(state_file, "ready")
             state, set_at = "ready", time.time()
 
-        # On any state change (especially internal timeouts), force the device's
-        # active app to match — state_emitter.sh only switches apps on external
-        # transitions, so without this the device stays parked on the previous
-        # app and shows stale frames. Also cancels any active battery flash so
-        # the new app appears immediately.
-        if pusher is not None and prev_state is not None and state != prev_state:
+        # Force the device's active app to match the state on every transition
+        # AND once at startup (prev_state is None). state_emitter.sh only switches
+        # apps on external transitions, so without the startup switch an unattended
+        # device reboot — which boots into the native Battery app — would leave the
+        # daemon pushing idle frames to an app that is never brought to the
+        # foreground (device shows Battery, crab never appears). Also cancels any
+        # active battery flash so the new app appears immediately.
+        if pusher is not None and (prev_state is None or state != prev_state):
             pusher.enqueue_control(state)
             flash_end_t = None
         prev_state = state
@@ -906,7 +968,10 @@ def run_daemon(state_file: str, preview: bool) -> None:
             # for BATTERY_FLASH_DURATION_S while the pusher discards frames,
             # then switch back. The render loop keeps ticking the whole time
             # so the crab resumes in-phase.
-            now = time.time()
+            # Monotonic clock: the flash is a pure duration, so a wall-clock step
+            # backward (NTP correction, sleep/resume) must not be able to wedge the
+            # Battery app on screen by making `now >= flash_end_t` never hold.
+            now = time.monotonic()
             if flash_end_t is None:
                 if state == "idle" and (now - last_battery_flash) >= BATTERY_FLASH_INTERVAL_S:
                     pusher.enqueue_control("Battery")
@@ -939,6 +1004,7 @@ def render_once(state: str, preview: bool) -> int:
         print(f"state: {state}")
         print(frame.to_ascii())
     else:
+        resolve_device_ip()
         _do_push_frame(state, frame.to_draw_array())
     return 0
 

@@ -71,7 +71,14 @@ export class Persistence {
     const adapter = this.app.vault.adapter;
     if (!(await adapter.exists(this.indexPath))) return null;
     try {
-      return JSON.parse(await adapter.read(this.indexPath)) as TabIndex;
+      const parsed = JSON.parse(await adapter.read(this.indexPath));
+      /* Validate the shape before trusting it. Valid-but-wrong JSON ({}, [],
+         {tabs:"x"}) passes JSON.parse and would then throw in the caller's
+         index.tabs iteration — loadTab is defensive per-field, loadIndex was not. */
+      if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as TabIndex).tabs)) {
+        return null;
+      }
+      return parsed as TabIndex;
     } catch {
       return null;
     }

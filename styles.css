@@ -1921,9 +1921,18 @@ mark.claudian-search-mark.is-active {
   font-family: var(--font-interface);
   font-size: 12px;
   color: var(--text-normal);
+  /* Flex column so the server list can scroll while the header and footer
+     stay pinned. max-height is a CSS fallback; openCostPopup() also sets a
+     pixel cap from the pill's viewport position so a server with dozens of
+     tools (e.g. webull's 68) doesn't push the popup off the top of screen. */
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 520px);
+  overflow: hidden;
 }
 .claudian-cost-popup-header {
   margin-bottom: 8px;
+  flex: 0 0 auto;
 }
 .claudian-cost-popup-title {
   font-weight: 600;
@@ -1944,6 +1953,16 @@ mark.claudian-search-mark.is-active {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* The one scrollable region. flex:1 + min-height:0 lets it shrink below
+     its content height so overflow-y actually engages inside the capped
+     popup; the negative-margin/padding pair bleeds the scrollbar to the
+     popup edge while keeping cards clear of it. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -4px;
+  padding: 0 4px;
 }
 .claudian-cost-popup-server {
   padding: 8px 10px;
@@ -1999,6 +2018,7 @@ mark.claudian-search-mark.is-active {
   font-size: 11px;
   color: var(--text-muted);
   text-align: center;
+  flex: 0 0 auto;
 }
 
 /* Disabled-state row styling in the MCP manager modal. Muted opacity +

@@ -1,5 +1,4 @@
 import { watch, statSync, createReadStream, type FSWatcher } from "node:fs";
-import { createInterface } from "node:readline";
 import type { StreamEvent } from "./Events";
 
 type EventListener = (e: StreamEvent) => void;
@@ -30,6 +29,9 @@ export class JsonlTailer {
   /* Tracks in-flight readAppended() invocations so stop() can await drain. */
   private readChain: Promise<void> = Promise.resolve();
   private stopped = false;
+  /* Single pending re-attach timer. Tracked so stop() can cancel it and so a
+     rename+close burst can't schedule two concurrent re-attaches. */
+  private reattachTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(path: string) {
     this.path = path;
@@ -87,24 +89,31 @@ export class JsonlTailer {
     if (this.stopped) return;
     try { this.watcher?.close(); } catch { /* ignore */ }
     try {
-      this.watcher = watch(this.path, (eventType) => {
+      const w = watch(this.path, (eventType) => {
         if (eventType === "rename") {
           /* File was renamed (or the inode the watcher was bound to was
              replaced). Re-stat from scratch and re-watch. */
           this.scheduleRead();
           /* Defer the re-attach a tick so the replacement file is in place. */
-          setTimeout(() => this.attachWatcher(), 50);
+          this.scheduleReattach();
           return;
         }
         this.scheduleRead();
       });
-      this.watcher.on("close", () => {
+      this.watcher = w;
+      w.on("close", () => {
         if (this.stopped) return;
-        /* Watcher closed underneath us (e.g. fs.watch hit a kernel-level
-           limit or the file was unlinked). Try to re-attach. */
-        setTimeout(() => this.attachWatcher(), 50);
+        /* Closing the previous watcher to install a new one (top of this
+           method) ALSO emits 'close' on the old instance. If we re-attached on
+           every close we'd close→close→close in a perpetual 50ms loop. Guard on
+           identity: only re-attach when the watcher that closed is still the
+           current one (i.e. an unexpected close — kernel limit, unlink — not our
+           own intentional replacement, after which this.watcher already points
+           at the new instance). */
+        if (this.watcher !== w) return;
+        this.scheduleReattach();
       });
-      this.watcher.on("error", (err) => {
+      w.on("error", (err) => {
         for (const cb of this.errorListeners) {
           try { cb(err); } catch { /* ignore */ }
         }
@@ -117,6 +126,16 @@ export class JsonlTailer {
     }
   }
 
+  /* Schedule a single deferred re-attach. Idempotent while one is pending so a
+     rename+close burst doesn't fan out into multiple concurrent watchers. */
+  private scheduleReattach(): void {
+    if (this.stopped || this.reattachTimer !== null) return;
+    this.reattachTimer = setTimeout(() => {
+      this.reattachTimer = null;
+      this.attachWatcher();
+    }, 50);
+  }
+
   /* Chain readAppended() so concurrent watcher events don't interleave reads. */
   private scheduleRead(): void {
     this.readChain = this.readChain.then(() => this.readAppended()).catch(() => {});
@@ -124,6 +143,10 @@ export class JsonlTailer {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    if (this.reattachTimer !== null) {
+      clearTimeout(this.reattachTimer);
+      this.reattachTimer = null;
+    }
     try { this.watcher?.close(); } catch { /* ignore */ }
     this.watcher = null;
     /* Wait for any in-flight reads to drain so callers can rely on
@@ -148,6 +171,11 @@ export class JsonlTailer {
     if (size < this.bytesRead) {
       this.bytesRead = 0;
       this.buffer = "";
+      /* Re-reading from byte 0 replays records we've already emitted. Their
+         uuids are still in the dedupe set, so without clearing it every replayed
+         record is silently dropped and the rotated session goes dark. */
+      this.seenUuids.clear();
+      this.seenUuidsOrder.length = 0;
       if (size === 0) return;
       await this.readRange(0, size);
       this.bytesRead = size;
@@ -158,13 +186,38 @@ export class JsonlTailer {
     this.bytesRead = size;
   }
 
+  /* Read [start, end) and emit each COMPLETE line. A trailing partial line (the
+     read landed mid-record because the CLI's append wasn't atomic) is retained
+     in this.buffer and stitched together with the next read rather than being
+     handed to readline as a truncated line that fails JSON.parse and is lost —
+     the previous readline-based implementation advanced bytesRead past such a
+     split record, dropping it permanently. The stream is destroyed on error so
+     a failed read can't leak the underlying fd. */
   private readRange(start: number, end: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const stream = createReadStream(this.path, { start, end: end - 1, encoding: "utf8" });
-      const rl = createInterface({ input: stream, crlfDelay: Infinity });
-      rl.on("line", line => this.handleLine(line));
-      rl.on("close", () => resolve());
-      stream.on("error", reject);
+      let settled = false;
+      stream.on("data", (chunk: string | Buffer) => {
+        this.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        let nl = this.buffer.indexOf("\n");
+        while (nl !== -1) {
+          const line = this.buffer.slice(0, nl);
+          this.buffer = this.buffer.slice(nl + 1);
+          this.handleLine(line);
+          nl = this.buffer.indexOf("\n");
+        }
+      });
+      stream.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        stream.destroy();
+        reject(err);
+      });
+      stream.on("close", () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      });
     });
   }
 

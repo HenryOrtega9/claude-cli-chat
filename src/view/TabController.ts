@@ -336,6 +336,7 @@ export class TabController {
     this.statusIndicator.destroy();
     this.activeFileIndicator.destroy();
     this.selectionTracker.destroy();
+    this.searchBar.destroy();
     this.renderer.destroy();
     this.inputBox.destroy();
     this.root.remove();
@@ -804,16 +805,25 @@ export class TabController {
        Agents pill's running counter stays stuck. */
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
+      let touched = false;
       for (const t of m.toolCalls) {
         if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
           t.status = "errored";
           t.isError = true;
           t.nestedStatus = "failed";
+          touched = true;
         }
       }
+      /* Re-render so the DOM tool row drops its running spinner. Mutating the
+         ToolCall object alone leaves the bubble visually stuck on "running". */
+      if (touched) void this.renderer.upsertMessage(m);
     }
     this.refreshRunningAgentCount();
     this.statusIndicator.hide();
+    /* Cancel leaves the last emitted device state as a held one (thinking /
+       needs_permission), whose 5s heartbeat would otherwise re-assert that app
+       on the TC001 forever. Drop back to ready, mirroring clearConversation. */
+    StateEmitter.setState("ready");
     new Notice("Stopped Claude.");
     this.onStateChangeCb();
   }
@@ -1638,7 +1648,14 @@ export class TabController {
   }
 
   private handleControlRequest(event: ControlRequestEvent) {
-    if (this.userCancelInitiated) return;
+    if (this.userCancelInitiated) {
+      /* A control_request that lands after the user hit cancel but before the
+         subprocess is actually killed still needs a response, or the CLI blocks
+         waiting for one during the (up-to-2s) teardown window. Deny it
+         immediately rather than dropping it silently — no card is shown. */
+      try { this.session?.deny(event.request_id, "User cancelled"); } catch { /* best-effort */ }
+      return;
+    }
     const approval: PendingApproval = {
       requestId: event.request_id,
       toolName: event.request.tool_name,
@@ -1670,15 +1687,29 @@ export class TabController {
     let swept = 0;
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
+      let touched = false;
       for (const t of m.toolCalls) {
         if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
           t.status = "completed";
           if (t.nestedStatus !== "completed" && t.nestedStatus !== "failed") {
             t.nestedStatus = "completed";
           }
+          /* This tool never received its tool_result, so handleToolResult never
+             ran to stop its subagent tracker. Stop it here, or the tracker's
+             JsonlTailer + session-file claim leak until the next teardownSession
+             (which may be many turns away in a long-lived tab). */
+          const tracker = this.subagentTrackers.get(t.id);
+          if (tracker) {
+            void tracker.stop();
+            this.subagentTrackers.delete(t.id);
+          }
+          this.subagentSpawnTimes.delete(t.id);
+          touched = true;
           swept++;
         }
       }
+      /* Re-render so the swept tool row stops showing a running spinner. */
+      if (touched) void this.renderer.upsertMessage(m);
     }
     if (swept > 0) this.refreshRunningAgentCount();
     /* Turn settled. StateEmitter auto-transitions complete -> ready after

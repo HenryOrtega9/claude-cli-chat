@@ -240,6 +240,14 @@ export class MCPConfigStore {
       /* Also clear any disabled-side entry under the same name so deletion is
          a full purge regardless of which bucket the server was sitting in. */
       if (cfg.disabledMcpServers) delete cfg.disabledMcpServers[name];
+      /* And drop it from the live per-vault disable list — the ONLY field that
+         drives spawn deny rules. Otherwise a removed server stays permanently
+         deny-listed and would poison a future server that sanitizes to the same
+         name. */
+      if (Array.isArray(cfg.disabledServers)) {
+        cfg.disabledServers = cfg.disabledServers.filter(n => n !== name);
+        if (cfg.disabledServers.length === 0) delete cfg.disabledServers;
+      }
       await this.save(cfg);
     });
   }

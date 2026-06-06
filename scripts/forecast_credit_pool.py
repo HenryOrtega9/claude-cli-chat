@@ -117,8 +117,11 @@ def main():
         per_day = total / days
         print(f"\nper day:                 ${per_day:.2f}")
         print(f"30-day projection:       ${per_day*30:.2f}")
-        print(f"${args.pool:.0f} pool exhaustion: {args.pool/per_day:.1f} days "
-              f"({(args.pool/per_day)/30*100:.0f}% of a month)")
+        if per_day > 0:
+            print(f"${args.pool:.0f} pool exhaustion: {args.pool/per_day:.1f} days "
+                  f"({(args.pool/per_day)/30*100:.0f}% of a month)")
+        else:
+            print(f"${args.pool:.0f} pool exhaustion: n/a (zero matched cost)")
 
 if __name__ == "__main__":
     main()

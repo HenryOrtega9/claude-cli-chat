@@ -48,10 +48,18 @@ JSON
 
 post_app() {
   local name="$1" payload="$2"
-  curl -sS -X POST "$API/custom?name=$name" \
+  # Tolerate a transient device outage: under `set -e`, a bare `curl && echo`
+  # would abort the whole script the moment one POST fails (device mid-reboot,
+  # off-network), silently skipping every state after it. Swallow the failure
+  # per-state and add --max-time so a hung connection can't stall the run.
+  if curl -sS --max-time 5 -X POST "$API/custom?name=$name" \
     -H "Content-Type: application/json" \
     -d "$payload" \
-    > /dev/null && echo "  registered: $name"
+    > /dev/null; then
+    echo "  registered: $name"
+  else
+    echo "  FAILED:     $name (device unreachable?)" >&2
+  fi
 }
 
 echo "Registering Claude state apps on $TC001..."

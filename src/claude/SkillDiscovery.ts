@@ -49,6 +49,10 @@ const BUILTIN_COMMANDS: { name: string; description: string }[] = [
 ];
 
 function parseFrontmatter(content: string): { name?: string; description?: string } {
+  /* Strip a leading UTF-8 BOM. readFileSync(..., "utf8") preserves it, and it
+     pushes `---` off column 0 so the ^ anchor below misses the frontmatter
+     entirely — the skill then loses its declared name/description. */
+  if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
   /* Frontmatter must be the first chars of the file, `---` fenced. */
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return {};

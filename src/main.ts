@@ -1,6 +1,6 @@
 import { FileSystemAdapter, Plugin, WorkspaceLeaf, addIcon } from "obsidian";
 import { ClaudeChatView, VIEW_TYPE_CLAUDE_CHAT } from "./view/ClaudeChatView";
-import { ClaudeChatSettingTab, DEFAULT_SETTINGS, autodetectClaudePath, autodetectUserName, type ClaudeChatSettings } from "./settings";
+import { ClaudeChatSettingTab, DEFAULT_SETTINGS, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, autodetectClaudePath, autodetectUserName, type ClaudeChatSettings } from "./settings";
 import { SubprocessManager, spawnOptionsFromSettings } from "./claude/SubprocessManager";
 import { MCPConfigStore } from "./mcp/MCPConfig";
 import { listMcpServersViaCli, type ParsedMcpServer } from "./mcp/McpServerList";
@@ -148,8 +148,12 @@ export default class ClaudeChatPlugin extends Plugin {
   async refreshMcpDenyPatterns(): Promise<void> {
     try {
       this.mcpDenyPatterns = await new MCPConfigStore(this.app).getDenyPatterns();
-    } catch {
-      this.mcpDenyPatterns = [];
+    } catch (err) {
+      /* Keep the prior patterns rather than clobbering to []. A transient read
+         failure here would otherwise silently re-enable every disabled MCP
+         server for the rest of the session, since the spawn path reads this
+         cache synchronously and nothing else re-primes it. */
+      console.warn("[claude-cli-chat] MCP deny pattern refresh failed; keeping previous patterns:", err);
     }
   }
 
@@ -159,11 +163,14 @@ export default class ClaudeChatPlugin extends Plugin {
      available" and fall back to runtime data. */
   async getMcpServers(force = false): Promise<ParsedMcpServer[]> {
     if (!force && this.mcpServerListCache) return this.mcpServerListCache;
-    if (this.mcpServerListInflight) return this.mcpServerListInflight;
+    /* Only coalesce onto an in-flight fetch when NOT forced. A force=true caller
+       (the MCP manager opening, which wants a fresh list) must not be handed a
+       stale in-flight non-forced result, so it starts its own fetch. */
+    if (!force && this.mcpServerListInflight) return this.mcpServerListInflight;
     const claudePath = this.settings.claudePath || autodetectClaudePath() || "claude";
     const job = listMcpServersViaCli(claudePath)
       .then(list => { this.mcpServerListCache = list; return list; })
-      .finally(() => { this.mcpServerListInflight = null; });
+      .finally(() => { if (this.mcpServerListInflight === job) this.mcpServerListInflight = null; });
     this.mcpServerListInflight = job;
     return job;
   }
@@ -190,6 +197,14 @@ export default class ClaudeChatPlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    /* Clamp enum-typed fields to the current vocabulary. Object.assign only
+       backfills MISSING keys, so a persisted value whose id was later removed
+       (e.g. a retired model key after a version migration) survives intact and
+       then resolves to undefined at spawn / shows no selection in the dropdown.
+       Snap any stale value back to its default. */
+    if (!(this.settings.defaultModel in MODEL_IDS)) this.settings.defaultModel = DEFAULT_SETTINGS.defaultModel;
+    if (!EFFORT_ORDER.includes(this.settings.defaultEffort)) this.settings.defaultEffort = DEFAULT_SETTINGS.defaultEffort;
+    if (!PERMISSION_MODE_ORDER.includes(this.settings.permissionMode)) this.settings.permissionMode = DEFAULT_SETTINGS.permissionMode;
     /* First-install user name autodetect. Empty userName means we've never
        populated it; try the OS account once and save. Validate the result
        — if dscl misbehaves and leaks an error string into stdout, the

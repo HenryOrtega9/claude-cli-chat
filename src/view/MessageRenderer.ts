@@ -203,6 +203,11 @@ export class MessageListRenderer {
       this.liveEls.set(msg.id, entry);
     }
     await this.renderContent(entry.content, msg);
+    /* renderContent awaits MarkdownRenderer; removeMessage() (preamble fold)
+       can run during that await, detaching entry.root and clearing liveEls. If
+       so, bail — otherwise we write to a detached bubble and re-register this
+       message's tools in toolEls pointing at orphaned DOM. */
+    if (this.liveEls.get(msg.id) !== entry) return;
     if (msg.toolCalls) {
       for (const tool of msg.toolCalls) {
         this.upsertTool(entry.root, tool);

@@ -293,14 +293,24 @@ export class TabSession {
     if (this.status === "exited") return;
     this.writer.closeStdin();
     return new Promise(resolve => {
+      /* `status` flips to "exited" asynchronously inside the 'exit' handler, so
+         the process can already be gone here even though the check above passed.
+         If it is, once('exit') would never fire and we'd block the full 2s for
+         nothing (multiplied across tabs on plugin unload). Resolve immediately. */
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      const onExit = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
       const timeout = setTimeout(() => {
+        this.child.removeListener("exit", onExit);
         try { this.child.kill("SIGKILL"); } catch { /* ignore */ }
         resolve();
       }, 2000);
-      this.child.once("exit", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
+      this.child.once("exit", onExit);
       try { this.child.kill("SIGTERM"); } catch { /* ignore */ }
     });
   }
