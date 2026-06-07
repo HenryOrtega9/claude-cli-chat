@@ -7,7 +7,6 @@ export type RemoteStatus = "starting" | "waiting" | "ready" | "exited" | "error"
 
 export type RemoteControlOptions = {
   cwd: string;
-  sessionId?: string;
   sessionName?: string;
   claudePath?: string;
   /* Optional handle to the SubprocessManager so the session-file poll can
@@ -36,7 +35,11 @@ function stripAnsi(input: string): string {
     .replace(/\r/g, "");
 }
 
-const URL_PATTERN = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+/;
+/* The pairing URL the CLI prints. Single-session mode emits the
+   `/code/session_<id>` form; the multi-session server emits the
+   `/code?environment=env_<id>` form. We spawn single-session mode below, but
+   match both so a future CLI spawn-mode change can't silently break pairing. */
+const URL_PATTERN = /https:\/\/claude\.ai\/code(?:\/session_[A-Za-z0-9]+|\?environment=env_[A-Za-z0-9]+)/;
 const TRUST_PROMPT_PATTERN = /trust this folder|Yes, I trust this folder/i;
 
 /* Inline Python PTY proxy. macOS `script -q /dev/null <cmd>` is the textbook
@@ -102,9 +105,20 @@ except KeyboardInterrupt:
     except OSError: pass
 `;
 
-/* Wraps `claude --remote-control` in a PTY via macOS `script -q /dev/null`.
-   The CLI emits an ANSI-laden interactive UI; we strip it, auto-confirm the
-   first-launch trust prompt, and watch for the pairing URL.
+/* Wraps the `claude remote-control` server subcommand in a PTY (the inline
+   Python pty.fork() proxy above). The CLI emits an ANSI-laden interactive UI;
+   we strip it, auto-confirm the first-launch trust prompt, and watch for the
+   pairing URL.
+
+   Why the subcommand and not the `--remote-control` flag: the interactive
+   `claude --remote-control` flag ENABLES remote control but never PRINTS a
+   pairing URL to the terminal (it only shows "Remote Control active"), so the
+   URL scrape could never fire and the card hung on "Waiting for pairing"
+   forever. The `remote-control` subcommand in single-session mode
+   (`--spawn=session`, "exits when the session ends") prints the
+   `https://claude.ai/code/session_<id>` URL directly. Trade-off: the
+   subcommand does NOT accept `--resume`, so it starts a fresh remote session
+   rather than carrying over an existing local conversation.
 
    Sibling JsonlTailer is responsible for surfacing the actual conversation;
    this class only owns the spawn lifecycle and URL discovery. */
@@ -142,9 +156,13 @@ export class RemoteControlSession {
     this.claimedSessionFiles = opts.claimedSessionFiles;
 
     const claude = opts.claudePath || autodetectClaudePath() || "claude";
-    const pyArgs = ["-c", PTY_PROXY_SCRIPT, claude, "--remote-control"];
-    if (opts.sessionName) pyArgs.push(opts.sessionName);
-    if (opts.sessionId) pyArgs.push("--resume", opts.sessionId);
+    /* `remote-control` is a subcommand (no leading dashes). `--spawn=session`
+       selects classic single-session mode, which also skips the interactive
+       "[1/2] spawn mode" prompt the default multi-session server shows on
+       first run. The session name is passed via `--name` (the subcommand
+       rejects a bare positional name). */
+    const pyArgs = ["-c", PTY_PROXY_SCRIPT, claude, "remote-control", "--spawn=session"];
+    if (opts.sessionName) pyArgs.push("--name", opts.sessionName);
 
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] RC spawn`, { claude, sessionName: opts.sessionName, cwd: opts.cwd });
@@ -191,18 +209,10 @@ export class RemoteControlSession {
       void this.dispose();
     }, 60000);
 
-    /* If an explicit sessionId was provided, we know the JSONL path upfront.
-       Otherwise poll the project dir for a newer file appearing post-spawn. */
-    if (opts.sessionId) {
-      const path = sessionFilePathFor(this.cwd, opts.sessionId);
-      if (existsSync(path)) {
-        this.sessionFile = path;
-        this.claimedSessionFiles?.claim(path);
-        for (const cb of this.sessionFileListeners) cb(path);
-      }
-    } else {
-      this.startSessionFilePoll();
-    }
+    /* The server subcommand creates its own fresh session, so we can't know
+       the JSONL path upfront — poll the project dir for the newest file
+       appearing post-spawn. */
+    this.startSessionFilePoll();
   }
 
   onUrl(cb: UrlListener) { this.urlListeners.push(cb); }
@@ -265,7 +275,10 @@ export class RemoteControlSession {
       this.clearUrlTimeout();
       console.log(`[claude-cli-chat] RC paired url=${this.url}`);
       for (const cb of this.urlListeners) cb(this.url);
-    } else if (this.status === "starting" && /remote control|connecting/i.test(this.stdoutBuffer)) {
+    } else if (
+      this.status === "starting" &&
+      /remote control|connecting|single session|spawn mode|launching|mobile app/i.test(this.stdoutBuffer)
+    ) {
       this.setStatus("waiting");
     }
   }

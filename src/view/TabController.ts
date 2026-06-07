@@ -538,7 +538,6 @@ export class TabController {
 
     this.remoteSession = new RemoteControlSession({
       cwd,
-      sessionId: this.state.sessionId ?? undefined,
       sessionName,
       claudePath: this.plugin.settings.claudePath || undefined,
     });

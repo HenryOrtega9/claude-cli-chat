@@ -6,24 +6,27 @@ import type { StreamEvent, ControlRequestEvent, ContentBlock } from "./Events";
 import { RemoteControlSession } from "./RemoteControlSession";
 import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from "../settings";
 
-/* Returns PIDs of every running process whose command line matches
-   `claude --remote-control`. Used by the settings UI to count live remote
-   sessions and by killAllRemoteAndOrphans() to sweep up anything the
-   in-process registry doesn't know about (e.g. survivors of a prior plugin
-   instance that exited before this cleanup logic landed).
+/* Returns PIDs of every running Remote Control process. Used by the settings
+   UI to count live remote sessions and by killAllRemoteAndOrphans() to sweep
+   up anything the in-process registry doesn't know about (e.g. survivors of a
+   prior plugin instance that exited before this cleanup logic landed).
 
-   The pattern uses pgrep's BRE (`-f` matches the full argv) to require
+   We spawn the `claude remote-control` subcommand, but older orphans may still
+   be running as the `claude --remote-control` flag form, so the pattern
+   accepts both: optional `--` before `remote-control`.
+
+   The pattern uses pgrep's ERE (`-f` matches the full argv) to require
    `claude` either at the start of the argv or after a `/` (so an absolute
-   path matches), followed by whitespace, then `--remote-control` bounded by
+   path matches), followed by whitespace, then `(--)?remote-control` bounded by
    whitespace or end. This avoids false positives like man pages, editor
-   buffers, or another tool with `claude --remote-control` embedded in a
+   buffers, or another tool with `claude remote-control` embedded in a
    longer command. After parsing, we cross-check via `ps -p <pid> -o
    command=` so we only return PIDs whose argv actually begins with the
    claude binary. */
 export function findRemoteControlPids(): number[] {
   let raw: string;
   try {
-    raw = execSync('pgrep -f "(^|/)claude[[:space:]]+--remote-control([[:space:]]|$)"', { encoding: "utf8" }).trim();
+    raw = execSync('pgrep -f "(^|/)claude[[:space:]]+(--)?remote-control([[:space:]]|$)"', { encoding: "utf8" }).trim();
   } catch {
     return [];
   }
@@ -40,12 +43,13 @@ export function findRemoteControlPids(): number[] {
     try {
       const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf8" }).trim();
       /* The argv as ps shows it: first token should be `claude` (possibly
-         absolute path) and `--remote-control` should appear as its own token. */
+         absolute path) and `remote-control` should appear as its own token
+         (or the legacy `--remote-control` flag, for old orphans). */
       const argv = cmd.split(/\s+/);
       const first = argv[0] ?? "";
       const isClaude = first === "claude" || /\/claude$/.test(first);
-      const hasFlag = argv.includes("--remote-control");
-      if (isClaude && hasFlag) verified.push(pid);
+      const hasRc = argv.includes("remote-control") || argv.includes("--remote-control");
+      if (isClaude && hasRc) verified.push(pid);
     } catch {
       /* Process gone between pgrep and ps. Skip. */
     }
@@ -440,7 +444,8 @@ export class SubprocessManager {
         const argv = cmd.split(/\s+/);
         const first = argv[0] ?? "";
         const isClaude = first === "claude" || /\/claude$/.test(first);
-        if (!isClaude || !argv.includes("--remote-control")) continue;
+        const hasRc = argv.includes("remote-control") || argv.includes("--remote-control");
+        if (!isClaude || !hasRc) continue;
       } catch {
         continue;
       }
