@@ -181,6 +181,11 @@ export class RemoteControlSession {
     this.child.on("error", err => {
       console.error(`[claude-cli-chat] RC error:`, err);
       this.setStatus("error");
+      /* A spawn failure emits 'error' and never 'exit', so the exit-path
+         teardown never runs here. Mirror it: stop the session-file poll and
+         clear the URL timeout so neither keeps firing on a dead session. */
+      this.stopSessionFilePoll();
+      this.clearUrlTimeout();
       for (const cb of this.errorListeners) cb(err);
     });
 

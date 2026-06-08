@@ -85,6 +85,13 @@ export type ChatMessage = {
   toolCalls?: ToolCall[];
   attachments?: Attachment[];
   selectionContext?: SelectionContext;
+  /* Vault-relative paths of notes/folders that were pinned in the file-pill
+     bar when this message was sent, shipped to Claude as @-context (or inlined
+     for office binaries). Rendered as small note pills above the user bubble
+     so it's obvious at a glance that the turn carried extra context. Wire-only
+     otherwise — the bubble text shows just what the user typed. Absent when
+     nothing was attached. */
+  attachedNotePaths?: string[];
   /* True while we are still receiving partial deltas for this message. */
   streaming?: boolean;
   /* Wall-clock time the model took to produce this pass, measured from

@@ -107,6 +107,11 @@ export function listMcpServersViaCli(claudePath: string, timeoutMs = 30_000): Pr
 
     const timer = setTimeout(() => {
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
+      /* Escalate to SIGKILL if SIGTERM is ignored (e.g. wedged mid-network/auth
+         during health checks). Mirrors TitleGenerator's reap so a hung
+         `claude mcp list` can't survive as an orphan after we drop the child
+         reference. Harmless if the process already exited. */
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 2000);
       finish(() => reject(new Error("claude mcp list timed out")));
     }, timeoutMs);
 

@@ -798,20 +798,20 @@ export class TabController {
       this.remoteSession = null;
     }
     await this.teardownSession("cancel");
-    /* Mark any Task/Agent tools that were still running as errored — the
-       subprocess just died, so they're not going to receive a tool_result.
-       Without this they linger at status=running indefinitely and the
-       Agents pill's running counter stays stuck. */
+    /* Mark any tools that were still running as errored — the subprocess just
+       died, so none of them will receive a tool_result. Without this they
+       linger at status=running indefinitely (and for Task/Agent tools the
+       Agents pill's running counter stays stuck). nestedStatus is only
+       meaningful for Task/Agent, so it's flipped for those alone. */
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
       let touched = false;
       for (const t of m.toolCalls) {
-        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
-          t.status = "errored";
-          t.isError = true;
-          t.nestedStatus = "failed";
-          touched = true;
-        }
+        if (t.status !== "running") continue;
+        t.status = "errored";
+        t.isError = true;
+        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
+        touched = true;
       }
       /* Re-render so the DOM tool row drops its running spinner. Mutating the
          ToolCall object alone leaves the bubble visually stuck on "running". */
@@ -838,7 +838,12 @@ export class TabController {
   }
 
   private async ensureSession(): Promise<TabSession> {
-    if (this.session && this.session.status !== "exited") return this.session;
+    /* Treat "error" as terminal alongside "exited": a spawn-level failure
+       (ENOENT/EACCES) leaves the session in status "error" with no 'exit'
+       event ever firing, so reusing it here would permanently brick the tab.
+       Falling through lets ensureSession() spawn a fresh session, mirroring
+       SubprocessManager.spawn's matching reuse guard. */
+    if (this.session && this.session.status !== "exited" && this.session.status !== "error") return this.session;
     /* Await any in-flight restart teardown so the old subprocess has fully
        exited (and been dropped from SubprocessManager's session map) before we
        spawn. Otherwise spawn() finds the not-yet-exited session and returns it
@@ -921,6 +926,15 @@ export class TabController {
   private lastStderr = "";
 
   private restartSubprocess() {
+    /* If a teardown is already in flight (e.g. a prior model/effort/mode
+       change still inside its ~2s SIGTERM window), don't start a second one.
+       teardownSession()'s re-entrancy guard would return a resolved no-op that
+       overwrites pendingRestartTeardown, dropping the reference to the real
+       in-flight dispose so ensureSession() spawns onto the not-yet-exited
+       session and double-binds its listeners. The latest state.model/effort/
+       mode is read at spawn time, so the single in-flight teardown plus the
+       next ensureSession() still pick up the newest selection. */
+    if (this.tearingDown) return;
     /* Capture the teardown promise (still fire-and-forget here) so the next
        ensureSession() can await the old subprocess's actual exit before
        spawning. Without this, a quick submit during the ~2s SIGTERM window
@@ -1073,6 +1087,10 @@ export class TabController {
       timestamp: Date.now(),
       attachments: attachments.length > 0 ? attachments : undefined,
       selectionContext,
+      /* Record the notes pinned for this turn so the bubble can surface them
+         as note pills. Captured before the post-submit auto-drop below clears
+         non-sticky pins off the bar. */
+      attachedNotePaths: pinnedPaths.length > 0 ? [...pinnedPaths] : undefined,
     };
     this.state.messages.push(msg);
     this.state.busy = true;
@@ -1356,24 +1374,30 @@ export class TabController {
         const slot = this.streamingBlocks.get(inner.index);
         if (slot && slot.kind === "tool") {
           slot.partialJson += inner.delta.partial_json;
-          /* Attempt a partial parse so the user sees the tool input filling in.
-             If JSON is incomplete this throws — silently ignore until it parses. */
-          try {
-            const parsed = JSON.parse(slot.partialJson);
-            /* Resolve the owning message via toolToMessage first — that map
-               is the authoritative registry of which message owns each
-               tool_use_id (handled at content_block_start / handleToolUse).
-               Fall back to scanning state.messages for legacy compat in case
-               we somehow received deltas before the start event. */
-            const ownerId = this.toolToMessage.get(slot.toolId);
-            let msg = ownerId ? this.state.messages.find(m => m.id === ownerId) : undefined;
-            if (!msg) msg = this.state.messages.find(m => m.toolCalls?.some(t => t.id === slot.toolId));
-            const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
-            if (tool) {
-              tool.input = parsed;
-              if (msg) await this.renderer.upsertMessage(msg);
-            }
-          } catch { /* incomplete JSON — wait for more deltas */ }
+          /* A top-level tool-input object only becomes parseable on the delta
+             that carries its closing brace; skip the full-buffer parse on
+             interior-content deltas to avoid O(n^2) scans + thrown SyntaxErrors
+             while a large value (e.g. Write/Edit content) streams. The
+             authoritative final input is set in handleAssistant, so these
+             intermediate parses are a cosmetic live preview only. */
+          if (inner.delta.partial_json.includes("}")) {
+            try {
+              const parsed = JSON.parse(slot.partialJson);
+              /* Resolve the owning message via toolToMessage first — that map
+                 is the authoritative registry of which message owns each
+                 tool_use_id (handled at content_block_start / handleToolUse).
+                 Fall back to scanning state.messages for legacy compat in case
+                 we somehow received deltas before the start event. */
+              const ownerId = this.toolToMessage.get(slot.toolId);
+              let msg = ownerId ? this.state.messages.find(m => m.id === ownerId) : undefined;
+              if (!msg) msg = this.state.messages.find(m => m.toolCalls?.some(t => t.id === slot.toolId));
+              const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
+              if (tool) {
+                tool.input = parsed;
+                if (msg) await this.renderer.upsertMessage(msg);
+              }
+            } catch { /* incomplete JSON — wait for more deltas */ }
+          }
         }
       }
       return;
@@ -1470,18 +1494,17 @@ export class TabController {
       msg.durationMs = Date.now() - this.passStartedAt;
     }
     this.maybeMergePrefixPreamble(msg);
-    await this.renderer.upsertMessage(msg);
-
-    /* After a final assistant message, future deltas belong to a new bubble.
-       Null out passStartedAt rather than restamping to Date.now(): the old
-       code re-anchored here, which on a multi-pass tool turn caused the
-       NEXT pass's timer to include the entire tool-execution wait (since
-       no other event reset it before the next content_block_start). Nulling
-       lets getOrCreateStreamingAssistantMessage() anchor a fresh timer
-       when the next pass actually begins streaming. */
+    /* Reset streaming state BEFORE yielding to the render await. node:readline
+       dispatches buffered lines synchronously and onEvent is fire-and-forget, so
+       a next-pass event in the same stdout chunk would otherwise bind to the
+       stale streamingAssistantMessageId or have its streamingBlocks slot wiped
+       by the clear below. passStartedAt is nulled (not restamped) so
+       getOrCreateStreamingAssistantMessage anchors a fresh timer when the next
+       pass actually begins streaming. */
     this.clearStreamingPointer();
     this.streamingBlocks.clear();
     this.passStartedAt = null;
+    await this.renderer.upsertMessage(msg);
   }
 
   /* Interleaved thinking can produce two adjacent assistant passes where the
@@ -1675,20 +1698,22 @@ export class TabController {
     this.statusIndicator.hide();
     this.clearStreamingPointer();
     this.passStartedAt = null;
-    /* Turn-end reconciliation for Task/Agent tools. If the model produced
-       a final synthesis (we're in handleResult), every subagent it relied
-       on must have returned a tool_result — otherwise the model couldn't
-       have written the answer. In practice though, a few tool_result events
-       can be missed by handleToolResult (out-of-order delivery, parser
-       skipping a synthetic user envelope, a state restore mid-turn). Without
-       a sweep those tools linger at status=running, leaving the Agents pill
-       stuck on a non-zero count after the turn settles. Force-close them. */
+    /* Turn-end reconciliation for any still-running tools. If the model
+       produced a final synthesis (we're in handleResult), every tool it relied
+       on must have returned a tool_result — otherwise the model couldn't have
+       written the answer. In practice though, a few tool_result events can be
+       missed by handleToolResult (out-of-order delivery, parser skipping a
+       synthetic user envelope, a state restore mid-turn, or a result that
+       arrived before its tool_use registered). Without a sweep those tools
+       linger at status=running, spinning forever — and for Task/Agent tools,
+       leaving the Agents pill stuck on a non-zero count. Force-close them. */
     let swept = 0;
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
       let touched = false;
       for (const t of m.toolCalls) {
-        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
+        if (t.status !== "running") continue;
+        if (t.name === "Task" || t.name === "Agent") {
           t.status = "completed";
           if (t.nestedStatus !== "completed" && t.nestedStatus !== "failed") {
             t.nestedStatus = "completed";
@@ -1703,9 +1728,14 @@ export class TabController {
             this.subagentTrackers.delete(t.id);
           }
           this.subagentSpawnTimes.delete(t.id);
-          touched = true;
           swept++;
+        } else {
+          /* A regular tool (Bash, Read, Edit, MCP, …) still running at the
+             turn-terminal result event will never get a tool_result either, so
+             close it too — otherwise its row keeps spinning for the tab's life. */
+          t.status = "completed";
         }
+        touched = true;
       }
       /* Re-render so the swept tool row stops showing a running spinner. */
       if (touched) void this.renderer.upsertMessage(m);
@@ -1769,6 +1799,11 @@ export class TabController {
       cwd: this.plugin.getVaultPath(),
     });
     if (generated) {
+      /* The title-gen subprocess is independent and outlives teardownSession()/clear(),
+         which neither kill it. If the conversation we titled was cleared or replaced
+         during the multi-second await, the first user message is gone (or has a new id),
+         so a stale title would retitle and persist a fresh tab with the prior topic. */
+      if (this.state.messages.find(m => m.role === "user")?.id !== firstUser.id) return;
       this.state.title = generated;
       this.state.updatedAt = Date.now();
       this.refreshTitleBar();

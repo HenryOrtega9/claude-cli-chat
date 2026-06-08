@@ -29,6 +29,11 @@ export class ClaudeChatView extends ItemView {
   /* True when this view detected another live window already holding the
      vault lock. We render a placeholder and skip tab restore in that case. */
   private holdingLock = false;
+  /* Last index payload actually written, serialized. saveIndex() fires once
+     per stream delta via the onStateChange callback; the index itself only
+     changes on tab add/remove/select/title/sessionId. Caching the last write
+     lets us short-circuit the redundant atomic tmp-write+rename pairs. */
+  private lastIndexJson: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: ClaudeChatPlugin) {
     super(leaf);
@@ -171,7 +176,7 @@ export class ClaudeChatView extends ItemView {
        a dangling reference. */
     const activeTab = this.tabs.find(t => t.state.id === this.activeTabId);
     const activeTabId = activeTab && !activeTab.state.incognito ? this.activeTabId : null;
-    void this.plugin.persistence.saveIndex({
+    const index = {
       activeTabId,
       /* Incognito tabs are excluded from the index so they never get written
          to tabs.json and thus never restore on reload. */
@@ -182,7 +187,17 @@ export class ClaudeChatView extends ItemView {
           title: t.state.title,
           sessionId: t.state.sessionId,
         })),
-    });
+    };
+    /* Skip the write when nothing about the index actually changed. The
+       onStateChange callback calls this once per streaming delta, but the
+       payload only shifts on tab add/remove/select/title/sessionId. Without
+       this guard each delta drives a redundant atomic tmp-write+rename of
+       tabs.json on an iCloud-synced vault. The cache starts null so
+       restoreTabs' explicit final write still goes through. */
+    const json = JSON.stringify(index);
+    if (json === this.lastIndexJson) return;
+    this.lastIndexJson = json;
+    void this.plugin.persistence.saveIndex(index);
   }
 
   async onClose() {
@@ -223,6 +238,16 @@ export class ClaudeChatView extends ItemView {
     this.selectTab(controller.state.id, { skipSave: true });
     if (!opts.skipSave) {
       this.saveIndex();
+      /* Tabs created with pre-populated history (fork, History-modal reopen)
+         carry messages that no streaming event will reproduce. saveIndex only
+         writes the index entry; without an explicit body write the conversation
+         file isn't created until the user interacts. A reload before that drops
+         the carried history (loadTab returns null, so restore replaces the
+         entry with a blank tab). Persist the body now. Empty new tabs and
+         incognito tabs are skipped; flush() on unload covers the debounce. */
+      if (!controller.state.incognito && controller.state.messages.length > 0) {
+        this.plugin.persistence.scheduleSaveTab(controller.state);
+      }
       /* User-initiated new tab (or fork). Reset the TC001 to "ready" so a
          lingering "thinking" / "needs_permission" from another tab doesn't
          carry over. skipSave is set during plugin-load tab restore, where we
@@ -280,6 +305,10 @@ export class ClaudeChatView extends ItemView {
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
     const [removed] = this.tabs.splice(idx, 1);
+    /* Snapshot busy state before destroy(): a tab closed mid-stream left
+       StateEmitter asserting "thinking" (it never reached the result event
+       that resets to "ready"), orphaning the TC001 heartbeat. */
+    const wasBusy = removed.isBusy();
     /* Await destroy() before splicing out — otherwise the subprocess SIGTERM
        handshake races against onClose-like cleanup and we can leak children
        as PPID=1 orphans (same failure mode that onClose's await pattern
@@ -287,6 +316,12 @@ export class ClaudeChatView extends ItemView {
     await removed.destroy();
     /* Incognito tabs have nothing on disk — skip the delete entirely. */
     if (!removed.state.incognito) void this.plugin.persistence.deleteTab(tabId);
+    /* Clear the orphaned "thinking" heartbeat back to "ready" — but only when
+       no surviving tab is itself busy, so closing one streaming tab doesn't
+       blank the device while another is still working. */
+    if (wasBusy && !this.tabs.some(t => t.isBusy())) {
+      StateEmitter.setState("ready");
+    }
     if (this.tabs.length === 0) {
       this.createTab();
     } else if (this.activeTabId === tabId) {

@@ -1,4 +1,4 @@
-import { App, Component, MarkdownRenderer, Notice, setIcon } from "obsidian";
+import { App, Component, MarkdownRenderer, Notice, setIcon, TFolder } from "obsidian";
 import type { Attachment, ChatMessage, NestedSubagentEvent, ToolCall } from "./state";
 import { editOpsFromInput, renderDiff, renderWritePreview } from "./DiffRenderer";
 
@@ -21,6 +21,9 @@ export type MessageActionCallbacks = {
      engages. This is the standard chat-app pattern and avoids the rAF /
      scrollHeight-mismatch races we had with the previous approach. */
 export class MessageListRenderer {
+  /* At or above this many attached notes, the pill row collapses behind a
+     single "N notes" summary pill the user can click to expand. */
+  private static readonly NOTE_COLLAPSE_THRESHOLD = 4;
   private app: App;
   private component: Component;
   private container: HTMLElement;
@@ -32,6 +35,12 @@ export class MessageListRenderer {
      DOM and both append. Serializing per-id removes the window structurally
      rather than patching symptoms downstream (footer dedup, etc.). */
   private renderChains = new Map<string, Promise<void>>();
+  /* Generation token bumped on every reset(). Clearing renderChains alone
+     cannot cancel an already-scheduled .then continuation, so a doUpsert queued
+     behind an in-flight one still runs after reset() and would re-create a
+     cleared bubble. Each upsert captures the generation it was queued under;
+     doUpsert bails if it no longer matches, so post-reset stragglers are inert. */
+  private generation = 0;
   /* Sticky per-message override for the thinking-block toggle. Set when the
      user clicks the header. Survives the empty()+rebuild cycle that happens
      on every streaming delta, so a user-collapsed block doesn't auto-reopen
@@ -113,6 +122,11 @@ export class MessageListRenderer {
        message /clear was meant to remove. Dropping the chain map detaches the
        stale promise so a late render can't re-enter the cleared container. */
     this.renderChains.clear();
+    /* Bump the generation so any doUpsert already scheduled behind an in-flight
+       MarkdownRenderer.render await bails on resume instead of re-appending a
+       bubble to the freshly-emptied container. Clearing the map above cannot
+       cancel that pending microtask; this token can. */
+    this.generation++;
     this.stickToBottom = true;
     /* Container was emptied above; re-insert the tracked tail element so the
        status pill survives /clear and new-chat resets. */
@@ -168,7 +182,10 @@ export class MessageListRenderer {
        another upsert clearing the same content element. GC the map entry once
        the chain settles so long-lived sessions don't leak. */
     const prev = this.renderChains.get(msg.id) ?? Promise.resolve();
-    const next = prev.then(() => this.doUpsert(msg));
+    /* Snapshot the generation now, before the chain resolves: if reset() runs
+       while this upsert is queued, doUpsert sees the mismatch and bails. */
+    const gen = this.generation;
+    const next = prev.then(() => this.doUpsert(msg, gen));
     this.renderChains.set(msg.id, next);
     next.finally(() => {
       if (this.renderChains.get(msg.id) === next) this.renderChains.delete(msg.id);
@@ -196,7 +213,11 @@ export class MessageListRenderer {
     this.renderChains.delete(id);
   }
 
-  private async doUpsert(msg: ChatMessage) {
+  private async doUpsert(msg: ChatMessage, gen: number) {
+    /* Bail before createBubble if a reset() ran while this upsert was queued.
+       Without this the missing liveEls entry would route us through createBubble
+       and re-append a bubble to the cleared container — a zombie message. */
+    if (gen !== this.generation) return;
     let entry = this.liveEls.get(msg.id);
     if (!entry) {
       entry = this.createBubble(msg);
@@ -402,6 +423,9 @@ export class MessageListRenderer {
     const wrapper = this.container.createDiv({
       cls: `claudian-message-wrapper claudian-message-wrapper-${msg.role}`,
     });
+    if (msg.role === "user" && msg.attachedNotePaths && msg.attachedNotePaths.length > 0) {
+      this.renderAttachedNoteFlags(wrapper, msg.attachedNotePaths);
+    }
     if (msg.role === "user" && msg.selectionContext) {
       this.renderSelectionFlag(wrapper, msg.selectionContext);
     }
@@ -427,6 +451,72 @@ export class MessageListRenderer {
       : `lines ${ctx.startLine}–${ctx.endLine}`;
     flag.createSpan({ cls: "claudian-selection-flag-text", text: `Selected from ${fileName} · ${range}` });
     flag.setAttr("title", `${ctx.filePath} · ${range}`);
+  }
+
+  /* Note pills rendered above the user's bubble, one per file/folder that was
+     pinned in the file-pill bar when the message was sent. Echoes the
+     composer's pill (file-text icon, brand tint) so the connection reads as
+     "the note I attached rode along with this turn". The bubble itself stays
+     clean — only the user's typed text shows inside it. Clicking a pill opens
+     the note.
+
+     Once the count reaches NOTE_COLLAPSE_THRESHOLD the row collapses behind a
+     single "📎 N notes" summary pill so the header stays compact; clicking it
+     toggles the full list. Below the threshold every note shows as its own
+     pill. */
+  private renderAttachedNoteFlags(parent: HTMLElement, paths: string[]) {
+    const row = parent.createDiv({ cls: "claudian-attached-note-flags" });
+
+    if (paths.length < MessageListRenderer.NOTE_COLLAPSE_THRESHOLD) {
+      for (const path of paths) this.renderNotePill(row, path);
+      return;
+    }
+
+    /* Collapsed: a single summary pill that toggles the expanded list below. */
+    const summary = row.createDiv({ cls: "claudian-attached-note-summary" });
+    const iconEl = summary.createSpan({ cls: "claudian-attached-note-flag-icon" });
+    setIcon(iconEl, "paperclip");
+    summary.createSpan({ cls: "claudian-attached-note-flag-text", text: `${paths.length} notes` });
+    const chevron = summary.createSpan({ cls: "claudian-attached-note-chevron" });
+    setIcon(chevron, "chevron-down");
+
+    const expanded = row.createDiv({ cls: "claudian-attached-note-expanded" });
+    for (const path of paths) this.renderNotePill(expanded, path);
+
+    const setTitle = (open: boolean) =>
+      summary.setAttr("title", `${paths.length} notes attached as context · click to ${open ? "collapse" : "expand"}`);
+    setTitle(false);
+    summary.addEventListener("click", e => {
+      e.stopPropagation();
+      const next = !row.hasClass("is-expanded");
+      row.toggleClass("is-expanded", next);
+      setTitle(next);
+      if (next) this.scrollToBottom();
+    });
+  }
+
+  /* One attached-note pill — file/folder icon + basename, clicking a file
+     opens it in a new tab. Shared by the inline (below-threshold) and the
+     expanded (collapsed-summary) layouts. */
+  private renderNotePill(container: HTMLElement, path: string) {
+    const flag = container.createDiv({ cls: "claudian-attached-note-flag" });
+    const iconEl = flag.createSpan({ cls: "claudian-attached-note-flag-icon" });
+    const node = this.app.vault.getAbstractFileByPath(path);
+    if (node instanceof TFolder) {
+      flag.addClass("is-folder");
+      setIcon(iconEl, "folder");
+    } else {
+      const ext = path.split(".").pop() ?? "";
+      setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
+    }
+    const fileName = path.split("/").pop() ?? path;
+    flag.createSpan({ cls: "claudian-attached-note-flag-text", text: fileName });
+    flag.setAttr("title", `Attached as context: ${path}`);
+    flag.addEventListener("click", e => {
+      e.stopPropagation();
+      if (node instanceof TFolder) return;
+      void this.app.workspace.openLinkText(path, "", "tab");
+    });
   }
 
   /* Per-message action toolbar — hidden until the message is hovered. Has a

@@ -37,6 +37,7 @@ type StoredMessage = {
   durationMs?: number;
   thinking?: string;
   selectionContext?: ChatMessage["selectionContext"];
+  attachedNotePaths?: string[];
 };
 
 type TabMeta = {
@@ -58,6 +59,11 @@ export class Persistence {
   /* Per-tab in-flight save promise. Used by deleteTab/flush to await a save
      that's already started before issuing remove() or returning. */
   private inflightSaves = new Map<string, Promise<void>>();
+  /* Last index payload written to disk (serialized). saveIndex is called once
+     per streaming token via onStateChange, but the index only changes on tab
+     add/remove/select, a title-gen result, or a sessionId landing. Dedupe on
+     the serialized form so token-rate calls do zero disk I/O. */
+  private lastIndexJson: string | null = null;
 
   constructor(private app: App) {}
 
@@ -122,29 +128,45 @@ export class Persistence {
   }
 
   async saveIndex(index: TabIndex): Promise<void> {
-    await this.ensureDirs();
-    await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
+    /* Content-dedupe: the index payload is identical on virtually every
+       streaming token, so skip the atomic rewrite when nothing changed.
+       Setting lastIndexJson before the await is intentional — the synchronous
+       compare-and-set must complete before any concurrent call's microtask so
+       the per-token flood is suppressed; the catch reverts so a transient
+       failure retries on the next state change rather than being masked. */
+    const json = JSON.stringify(index);
+    if (json === this.lastIndexJson) return;
+    this.lastIndexJson = json;
+    try {
+      await this.ensureDirs();
+      await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
+    } catch (err) {
+      this.lastIndexJson = null;
+      throw err;
+    }
   }
 
   /* Debounced per-tab write. Coalesces rapid streaming updates so we write
-     at most once every 500ms per tab. The TabState is snapshotted at
-     schedule time so a later mutation (or destroy) doesn't corrupt the
-     write payload mid-flight. */
+     at most once every 500ms per tab. The TabState is snapshotted synchronously
+     at write time (when the timer fires), still immediately before saveTab's
+     async work, so a later mutation (or destroy) can't corrupt the write
+     payload mid-flight. Cloning at schedule time instead would clone on every
+     token only to discard all but the last snapshot before a quiet period. */
   scheduleSaveTab(state: TabState): void {
     const existing = this.pendingWrites.get(state.id);
     if (existing) clearTimeout(existing.handle);
-    const snapshot = this.snapshotState(state);
     const handle = setTimeout(() => {
       this.pendingWrites.delete(state.id);
-      void this.saveTab(snapshot);
+      void this.saveTab(this.snapshotState(state));
     }, 500);
-    this.pendingWrites.set(state.id, { handle, state: snapshot });
+    this.pendingWrites.set(state.id, { handle, state });
   }
 
   /* Shallow-clone the persisted-relevant fields into a fresh object so
-     a tab destroy or message mutation between schedule and flush doesn't
-     surface as a torn write. messages is array-cloned with each entry
-     shallow-cloned too, since streaming mutates entry.content in place. */
+     a tab destroy or message mutation between this synchronous snapshot and
+     saveTab's async work doesn't surface as a torn write. messages is
+     array-cloned with each entry shallow-cloned too, since streaming mutates
+     entry.content in place. */
   private snapshotState(state: TabState): TabState {
     return {
       id: state.id,
@@ -199,6 +221,7 @@ export class Persistence {
         durationMs: m.durationMs,
         thinking: m.thinking,
         selectionContext: m.selectionContext,
+        attachedNotePaths: m.attachedNotePaths,
       })),
       messageCount: state.messages.length,
       model: state.model,
@@ -253,7 +276,7 @@ export class Persistence {
     const triggered: Promise<void>[] = [];
     for (const { handle, state } of pending) {
       clearTimeout(handle);
-      triggered.push(this.saveTab(state));
+      triggered.push(this.saveTab(this.snapshotState(state)));
     }
     /* Await both the writes we just triggered AND any already-running
        saves dispatched by prior timer fires. Snapshotting inflightSaves

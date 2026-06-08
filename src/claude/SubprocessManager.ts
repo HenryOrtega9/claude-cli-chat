@@ -360,7 +360,14 @@ export class SubprocessManager {
 
   spawn(tabId: string, opts: SpawnOptions): TabSession {
     const existing = this.sessions.get(tabId);
-    if (existing && existing.status !== "exited") return existing;
+    /* A spawn-level failure (ENOENT on a wrong/missing claudePath, EACCES,
+       etc.) leaves the session in status "error" and Node fires only the
+       child 'error' event, never 'exit' — so the onExit reaper below never
+       runs and the dead session lingers in `sessions`. Treat "error" as
+       terminal alongside "exited" so the next attempt replaces it. The
+       `this.sessions.set` below overwrites the stale entry; the failed
+       child never started, so no manual delete or dispose is needed. */
+    if (existing && existing.status !== "exited" && existing.status !== "error") return existing;
     const session = new TabSession(tabId, opts);
     session.onExit(() => {
       const current = this.sessions.get(tabId);
