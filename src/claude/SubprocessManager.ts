@@ -165,6 +165,13 @@ export class TabSession {
       console.warn(`[claude-cli-chat] stderr:`, chunk);
       for (const cb of this.stderrListeners) cb(chunk);
     });
+    /* Read-side stream errors (EIO/EPIPE after an abnormal child death)
+       emit 'error' on the stream object itself — the child-level 'error'
+       handler below only covers spawn failures. Unhandled, they become an
+       uncaught exception in the renderer. stdout's handler lives in
+       StreamJsonParser.attach; stdin write errors are absorbed by
+       InputWriter's per-write callbacks. */
+    this.child.stderr.on("error", err => console.warn(`[claude-cli-chat] stderr stream error:`, err));
 
     this.child.on("error", err => {
       console.error(`[claude-cli-chat] child error:`, err);
@@ -294,7 +301,11 @@ export class TabSession {
   onStderr(cb: StderrListener) { this.stderrListeners.push(cb); }
 
   async dispose(): Promise<void> {
-    if (this.status === "exited") return;
+    /* "error" means the child never started (synchronous spawn failure —
+       ENOENT/EACCES). There is no process to SIGTERM and no 'exit' event
+       will ever fire, so falling through would block the full 2s timeout
+       for nothing on every disposal of a failed tab. */
+    if (this.status === "exited" || this.status === "error") return;
     this.writer.closeStdin();
     return new Promise(resolve => {
       /* `status` flips to "exited" asynchronously inside the 'exit' handler, so

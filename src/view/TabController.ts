@@ -38,6 +38,7 @@ import type {
   ThinkingBlock,
   ControlRequestEvent,
   ResultEvent,
+  RateLimitEvent,
   ErrorEvent,
   ImageBlock,
   DocumentBlock,
@@ -396,8 +397,24 @@ export class TabController {
     try {
       const s = this.session;
       this.session = null;
+      if (s && reason === "restart") {
+        /* A control_request can be in flight when the user flips the model/
+           effort/permission-mode pill (setBusy only disables Send, not the
+           pills). The fresh subprocess knows nothing about the old request,
+           so deny it best-effort BEFORE dispose (the denial rides the write
+           chain that closeStdin flushes). Without this the entry ghosts in
+           pendingApprovals forever: hasPendingApprovals() keeps the tab
+           badge lit and the orphaned card's Allow/Deny no-op against the
+           nulled session. */
+        for (const requestId of Array.from(this.state.pendingApprovals.keys())) {
+          try { s.deny(requestId, "Session restarted"); } catch { /* ignore — best-effort */ }
+        }
+      }
       if (s) {
         try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
+      }
+      if (reason === "restart") {
+        this.state.pendingApprovals.clear();
       }
       /* The CLI writes an `ai-title` residue file even under
          --no-session-persistence. Once the process has exited (dispose above
@@ -423,7 +440,7 @@ export class TabController {
         this.state.busy = false;
         this.inputBox.setBusy(false);
       }
-      if (reason === "cancel" || reason === "clear" || reason === "destroy") {
+      if (reason === "cancel" || reason === "restart" || reason === "clear" || reason === "destroy") {
         this.approvalArea.dismissAll();
       }
     } finally {
@@ -1275,6 +1292,10 @@ export class TabController {
         await this.handleError(event as ErrorEvent);
         break;
       }
+      case "rate_limit_event": {
+        this.handleRateLimit(event as RateLimitEvent);
+        break;
+      }
       default:
         break;
     }
@@ -1692,12 +1713,33 @@ export class TabController {
     StateEmitter.setState("needs_permission");
   }
 
-  private handleResult(_event: ResultEvent) {
+  private handleResult(event: ResultEvent) {
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
     this.clearStreamingPointer();
     this.passStartedAt = null;
+    /* Turn-level failures (error_max_turns, error_during_execution,
+       error_budget_exhausted, …) arrive through this same result event —
+       there is no separate top-level error event for them. Surface a bubble
+       directly here rather than via handleError, whose errorBubbleEmitted
+       dedup could swallow it if a prior error event already fired this
+       session. Without this the conversation just stops dead with no
+       indication anything failed. */
+    const turnFailed = event.is_error === true ||
+      (typeof event.subtype === "string" && event.subtype.startsWith("error"));
+    if (turnFailed) {
+      const label = typeof event.subtype === "string" && event.subtype !== "success" ? event.subtype : "error";
+      const detail = typeof event.result === "string" && event.result ? ` — ${event.result}` : "";
+      const errorMsg: ChatMessage = {
+        id: makeMessageId(),
+        role: "assistant",
+        content: `**Turn failed (${label})**${detail}`,
+        timestamp: Date.now(),
+      };
+      this.state.messages.push(errorMsg);
+      void this.renderer.upsertMessage(errorMsg);
+    }
     /* Turn-end reconciliation for any still-running tools. If the model
        produced a final synthesis (we're in handleResult), every tool it relied
        on must have returned a tool_result — otherwise the model couldn't have
@@ -1706,7 +1748,9 @@ export class TabController {
        synthetic user envelope, a state restore mid-turn, or a result that
        arrived before its tool_use registered). Without a sweep those tools
        linger at status=running, spinning forever — and for Task/Agent tools,
-       leaving the Agents pill stuck on a non-zero count. Force-close them. */
+       leaving the Agents pill stuck on a non-zero count. Force-close them —
+       as errored when the turn itself failed, since a dead turn never
+       finished its tools. */
     let swept = 0;
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
@@ -1714,9 +1758,10 @@ export class TabController {
       for (const t of m.toolCalls) {
         if (t.status !== "running") continue;
         if (t.name === "Task" || t.name === "Agent") {
-          t.status = "completed";
+          t.status = turnFailed ? "errored" : "completed";
+          if (turnFailed) t.isError = true;
           if (t.nestedStatus !== "completed" && t.nestedStatus !== "failed") {
-            t.nestedStatus = "completed";
+            t.nestedStatus = turnFailed ? "failed" : "completed";
           }
           /* This tool never received its tool_result, so handleToolResult never
              ran to stop its subagent tracker. Stop it here, or the tracker's
@@ -1733,7 +1778,8 @@ export class TabController {
           /* A regular tool (Bash, Read, Edit, MCP, …) still running at the
              turn-terminal result event will never get a tool_result either, so
              close it too — otherwise its row keeps spinning for the tab's life. */
-          t.status = "completed";
+          t.status = turnFailed ? "errored" : "completed";
+          if (turnFailed) t.isError = true;
         }
         touched = true;
       }
@@ -1743,8 +1789,9 @@ export class TabController {
     if (swept > 0) this.refreshRunningAgentCount();
     /* Turn settled. StateEmitter auto-transitions complete -> ready after
        10s (matches the daemon's COMPLETE_TIMEOUT_S), and the animator daemon
-       times ready -> idle after 60s. */
-    StateEmitter.setState("complete");
+       times ready -> idle after 60s. A failed turn goes straight to ready —
+       "complete" on the TC001 would misreport the failure as success. */
+    StateEmitter.setState(turnFailed ? "ready" : "complete");
     /* Do NOT use event.usage here — it sums across every API call in the
        turn (each tool round-trip counts the shared context again), inflating
        the displayed token count. handleAssistant updates the indicator
@@ -1862,6 +1909,31 @@ export class TabController {
     this.onStateChangeCb();
   }
 
+  /* Rate-limit telemetry. "allowed" is the steady-state no-op; warning and
+     blocked are surfaced via Notice (the same channel other non-fatal
+     signals use) — without it the user just sees the turn stall with no
+     hint that a cap was hit or when it resets. */
+  private handleRateLimit(event: RateLimitEvent) {
+    const info = event.rate_limit_info;
+    if (!info || info.status === "allowed") return;
+    if (info.status !== "warning" && info.status !== "blocked") return;
+    const cap = info.rateLimitType === "five_hour" ? "5-hour limit"
+      : info.rateLimitType === "seven_day" ? "weekly limit"
+      : "rate limit";
+    const verb = info.status === "blocked" ? "reached" : "near";
+    const resetSuffix = info.resetsAt ? ` Resets ${this.formatResetTime(info.resetsAt)}.` : "";
+    const overageSuffix = (info.isUsingOverage || info.overageStatus === "blocked") && info.overageResetsAt
+      ? ` Overage resets ${this.formatResetTime(info.overageResetsAt)}.`
+      : "";
+    new Notice(`Claude ${cap} ${verb}.${resetSuffix}${overageSuffix}`, 8000);
+  }
+
+  /* resetsAt arrives as Unix epoch seconds; tolerate ms just in case. */
+  private formatResetTime(resetsAt: number): string {
+    const ms = resetsAt > 1e12 ? resetsAt : resetsAt * 1000;
+    return new Date(ms).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+  }
+
   private onExit(code: number | null, signal?: NodeJS.Signals | null) {
     if (this.userCancelInitiated) {
       /* Esc-cancel exit. Suppress the crash error and drop a soft italic
@@ -1884,6 +1956,34 @@ export class TabController {
         message: `Claude exited (code=${code}${sigSuffix}) before completing the response.${stderrSuffix}`,
       });
     }
+    /* Crash-path reconciliation, mirroring what cancelStream and
+       handleResult both do but the unexpected-exit path missed: the
+       subprocess is gone, so no still-running tool will ever receive its
+       tool_result. Stop ALL subagent trackers (each holds a JsonlTailer +
+       a session-file claim that would otherwise keep polling disk until
+       the next teardownSession, possibly many turns away), flip running
+       tool rows to errored so they stop spinning, and refresh the Agents
+       pill so its running count doesn't stick. Idempotent on the teardown-
+       driven exits (cancel/restart/clear), where the maps are already
+       empty and no tools are left running. */
+    for (const tracker of this.subagentTrackers.values()) {
+      void tracker.stop();
+    }
+    this.subagentTrackers.clear();
+    this.subagentSpawnTimes.clear();
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      let touched = false;
+      for (const t of m.toolCalls) {
+        if (t.status !== "running") continue;
+        t.status = "errored";
+        t.isError = true;
+        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
+        touched = true;
+      }
+      if (touched) void this.renderer.upsertMessage(m);
+    }
+    this.refreshRunningAgentCount();
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();

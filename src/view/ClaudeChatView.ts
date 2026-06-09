@@ -29,11 +29,6 @@ export class ClaudeChatView extends ItemView {
   /* True when this view detected another live window already holding the
      vault lock. We render a placeholder and skip tab restore in that case. */
   private holdingLock = false;
-  /* Last index payload actually written, serialized. saveIndex() fires once
-     per stream delta via the onStateChange callback; the index itself only
-     changes on tab add/remove/select/title/sessionId. Caching the last write
-     lets us short-circuit the redundant atomic tmp-write+rename pairs. */
-  private lastIndexJson: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: ClaudeChatPlugin) {
     super(leaf);
@@ -188,16 +183,17 @@ export class ClaudeChatView extends ItemView {
           sessionId: t.state.sessionId,
         })),
     };
-    /* Skip the write when nothing about the index actually changed. The
-       onStateChange callback calls this once per streaming delta, but the
-       payload only shifts on tab add/remove/select/title/sessionId. Without
-       this guard each delta drives a redundant atomic tmp-write+rename of
-       tabs.json on an iCloud-synced vault. The cache starts null so
-       restoreTabs' explicit final write still goes through. */
-    const json = JSON.stringify(index);
-    if (json === this.lastIndexJson) return;
-    this.lastIndexJson = json;
-    void this.plugin.persistence.saveIndex(index);
+    /* Dedupe against per-streaming-delta calls happens inside
+       persistence.saveIndex (content compare on the serialized payload).
+       A second view-level cache here used to shadow it, but it never
+       reverted on write failure — a transient EACCES/disk-full/iCloud
+       hiccup poisoned it with the failed payload, and every retry with
+       identical content short-circuited before reaching persistence. The
+       persistence-level cache handles failure correctly (reverts to null),
+       so it is the only one. */
+    return this.plugin.persistence.saveIndex(index).catch(err => {
+      console.warn(`[claude-cli-chat] index write failed`, err);
+    });
   }
 
   async onClose() {
@@ -314,8 +310,17 @@ export class ClaudeChatView extends ItemView {
        as PPID=1 orphans (same failure mode that onClose's await pattern
        fixed for the bulk path). */
     await removed.destroy();
-    /* Incognito tabs have nothing on disk — skip the delete entirely. */
-    if (!removed.state.incognito) void this.plugin.persistence.deleteTab(tabId);
+    /* Incognito tabs have nothing on disk — skip the delete entirely.
+       Order matters for the rest: drop the index entry FIRST, then remove
+       the files, and await both. A crash between the two leaves an orphaned
+       conversation file (harmless — listConversations tolerates it) instead
+       of a dangling index entry that restores as a phantom blank tab. The
+       tab is already spliced out above, so saveIndex writes the index
+       without it. */
+    if (!removed.state.incognito) {
+      await this.saveIndex();
+      await this.plugin.persistence.deleteTab(tabId);
+    }
     /* Clear the orphaned "thinking" heartbeat back to "ready" — but only when
        no surviving tab is itself busy, so closing one streaming tab doesn't
        blank the device while another is still working. */
@@ -346,15 +351,19 @@ export class ClaudeChatView extends ItemView {
      any file written while it was a normal empty tab (createTab wrote an index
      entry; a debounced body write may also be in flight). Turning OFF resumes
      normal persistence. saveIndex() re-derives the filtered index either way. */
-  private onIncognitoToggle(tabId: string, incognito: boolean) {
+  private async onIncognitoToggle(tabId: string, incognito: boolean) {
     const tab = this.tabs.find(t => t.state.id === tabId);
-    if (incognito) {
-      void this.plugin.persistence.deleteTab(tabId);
-    } else if (tab) {
-      this.plugin.persistence.scheduleSaveTab(tab.state);
-    }
-    this.saveIndex();
     this.renderTabBar();
+    if (incognito) {
+      /* Same ordering as closeTab: rewrite the index (which now filters
+         this tab out) BEFORE removing its files, so a crash between the
+         two can't leave a dangling index entry. */
+      await this.saveIndex();
+      await this.plugin.persistence.deleteTab(tabId);
+    } else {
+      if (tab) this.plugin.persistence.scheduleSaveTab(tab.state);
+      await this.saveIndex();
+    }
   }
 
   private clearActiveTab() {

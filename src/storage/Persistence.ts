@@ -64,6 +64,13 @@ export class Persistence {
      add/remove/select, a title-gen result, or a sessionId landing. Dedupe on
      the serialized form so token-rate calls do zero disk I/O. */
   private lastIndexJson: string | null = null;
+  /* Most recent saveIndex dispatch, rejection pre-swallowed. The view fires
+     saveIndex fire-and-forget, so without this handle flush() (the unload
+     path) has no way to await a still-in-flight index write — a tab
+     close/title/sessionId change landing right before quit would be lost,
+     leaving tabs.json referencing deleted files (phantom blank tab on next
+     load). */
+  private lastIndexWrite: Promise<void> = Promise.resolve();
 
   constructor(private app: App) {}
 
@@ -137,13 +144,20 @@ export class Persistence {
     const json = JSON.stringify(index);
     if (json === this.lastIndexJson) return;
     this.lastIndexJson = json;
-    try {
-      await this.ensureDirs();
-      await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
-    } catch (err) {
-      this.lastIndexJson = null;
-      throw err;
-    }
+    const write = (async () => {
+      try {
+        await this.ensureDirs();
+        await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
+      } catch (err) {
+        this.lastIndexJson = null;
+        throw err;
+      }
+    })();
+    /* Track the dispatch so flush() can await it on unload. Swallow the
+       rejection on the tracked copy only — callers awaiting saveIndex still
+       see the error. */
+    this.lastIndexWrite = write.catch(() => undefined);
+    return write;
   }
 
   /* Debounced per-tab write. Coalesces rapid streaming updates so we write
@@ -232,16 +246,21 @@ export class Persistence {
       stickyPinnedFilePaths: state.stickyPinnedFilePaths,
     };
     const adapter = this.app.vault.adapter;
-    await writeJsonAtomic(adapter, this.convPath(state.id), stored);
     /* Sidecar meta file lets listConversations skip the full body read.
        Written atomically too so a crash mid-rotation never leaves the
-       History dropdown reading half-written JSON. */
+       History dropdown reading half-written JSON. Meta is written FIRST:
+       the pair isn't atomic, and listConversations treats an existing meta
+       as authoritative — a crash between the two writes with meta-first
+       leaves the History dropdown at worst one save optimistic, whereas
+       body-first left it stale indefinitely (the fallback body read only
+       runs when the meta file is entirely absent). */
     const meta: TabMeta = {
       title: stored.title,
       updatedAt: stored.updatedAt,
       messageCount: stored.messages.length,
     };
     await writeJsonAtomic(adapter, this.metaPath(state.id), meta);
+    await writeJsonAtomic(adapter, this.convPath(state.id), stored);
   }
 
   async deleteTab(id: string): Promise<void> {
@@ -292,6 +311,11 @@ export class Persistence {
     if (failed.length > 0) {
       console.warn(`[claude-cli-chat] ${failed.length} tab write(s) failed during flush`, failed.map(f => f.reason));
     }
+    /* The index is written fire-and-forget by the view; await the most
+       recent dispatch so a tab add/remove/title/sessionId change landing
+       just before quit isn't truncated mid-write. Rejection is already
+       swallowed on this handle. */
+    await this.lastIndexWrite;
   }
 
   /* List stored tab files (used by the History dropdown). Returns metadata

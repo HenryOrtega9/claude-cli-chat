@@ -11,6 +11,12 @@ export class StreamJsonParser {
   private rawListeners: Array<(line: string) => void> = [];
 
   attach(stream: Readable) {
+    /* Read errors (EIO/EPIPE after the child dies abnormally) emit 'error'
+       on the stream object; readline wraps the stream but does not absorb
+       them. Unhandled, the event escalates to an uncaught exception in the
+       renderer. Attach directly to the stream rather than the Interface so
+       coverage doesn't depend on readline's forwarding behavior. */
+    stream.on("error", err => console.warn(`[claude-cli-chat] stdout stream error:`, err));
     this.rl = createInterface({ input: stream, crlfDelay: Infinity });
     this.rl.on("line", line => this.handleLine(line));
   }

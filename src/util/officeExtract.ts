@@ -48,9 +48,13 @@ async function extractPptxText(buffer: ArrayBuffer): Promise<string> {
   const out: string[] = [];
   for (let i = 0; i < slideFiles.length; i++) {
     const xml = await zip.files[slideFiles[i]].async("string");
-    /* Pull every <a:t>…</a:t> run; order in the XML matches reading order. */
+    /* Pull every <a:t>…</a:t> run; order in the XML matches reading order.
+       The attr part must not end in `/`: a bare `[^>]*` also matches the
+       trailing slash of a self-closing `<a:t/>` (empty run), making the
+       open-tag branch swallow everything up to the NEXT closing tag and
+       dropping real runs. Same guard on every OOXML regex in this file. */
     const runs: string[] = [];
-    const re = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+    const re = /<a:t(?:[^>]*[^/>])?>([\s\S]*?)<\/a:t>/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(xml)) !== null) {
       const txt = decodeXmlEntities(m[1]);
@@ -111,13 +115,20 @@ async function extractXlsxText(buffer: ArrayBuffer): Promise<string> {
   const ssFile = zip.files["xl/sharedStrings.xml"];
   if (ssFile) {
     const xml = await ssFile.async("string");
-    const siRe = /<si\b[^>]*>([\s\S]*?)<\/si>/g;
+    /* Excel emits empty entries as self-closing <si/>. The first branch's
+       attr group is constrained to not end in `/` so those fall through to
+       the explicit second branch instead of lazily swallowing every
+       following <si> up to the next </si> — which would shift every
+       subsequent shared-string index and mislabel every string cell. The
+       self-closing branch still contributes an empty string (m[1] is
+       undefined there) to keep indices aligned. */
+    const siRe = /<si\b(?:[^>]*[^/>])?>([\s\S]*?)<\/si>|<si\b[^>]*\/>/g;
     let m: RegExpExecArray | null;
     while ((m = siRe.exec(xml)) !== null) {
-      const tRe = /<t[^>]*>([\s\S]*?)<\/t>/g;
+      const tRe = /<t(?:[^>]*[^/>])?>([\s\S]*?)<\/t>/g;
       const parts: string[] = [];
       let t: RegExpExecArray | null;
-      while ((t = tRe.exec(m[1])) !== null) parts.push(decodeXmlEntities(t[1]));
+      while ((t = tRe.exec(m[1] ?? "")) !== null) parts.push(decodeXmlEntities(t[1]));
       sharedStrings.push(parts.join(""));
     }
   }
@@ -150,13 +161,20 @@ async function extractXlsxText(buffer: ArrayBuffer): Promise<string> {
 
     /* Walk rows; build a sparse grid keyed by column index to preserve
        column alignment for cells that span gaps (e.g. only A and C used). */
-    const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+    /* Self-closing <row/> (an empty row) must not match the open-tag form,
+       or it absorbs all following rows up to the next </row>. Empty rows
+       carry no cells, so skipping them entirely is correct. */
+    const rowRe = /<row\b(?:[^>]*[^/>])?>([\s\S]*?)<\/row>/g;
     const rows: string[][] = [];
     let maxCol = -1;
     let r: RegExpExecArray | null;
     while ((r = rowRe.exec(xml)) !== null) {
       const cells: string[] = [];
-      const cellRe = /<c\b([^>]*)>([\s\S]*?)<\/c>|<c\b([^>]*)\/>/g;
+      /* Styled-but-empty cells are routinely emitted self-closing
+         (<c r="A1" s="5"/>). Constrain the first branch so they hit the
+         dedicated self-closing branch instead of stealing the next real
+         cell's body (which shifted values and dropped cells silently). */
+      const cellRe = /<c\b((?:[^>]*[^/>])?)>([\s\S]*?)<\/c>|<c\b([^>]*)\/>/g;
       let c: RegExpExecArray | null;
       while ((c = cellRe.exec(r[1])) !== null) {
         const attrs = c[1] ?? c[3] ?? "";
@@ -170,7 +188,7 @@ async function extractXlsxText(buffer: ArrayBuffer): Promise<string> {
           const v = body.match(/<v>([\s\S]*?)<\/v>/);
           if (v) value = sharedStrings[parseInt(v[1], 10)] ?? "";
         } else if (type === "inlineStr") {
-          const t = body.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+          const t = body.match(/<t(?:[^>]*[^/>])?>([\s\S]*?)<\/t>/);
           if (t) value = decodeXmlEntities(t[1]);
         } else {
           const v = body.match(/<v>([\s\S]*?)<\/v>/);

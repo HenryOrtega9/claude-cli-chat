@@ -133,6 +133,13 @@ export default class ClaudeChatPlugin extends Plugin {
     StateEmitter.dispose();
     await this.persistence?.flush();
     await this.subprocessManager.killAll();
+    /* killAll's RC dispose gives the PTY proxy only ~1.5s between SIGTERM
+       and SIGKILL. The proxy forwards the SIGTERM to the inner
+       `claude remote-control` immediately, but if that process needs longer
+       than the window for network teardown, the proxy dies first and the
+       survivor is reparented to launchd. Run the same orphan sweep the
+       settings panel uses so plugin disable/reload never leaks one. */
+    try { await this.subprocessManager.killAllRemoteAndOrphans(); } catch { /* best-effort */ }
   }
 
   getVaultPath(): string {

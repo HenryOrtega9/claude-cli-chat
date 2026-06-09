@@ -177,6 +177,16 @@ export class RemoteControlSession {
     this.child.stdout.on("data", chunk => this.handleStdout(chunk));
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", chunk => console.warn(`[claude-cli-chat] RC stderr:`, chunk));
+    /* Absorb async stream errors on all three stdio pipes. EIO/EPIPE after
+       the PTY proxy dies abnormally (or a concurrent dispose tears the
+       streams down mid-callback) emits 'error' on the stream object itself.
+       The process-level 'error' handler below only covers spawn failures,
+       and an unhandled stream 'error' crashes the renderer. stdin matters
+       most: the trust-prompt auto-confirm write below has no per-write
+       callback chain like InputWriter's. */
+    this.child.stdin.on("error", err => console.warn(`[claude-cli-chat] RC stdin error:`, err));
+    this.child.stdout.on("error", err => console.warn(`[claude-cli-chat] RC stdout error:`, err));
+    this.child.stderr.on("error", err => console.warn(`[claude-cli-chat] RC stderr error:`, err));
 
     this.child.on("error", err => {
       console.error(`[claude-cli-chat] RC error:`, err);
@@ -268,7 +278,14 @@ export class RemoteControlSession {
     if (!this.trustConfirmed && TRUST_PROMPT_PATTERN.test(this.stdoutBuffer)) {
       this.trustConfirmed = true;
       console.log(`[claude-cli-chat] RC auto-confirming trust prompt`);
-      try { this.child.stdin.write("\r"); } catch { /* ignore */ }
+      /* A bare try/catch can't intercept the ASYNC 'error' a broken pipe
+         emits (proxy exited between the stdout chunk and this handler
+         running). Guard on writability and hand write() a callback so the
+         failure is delivered there (and to the stdin 'error' listener)
+         instead of as an uncaught exception. */
+      if (this.child.stdin.writable) {
+        this.child.stdin.write("\r", () => { /* errors land in the stdin 'error' handler */ });
+      }
     }
 
     this.tryCaptureSessionId();
