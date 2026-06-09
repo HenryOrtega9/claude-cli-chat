@@ -1796,6 +1796,14 @@ mark.claudian-search-mark.is-active {
 .claudian-popup-row.is-selected .claudian-popup-row-sublabel {
   color: var(--text-muted);
 }
+/* Model rows that carry an availability caveat (MODEL_NOTES) wrap the note
+   under the label instead of letting it stretch the popup wider than the
+   composer. */
+.claudian-popup-model .claudian-popup-row-sublabel {
+  max-width: 220px;
+  white-space: normal;
+  line-height: 1.3;
+}
 
 /* ---- Attach popup (+ button) ----------------------------- */
 /* Wider than the model/effort popups because trusted-folder rows carry a

@@ -2,6 +2,7 @@ import { setIcon, Notice } from "obsidian";
 import {
   MODEL_LABELS,
   MODEL_GROUPS,
+  MODEL_NOTES,
   EFFORT_LABELS,
   effortLevelsForModel,
   contextWindowForModel,
@@ -1140,7 +1141,16 @@ export class InputBox {
         const img = icon.createEl("img");
         img.src = CLAUDE_ASTERISK_DATA_URI;
         img.alt = "";
-        row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+        const note = MODEL_NOTES[key];
+        if (note) {
+          /* Models with an availability caveat stack label over the note,
+             reusing the icon + labels-column shell from folder rows. */
+          const labels = row.createDiv({ cls: "claudian-popup-row-labels" });
+          labels.createDiv({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+          labels.createDiv({ cls: "claudian-popup-row-sublabel", text: note });
+        } else {
+          row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+        }
         row.addEventListener("click", e => {
           e.stopPropagation();
           this.selectModel(key);

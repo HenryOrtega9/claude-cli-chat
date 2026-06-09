@@ -35,6 +35,7 @@ function debounced<A extends unknown[]>(fn: (...args: A) => void, ms: number): (
    itself does the model selection; the underlying Opus path still gets
    1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
+  "fable-5": "claude-fable-5[1m]",
   "opus-1m": "claude-opus-4-8[1m]",
   "opus-4-7-1m": "claude-opus-4-7[1m]",
   "opus-4-6-1m": "claude-opus-4-6[1m]",
@@ -46,6 +47,7 @@ export const MODEL_IDS = {
 export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
+  "fable-5": "Fable 5 1M",
   "opus-1m": "Opus 4.8 1M",
   "opus-4-7-1m": "Opus 4.7 1M",
   "opus-4-6-1m": "Opus 4.6 1M",
@@ -54,11 +56,26 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
   "haiku": "Haiku",
 };
 
+/* Availability caveats surfaced under the model name in the picker popup
+   and appended to the settings dropdown. fable-5 is a fresh release (June
+   2026) whose subscription-plan access is not guaranteed past 2026-06-22.
+   If Anthropic pulls it, delete the "fable-5" entries here and in
+   MODEL_IDS/MODEL_LABELS/MODEL_GROUPS — the defaultModel guard in main.ts
+   and the per-tab ModelKey guard in TabController fall back gracefully for
+   anyone who had it persisted. 1M context and xhigh effort are confirmed
+   supported, so it carries the `[1m]` suffix and the full effort ladder
+   like the Opus 1M variants. */
+export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
+  "fable-5": "New release. Subscription access may end after Jun 22, 2026.",
+};
+
 /* Ordered sections for the model-picker popup; each renders under its own
-   header. Opus variants (including the opus-plan alias, which routes to Opus)
-   are grouped together, then Sonnet, then Haiku. Keep in sync with MODEL_IDS:
-   every ModelKey must appear in exactly one group. */
+   header. Fable (the newest family) leads, then Opus variants (including
+   the opus-plan alias, which routes to Opus), then Sonnet, then Haiku.
+   Keep in sync with MODEL_IDS: every ModelKey must appear in exactly one
+   group. */
 export const MODEL_GROUPS: { header: string; keys: ModelKey[] }[] = [
+  { header: "FABLE", keys: ["fable-5"] },
   { header: "OPUS", keys: ["opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
   { header: "SONNET", keys: ["sonnet-1m"] },
   { header: "HAIKU", keys: ["haiku"] },
@@ -78,10 +95,11 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   Opus today (Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which routes to
-   Opus when in plan mode); everything else shows the standard four. */
+   Fable 5 and Opus today (Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which
+   routes to Opus when in plan mode); everything else shows the standard
+   four. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan") return EFFORT_ORDER;
+  if (model === "fable-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
@@ -91,7 +109,7 @@ export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
    resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "fable-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 
@@ -318,11 +336,12 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Default model")
-      .setDesc("Sonnet 1M and Opus 1M use the 1M-context window via the `[1m]` model suffix. Haiku has standard context.")
+      .setDesc("Fable 5, Sonnet 1M, and Opus 1M use the 1M-context window via the `[1m]` model suffix. Haiku has standard context.")
       .addDropdown(dd => {
         const options: Record<string, string> = {};
         for (const key of Object.keys(MODEL_LABELS) as ModelKey[]) {
-          options[key] = `${MODEL_LABELS[key]} (${MODEL_IDS[key]})`;
+          const note = MODEL_NOTES[key];
+          options[key] = `${MODEL_LABELS[key]} (${MODEL_IDS[key]})${note ? ` - ${note}` : ""}`;
         }
         dd.addOptions(options)
           .setValue(this.plugin.settings.defaultModel)

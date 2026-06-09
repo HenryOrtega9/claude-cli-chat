@@ -44,7 +44,7 @@ Each of these was a load-bearing bug we hit and fixed. Authoritative reference i
 2. `tool_use` blocks live INSIDE the assistant message's `content[]` array, not as top-level `tool_use` events. Filtering `content` to text-only drops tools silently.
 3. `tool_result` blocks live INSIDE synthetic `user`-type events (`event.type === "user"`, content blocks with `type: "tool_result"`). Missing this leaves tools stuck on "RUNNING" forever.
 4. The `can_use_tool` control_response schema is `{ behavior: "allow", updatedInput }` or `{ behavior: "deny", message }`. Any other shape produces a Zod parse error that the CLI returns as a synthetic tool_result, which the model then narrates as "harness ZodError".
-5. Model `[1m]` suffix gating: Opus 1M supports `xhigh` effort; other models top out at `max`.
+5. Model `[1m]` suffix gating: Opus 1M and Fable 5 1M support `xhigh` effort; other models top out at `max`.
 6. `--no-session-persistence` (incognito) suppresses the conversation transcript but the CLI STILL writes a one-line `ai-title` record to `~/.claude/projects/<slug>/<session-id>.jsonl`, and that title summarizes the chat. Neither `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` nor any flag stops it. Incognito tabs therefore delete their own session files on teardown (`TabController.cleanupIncognitoSessionFiles`) rather than trusting the flag alone.
 
 ## Authoritative deeper docs
