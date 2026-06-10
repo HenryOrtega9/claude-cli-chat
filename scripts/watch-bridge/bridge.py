@@ -23,6 +23,19 @@ API (all routes require `Authorization: Bearer <token>`):
                  machinery entirely. Sticky: replayed after respawns.
   POST /reset  -> kill + respawn the claude child (fresh session)
   GET  /health -> {state, session_id, session_file, child_pid, uptime_s}
+  GET  /sessions -> {sessions: [{id, kind, name, cwd, attach, pid,
+                 last_activity, preview}]}. Every live claude process on this
+                 Mac mapped to its JSONL transcript. attach: "bridge" (this
+                 daemon's child), "tmux:<target>" (injectable via send-keys,
+                 e.g. vault-cc), or null (view-only).
+  GET  /sessions/<id>/messages?limit=N -> {session, messages: [{uuid, role,
+                 text, ts}]}. Tail of the transcript, text turns only.
+  POST /sessions/<id>/send {"message": str} -> 200 {ok}. Fire-and-forget
+                 inject; poll messages for the reply. 409 view_only if the
+                 session has no input route.
+  GET  /usage  -> Anthropic OAuth usage buckets (five_hour, seven_day,
+                 seven_day_sonnet, seven_day_omelette, ...), proxied with the
+                 ClaudeUsageBar credentials file and cached 60s.
 
 Config (env):
   WATCH_BRIDGE_PORT            default 8787
@@ -50,6 +63,8 @@ import sys
 import termios
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------- config
@@ -688,6 +703,448 @@ class TurnManager:
             self.busy.release()
 
 
+# ---------------------------------------------------------------- session directory
+
+
+TMUX = "/opt/homebrew/bin/tmux"
+
+
+def _run(argv, timeout=5):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def extract_messages(path, limit=30):
+    """Last `limit` user/assistant text messages from a session JSONL. Reads
+    only the file tail (256KB) so huge transcripts stay cheap. Tool results,
+    meta records, and harness-injected user content are skipped."""
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return []
+    msgs = []
+    try:
+        with open(path, "rb") as f:
+            if size > 262144:
+                f.seek(size - 262144)
+                f.readline()  # drop the partial line at the seek point
+            data = f.read()
+    except OSError:
+        return []
+    for line in data.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("isMeta"):
+            continue
+        rtype = rec.get("type")
+        msg = rec.get("message") or {}
+        content = msg.get("content")
+        text = ""
+        if rtype == "user":
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    continue
+                text = "\n".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                )
+            text = text.strip()
+            if not text or text.startswith(("<command-", "<local-command", "Caveat:", "<system-reminder")):
+                continue
+            role = "user"
+        elif rtype == "assistant":
+            if isinstance(content, list):
+                text = "\n".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                ).strip()
+            if not text:
+                continue
+            role = "assistant"
+        else:
+            continue
+        msgs.append({
+            "uuid": rec.get("uuid"),
+            "role": role,
+            "text": text,
+            "ts": rec.get("timestamp"),
+        })
+    return msgs[-limit:]
+
+
+class SessionDirectory:
+    """Discovers live `claude` processes on this Mac and maps each one to its
+    session JSONL, so the watch can list and read any active conversation
+    (vault-cc remote-control sessions included). Input routing: the bridge's
+    own PTY child is attachable natively; a claude running inside a tmux pane
+    is attachable via `tmux send-keys`; anything else is view-only."""
+
+    CACHE_S = 5.0
+
+    def __init__(self, session, turns):
+        self.session = session
+        self.turns = turns
+        self.lock = threading.Lock()
+        self._cached_at = 0.0
+        self._sessions = []
+        self._by_id = {}
+
+    def _ps_table(self):
+        out = _run(["ps", "-axo", "pid=,ppid=,command="])
+        rows = []
+        if not out or out.returncode != 0:
+            return rows
+        for line in out.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                rows.append((int(parts[0]), int(parts[1]), parts[2]))
+            except ValueError:
+                continue
+        return rows
+
+    def _tmux_pane_map(self):
+        """pane_pid -> tmux target usable with send-keys."""
+        out = _run([TMUX, "list-panes", "-a", "-F",
+                    "#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}"])
+        panes = {}
+        if not out or out.returncode != 0:
+            return panes
+        for line in out.stdout.splitlines():
+            try:
+                target, pid = line.rsplit("\t", 1)
+                panes[int(pid)] = target
+            except ValueError:
+                continue
+        return panes
+
+    def _cwd_of(self, pid):
+        out = _run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=10)
+        if not out:
+            return None
+        for line in out.stdout.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+        return None
+
+    def _start_epoch(self, pid):
+        out = _run(["ps", "-p", str(pid), "-o", "lstart="])
+        if not out or not out.stdout.strip():
+            return None
+        try:
+            return time.mktime(time.strptime(out.stdout.strip(), "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            return None
+
+    def _session_file_for(self, cwd, start_epoch, exclude=None):
+        """Newest JSONL in the project slug born after the process started.
+        Same heuristic the plugin uses; ambiguous only when two sessions start
+        in the same cwd within seconds of each other."""
+        proj = project_dir_for(cwd)
+        floor = (start_epoch or 0) - 5
+        best = None
+        try:
+            for name in os.listdir(proj):
+                if not name.endswith(".jsonl"):
+                    continue
+                full = os.path.join(proj, name)
+                if exclude and full == exclude:
+                    continue
+                st = os.stat(full)
+                birth = getattr(st, "st_birthtime", st.st_mtime)
+                if birth < floor:
+                    continue
+                if best is None or birth > best[1]:
+                    best = (full, birth)
+        except OSError:
+            return None
+        return best[0] if best else None
+
+    def refresh(self):
+        rows = self._ps_table()
+        ppid_of = {pid: ppid for pid, ppid, _ in rows}
+        panes = self._tmux_pane_map()
+
+        def tmux_target(pid):
+            seen = set()
+            while pid > 1 and pid not in seen:
+                seen.add(pid)
+                if pid in panes:
+                    return panes[pid]
+                pid = ppid_of.get(pid, 0)
+            return None
+
+        own_file = self.session.session_file
+        sessions = []
+        for pid, _, command in rows:
+            argv = command.split()
+            if not argv or os.path.basename(argv[0]) != "claude":
+                continue
+            if pid == self.session.pid:
+                sessions.append({
+                    "id": self.session.session_id or "watch",
+                    "kind": "watch",
+                    "name": "Watch session",
+                    "cwd": VAULT,
+                    "file": own_file,
+                    "attach": "bridge",
+                    "pid": pid,
+                })
+                continue
+            cwd = self._cwd_of(pid)
+            if not cwd:
+                continue
+            start = self._start_epoch(pid)
+            file = self._session_file_for(cwd, start, exclude=own_file)
+            target = tmux_target(pid)
+            kind = "remote-control" if "remote-control" in command else "terminal"
+            name = os.path.basename(cwd)
+            m = re.search(r"--remote-control\s+(.+)$", command)
+            if m:
+                name = m.group(1).strip().strip("'\"")
+            sessions.append({
+                "id": os.path.basename(file)[:-len(".jsonl")] if file else f"pid-{pid}",
+                "kind": kind,
+                "name": name,
+                "cwd": cwd,
+                "file": file,
+                "attach": f"tmux:{target}" if target else None,
+                "pid": pid,
+            })
+        for s in sessions:
+            s["last_activity"] = None
+            s["preview"] = ""
+            if s["file"]:
+                try:
+                    s["last_activity"] = int(os.stat(s["file"]).st_mtime)
+                except OSError:
+                    pass
+                tail = extract_messages(s["file"], limit=1)
+                if tail:
+                    s["preview"] = tail[-1]["text"][:120]
+        with self.lock:
+            self._cached_at = time.time()
+            self._sessions = sessions
+            self._by_id = {s["id"]: s for s in sessions}
+        return sessions
+
+    def list_sessions(self):
+        with self.lock:
+            fresh = time.time() - self._cached_at < self.CACHE_S
+            cached = list(self._sessions)
+        return cached if fresh else self.refresh()
+
+    def resolve(self, sid):
+        with self.lock:
+            fresh = time.time() - self._cached_at < self.CACHE_S
+            hit = self._by_id.get(sid)
+        # A hit without a transcript yet (or a stale cache) gets re-scanned so
+        # the session file is picked up as soon as it exists.
+        if hit and fresh and hit.get("file"):
+            return hit
+        self.refresh()
+        with self.lock:
+            found = self._by_id.get(sid)
+            if found:
+                return found
+            # The id graduates from pid-<n> to the session uuid once the
+            # transcript appears; keep resolving the old handle by pid.
+            if sid.startswith("pid-"):
+                try:
+                    pid = int(sid[len("pid-"):])
+                except ValueError:
+                    return hit
+                for s in self._sessions:
+                    if s["pid"] == pid:
+                        return s
+            return hit
+
+    @staticmethod
+    def public(s):
+        return {k: v for k, v in s.items() if k != "file"}
+
+    def messages(self, sid, limit):
+        s = self.resolve(sid)
+        if not s:
+            return 404, {"error": "session_not_found"}
+        if not s["file"]:
+            return 200, {"session": self.public(s), "messages": []}
+        return 200, {"session": self.public(s), "messages": extract_messages(s["file"], limit)}
+
+    def send(self, sid, message):
+        s = self.resolve(sid)
+        if not s:
+            return 404, {"error": "session_not_found"}
+        attach = s.get("attach")
+        if attach == "bridge":
+            if self.turns.busy.locked():
+                return 409, {"error": "turn_in_flight"}
+            try:
+                self.session.send(message)
+            except (OSError, RuntimeError) as e:
+                return 503, {"error": f"send_failed: {e}"}
+            return 200, {"ok": True}
+        if attach and attach.startswith("tmux:"):
+            target = attach[len("tmux:"):]
+            # Bracketed paste so embedded newlines don't submit early, then CR.
+            paste = _run([TMUX, "send-keys", "-t", target, "-l",
+                          "\x1b[200~" + message + "\x1b[201~"])
+            if not paste or paste.returncode != 0:
+                err = (paste.stderr.strip() if paste else "tmux unavailable")
+                return 503, {"error": f"send_failed: {err}"}
+            time.sleep(0.3)
+            _run([TMUX, "send-keys", "-t", target, "Enter"])
+            return 200, {"ok": True}
+        return 409, {"error": "view_only"}
+
+
+# ---------------------------------------------------------------- usage limits
+
+
+def _https_context():
+    """The framework Python install has no root CA bundle wired into ssl's
+    defaults, so load certifi's or the system bundle explicitly."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    if os.path.exists("/etc/ssl/cert.pem"):
+        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+    return ssl.create_default_context()
+
+
+class UsageFetcher:
+    """Proxies Anthropic's OAuth usage endpoint for the watch, reusing the
+    ClaudeUsageBar credentials file (and keeping it fresh for both apps, since
+    refreshed tokens are written back to the same file)."""
+
+    CRED_PATH = HOME + "/.config/claude-usage-bar/credentials.json"
+    USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+    TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+    CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    CACHE_S = 60.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._cached_at = 0.0
+        self._cached = None
+        self._ctx = _https_context()
+
+    def fetch(self):
+        with self.lock:
+            if self._cached is not None and time.time() - self._cached_at < self.CACHE_S:
+                return 200, self._cached
+            creds = self._load_creds()
+            if not creds or not creds.get("accessToken"):
+                return 503, {"error": "usage_credentials_missing"}
+            if self._needs_refresh(creds):
+                creds = self._refresh(creds) or creds
+            code, payload = self._get_usage(creds["accessToken"])
+            if code == 401:
+                creds = self._refresh(creds)
+                if not creds:
+                    return 503, {"error": "usage_auth_expired"}
+                code, payload = self._get_usage(creds["accessToken"])
+            if code == 200:
+                self._cached_at = time.time()
+                self._cached = payload
+            return code, payload
+
+    def _load_creds(self):
+        try:
+            with open(self.CRED_PATH) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _parse_expiry(value):
+        if not isinstance(value, str):
+            return 0
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+            try:
+                return time.mktime(time.strptime(value, fmt)) - time.timezone
+            except ValueError:
+                continue
+        return 0
+
+    def _needs_refresh(self, creds):
+        return self._parse_expiry(creds.get("expiresAt")) <= time.time() + 60
+
+    def _get_usage(self, token):
+        req = urllib.request.Request(self.USAGE_URL, headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=self._ctx) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            return e.code, {"error": f"usage_http_{e.code}"}
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            return 502, {"error": f"usage_fetch_failed: {e}"}
+
+    def _refresh(self, creds):
+        refresh_token = creds.get("refreshToken")
+        if not refresh_token:
+            return None
+        body = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self.CLIENT_ID,
+        }
+        scopes = creds.get("scopes") or []
+        if scopes:
+            body["scope"] = " ".join(scopes)
+        req = urllib.request.Request(
+            self.TOKEN_URL,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=self._ctx) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except (OSError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+            log(f"usage token refresh failed: {e}")
+            return None
+        access = data.get("access_token")
+        if not access:
+            return None
+        expires_in = data.get("expires_in") or 3600
+        updated = {
+            "accessToken": access,
+            "refreshToken": data.get("refresh_token") or refresh_token,
+            "expiresAt": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + float(expires_in))
+            ),
+            "scopes": scopes,
+        }
+        try:
+            tmp = self.CRED_PATH + ".watch-bridge.tmp"
+            with open(tmp, "w") as f:
+                json.dump(updated, f, indent=2)
+                f.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.CRED_PATH)
+            log("usage token refreshed")
+        except OSError as e:
+            log(f"usage credentials save failed: {e}")
+        return updated
+
+
 # ---------------------------------------------------------------- http
 
 
@@ -813,7 +1270,11 @@ class StickyCommands:
                     log(f"sticky replay failed for {cmd}: {e}")
 
 
-def make_handler(token, session, turns, sticky, guard, started_at):
+SESSION_MESSAGES_RE = re.compile(r"^/sessions/([A-Za-z0-9._-]+)/messages(?:\?(.*))?$")
+SESSION_SEND_RE = re.compile(r"^/sessions/([A-Za-z0-9._-]+)/send$")
+
+
+def make_handler(token, session, turns, sticky, guard, directory, usage, started_at):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             log(f"http {self.address_string()} {fmt % args}")
@@ -852,6 +1313,22 @@ def make_handler(token, session, turns, sticky, guard, started_at):
                 if turns.last_reply is None:
                     return self._send(404, {"error": "no_reply_yet"})
                 return self._send(200, turns.last_reply)
+            if self.path == "/usage":
+                return self._send(*usage.fetch())
+            if self.path == "/sessions":
+                return self._send(200, {
+                    "sessions": [directory.public(s) for s in directory.list_sessions()]
+                })
+            m = SESSION_MESSAGES_RE.match(self.path)
+            if m:
+                limit = 30
+                for part in (m.group(2) or "").split("&"):
+                    if part.startswith("limit="):
+                        try:
+                            limit = max(1, min(200, int(part[len("limit="):])))
+                        except ValueError:
+                            pass
+                return self._send(*directory.messages(m.group(1), limit))
             self._send(404, {"error": "not_found"})
 
         def do_POST(self):
@@ -896,6 +1373,17 @@ def make_handler(token, session, turns, sticky, guard, started_at):
                 sticky.remember(command)
                 log(f"slash command sent: {command}")
                 return self._send(200, {"ok": True, "command": command})
+            m = SESSION_SEND_RE.match(self.path)
+            if m:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    message = body.get("message", "")
+                except (ValueError, json.JSONDecodeError):
+                    return self._send(400, {"error": "bad_json"})
+                if not isinstance(message, str) or not message.strip():
+                    return self._send(400, {"error": "empty_message"})
+                return self._send(*directory.send(m.group(1), message.strip()))
             self._send(404, {"error": "not_found"})
 
     return Handler
@@ -943,10 +1431,13 @@ def main():
     turns = TurnManager(session, tailer)
     guard = SettingsGuard()
     sticky = StickyCommands(session, guard)
+    directory = SessionDirectory(session, turns)
+    usage = UsageFetcher()
     threading.Thread(target=watchdog, args=(session, turns), daemon=True).start()
 
     server = ThreadingHTTPServer(
-        (bind, PORT), make_handler(token, session, turns, sticky, guard, time.time())
+        (bind, PORT),
+        make_handler(token, session, turns, sticky, guard, directory, usage, time.time()),
     )
     emit_state("ready")
     log("listening")
