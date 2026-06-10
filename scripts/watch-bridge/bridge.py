@@ -430,6 +430,16 @@ class ClaudeSession:
         time.sleep(0.2)
         os.write(fd, b"\r")
 
+    def nudge_submit(self):
+        """Extra CR a moment after a send: a TUI mid-redraw can eat the
+        submit CR, leaving the text sitting in the composer (where the NEXT
+        send would concatenate onto it). If the original CR landed this is an
+        empty-composer no-op; if it was eaten, this submits the command."""
+        try:
+            os.write(self.fd, b"\r")
+        except OSError:
+            pass
+
     def respawn(self):
         with self.lock:
             pid = self.pid
@@ -1260,12 +1270,19 @@ class StickyCommands:
                 pending = list(self.commands.values())
             if not pending:
                 continue
+            # The TUI right after ready() is the riskiest redraw window; give
+            # it a moment, and confirm each command's submit CR before typing
+            # the next one so two commands can never concatenate in the
+            # composer ("/model sonnet[1m]/effort high").
+            time.sleep(2.0)
             for cmd in pending:
                 self.guard.guard()
                 try:
                     self.session.send(cmd)
                     log(f"replayed sticky command: {cmd}")
-                    time.sleep(1.0)
+                    time.sleep(0.8)
+                    self.session.nudge_submit()
+                    time.sleep(1.5)
                 except (OSError, RuntimeError) as e:
                     log(f"sticky replay failed for {cmd}: {e}")
 
@@ -1370,6 +1387,9 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     session.send(command)
                 except (OSError, RuntimeError) as e:
                     return self._send(503, {"error": f"send_failed: {e}"})
+                timer = threading.Timer(0.8, session.nudge_submit)
+                timer.daemon = True
+                timer.start()
                 sticky.remember(command)
                 log(f"slash command sent: {command}")
                 return self._send(200, {"ok": True, "command": command})
