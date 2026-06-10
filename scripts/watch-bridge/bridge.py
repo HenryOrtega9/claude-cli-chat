@@ -17,6 +17,10 @@ API (all routes require `Authorization: Bearer <token>`):
                                    202 {..., partial:true} if the reply budget expires
                                    409 turn in flight / 503 not ready
   GET  /last   -> last completed reply (same shape as 200)
+  POST /command {"command": str} -> 200 {ok}. Fire-and-forget slash command
+                 (allowlist: /model, /effort). These run locally in the CLI
+                 and produce no assistant turn, so they bypass the turn
+                 machinery entirely. Sticky: replayed after respawns.
   POST /reset  -> kill + respawn the claude child (fresh session)
   GET  /health -> {state, session_id, session_file, child_pid, uptime_s}
 
@@ -88,6 +92,12 @@ SESSION_ID_RES = [
 # output often loses the spaces between words; match space-agnostically.
 TRUST_PROMPT_RE = re.compile(r"trust\s*this\s*folder", re.I)
 BYPASS_PROMPT_RE = re.compile(r"Bypass\s*Permissions\s*mode", re.I)
+# Switching model OR effort mid-conversation prompts a confirmation, because
+# the cached history must be re-read ("...the full history gets re-read on
+# your next message. 1. Yes, switch to X / 2. No, go back"). Auto-accept
+# option 1. The cached-history warning is the shared, reliable marker.
+SWITCH_PROMPT_RE = re.compile(r"history\s*gets?\s*re-?read", re.I)
+SWITCH_ACCEPT_RE = re.compile(r"1\.\s*Yes", re.I)
 
 
 def log(msg):
@@ -207,6 +217,7 @@ class ClaudeSession:
         self.first_send_epoch = None
         self._trust_confirmed = False
         self._bypass_confirmed = False
+        self._switch_accept_epoch = 0.0  # debounce model-switch dialog redraws
         self._gen = 0  # respawn generation, lets stale reader threads exit
 
     def spawn(self):
@@ -309,6 +320,19 @@ class ClaudeSession:
                 os.write(fd, b"\r")
             except OSError:
                 pass
+        # The dialog clears as soon as we answer, but the screen redraws a few
+        # times while it's up; debounce so we send a single "1" per dialog.
+        if (SWITCH_PROMPT_RE.search(self.stdout_tail[-1500:])
+                and SWITCH_ACCEPT_RE.search(self.stdout_tail[-1500:])
+                and time.time() - self._switch_accept_epoch > 3):
+            self._switch_accept_epoch = time.time()
+            log("auto-accepting model-switch confirmation")
+            try:
+                os.write(fd, b"1")
+                time.sleep(0.15)
+                os.write(fd, b"\r")
+            except OSError:
+                pass
         if not self._trust_confirmed and TRUST_PROMPT_RE.search(self.stdout_tail):
             self._trust_confirmed = True
             log("auto-confirming trust prompt")
@@ -349,11 +373,16 @@ class ClaudeSession:
                     if not name.endswith(".jsonl"):
                         continue
                     full = os.path.join(proj, name)
-                    mtime = os.stat(full).st_mtime
-                    if mtime < floor:
+                    st = os.stat(full)
+                    # Creation time, not mtime: a dying previous child writes
+                    # a closing record to ITS file right as the new one
+                    # spawns, which put an old file inside the mtime window
+                    # and hijacked reply extraction for the whole session.
+                    birth = getattr(st, "st_birthtime", st.st_mtime)
+                    if birth < floor:
                         continue
-                    if best is None or mtime > best[1]:
-                        best = (full, mtime)
+                    if best is None or birth > best[1]:
+                        best = (full, birth)
                 if best:
                     if not self.session_id:
                         log("session file via mtime fallback (no banner id)")
@@ -491,6 +520,10 @@ class TranscriptTailer:
         with self.lock:
             return len(self.records)
 
+    def assistant_since(self, mark):
+        with self.lock:
+            return any(k == "assistant_text" for (_, k, _) in self.records[mark:])
+
     def reply_since(self, mark):
         """Text of the LAST assistant text message after the mark (skips
         tool-call wrapper messages and thinking, which never produce text
@@ -562,10 +595,30 @@ class TurnManager:
 
             def wait_for_completion():
                 try:
+                    nudged = False
                     while True:
                         if self._stop_signaled(start) or self.tailer.idle_complete(mark):
                             break
                         if not self.session.alive:
+                            break
+                        waited = time.time() - start
+                        landed = self.tailer.mark() > mark
+                        if not nudged and waited > 10 and not self.tailer.assistant_since(mark):
+                            # The submit CR can get swallowed if the TUI was
+                            # mid-redraw (seen after /model switches). An
+                            # empty-composer CR is a no-op, so nudging during
+                            # a slow-but-real turn is harmless.
+                            nudged = True
+                            log("turn: no assistant text 10s after send, re-sending CR")
+                            try:
+                                os.write(self.session.fd, b"\r")
+                            except OSError:
+                                pass
+                        if not landed and waited > 45:
+                            log("turn: message never landed in transcript, aborting turn")
+                            break
+                        if waited > budget_s * 4:
+                            log("turn: absolute ceiling reached, aborting turn")
                             break
                         time.sleep(0.25)
                     # the stop hook can fire before the tailer's next 250ms
@@ -638,7 +691,129 @@ class TurnManager:
 # ---------------------------------------------------------------- http
 
 
-def make_handler(token, session, turns, started_at):
+COMMAND_ALLOWLIST = ("/model", "/effort")
+
+# /model and /effort also persist themselves into ~/.claude/settings.json as
+# the global default for new sessions. The watch picker must stay
+# session-scoped, so snapshot those keys before the command and restore them
+# a few seconds after the CLI has written its update.
+SETTINGS_PATH = HOME + "/.claude/settings.json"
+PERSISTED_COMMAND_KEYS = ("model", "effortLevel")
+_MISSING = object()
+
+
+def settings_snapshot():
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return {k: data.get(k, _MISSING) for k in PERSISTED_COMMAND_KEYS}
+
+
+def settings_restore(snap):
+    if snap is None:
+        return
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    changed = False
+    for k, v in snap.items():
+        if v is _MISSING:
+            if k in data:
+                del data[k]
+                changed = True
+        elif data.get(k) != v:
+            data[k] = v
+            changed = True
+    if not changed:
+        return
+    try:
+        tmp = SETTINGS_PATH + ".watch-bridge.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, SETTINGS_PATH)
+        log("restored persisted model/effort defaults after slash command")
+    except OSError as e:
+        log(f"settings restore failed: {e}")
+
+
+class SettingsGuard:
+    """Keeps the watch's /model and /effort session-scoped: those commands also
+    persist into settings.json as the global default. We snapshot the GENUINE
+    pre-command baseline ONCE per burst (the "Apply" button fires /model then
+    /effort ~1s apart) and restore it after the burst settles. Re-snapshotting
+    per command would capture the first command's own persisted change as the
+    baseline, re-polluting the global default — the bug this class exists to
+    avoid."""
+
+    SETTLE_S = 4.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.baseline = None
+        self.timer = None
+
+    def guard(self):
+        with self.lock:
+            if self.timer is None:
+                # idle: capture the true baseline before any command lands
+                self.baseline = settings_snapshot()
+            else:
+                self.timer.cancel()  # extend the window past this command
+            self.timer = threading.Timer(self.SETTLE_S, self._fire)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def _fire(self):
+        with self.lock:
+            snap = self.baseline
+            self.baseline = None
+            self.timer = None
+        settings_restore(snap)
+
+
+class StickyCommands:
+    """Last /model and /effort sent, replayed into each fresh claude child so
+    the watch's picker choice survives respawns (auto-reset, watchdog, /reset)."""
+
+    def __init__(self, session, guard):
+        self.session = session
+        self.guard = guard
+        self.lock = threading.Lock()
+        self.commands = {}  # "/model" -> full command string
+        self._replayed_gen = session._gen
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def remember(self, command):
+        with self.lock:
+            self.commands[command.split()[0]] = command
+
+    def _loop(self):
+        while True:
+            time.sleep(1)
+            gen = self.session._gen
+            if gen == self._replayed_gen or not self.session.ready():
+                continue
+            self._replayed_gen = gen
+            with self.lock:
+                pending = list(self.commands.values())
+            if not pending:
+                continue
+            for cmd in pending:
+                self.guard.guard()
+                try:
+                    self.session.send(cmd)
+                    log(f"replayed sticky command: {cmd}")
+                    time.sleep(1.0)
+                except (OSError, RuntimeError) as e:
+                    log(f"sticky replay failed for {cmd}: {e}")
+
+
+def make_handler(token, session, turns, sticky, guard, started_at):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             log(f"http {self.address_string()} {fmt % args}")
@@ -670,6 +845,9 @@ def make_handler(token, session, turns, started_at):
                     "child_pid": session.pid,
                     "uptime_s": int(time.time() - started_at),
                 })
+            if self.path == "/screen":
+                # Debug: last ANSI-stripped PTY output.
+                return self._send(200, {"tail": session.stdout_tail[-3000:]})
             if self.path == "/last":
                 if turns.last_reply is None:
                     return self._send(404, {"error": "no_reply_yet"})
@@ -691,6 +869,33 @@ def make_handler(token, session, turns, started_at):
                 if not isinstance(message, str) or not message.strip():
                     return self._send(400, {"error": "empty_message"})
                 return self._send(*turns.run_turn(message.strip(), REPLY_BUDGET_S))
+            if self.path == "/command":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    command = body.get("command", "")
+                except (ValueError, json.JSONDecodeError):
+                    return self._send(400, {"error": "bad_json"})
+                if not isinstance(command, str):
+                    return self._send(400, {"error": "bad_command"})
+                command = command.strip()
+                if "\n" in command or "\r" in command:
+                    return self._send(400, {"error": "bad_command"})
+                if not any(
+                    command == p or command.startswith(p + " ")
+                    for p in COMMAND_ALLOWLIST
+                ):
+                    return self._send(400, {"error": "command_not_allowed"})
+                if turns.busy.locked():
+                    return self._send(409, {"error": "turn_in_flight"})
+                guard.guard()
+                try:
+                    session.send(command)
+                except (OSError, RuntimeError) as e:
+                    return self._send(503, {"error": f"send_failed: {e}"})
+                sticky.remember(command)
+                log(f"slash command sent: {command}")
+                return self._send(200, {"ok": True, "command": command})
             self._send(404, {"error": "not_found"})
 
     return Handler
@@ -736,9 +941,13 @@ def main():
     session.spawn()
     tailer = TranscriptTailer(session)
     turns = TurnManager(session, tailer)
+    guard = SettingsGuard()
+    sticky = StickyCommands(session, guard)
     threading.Thread(target=watchdog, args=(session, turns), daemon=True).start()
 
-    server = ThreadingHTTPServer((bind, PORT), make_handler(token, session, turns, time.time()))
+    server = ThreadingHTTPServer(
+        (bind, PORT), make_handler(token, session, turns, sticky, guard, time.time())
+    )
     emit_state("ready")
     log("listening")
     try:
