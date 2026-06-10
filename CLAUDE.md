@@ -35,6 +35,7 @@ Build output path: `/Users/henryortega/Library/Mobile Documents/iCloud~md~obsidi
 - Per-vault MCP disable: the MCP manager lists the real CLI servers; unchecking one records its name in `disabledServers`. At spawn, those become `mcp__<server>` deny rules passed via `--settings` (SubprocessManager.buildArgs), which removes the server's tools from the model's tool list. Scoped to the plugin's subprocesses only — other Claude Code instances and the server definitions are untouched. Patterns are cached on the plugin (`mcpDenyPatterns`, refreshed via `refreshMcpDenyPatterns`) so the synchronous spawn path can read them.
 - `src/permissions/PermissionsConfig.ts`: `can_use_tool` policy.
 - `scripts/`: out-of-tree shell + Python helpers (smoke tests, credit-pool forecaster). Not bundled.
+  - `scripts/watch-bridge/`: Apple Watch chat bridge — launchd daemon (`bridge.py`) holding one interactive `claude` session (no `--print`, subscription-cap billing) in a PTY over the vault, HTTP API for a watch Shortcut via Tailscale; `stop_hook.py` signals end-of-turn. Authoritative doc note lives in the vault.
 
 ## Wire-format gotchas (do not regress)
 
