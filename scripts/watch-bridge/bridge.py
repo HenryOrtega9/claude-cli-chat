@@ -17,6 +17,11 @@ API (all routes require `Authorization: Bearer <token>`):
                                    202 {..., partial:true} if the reply budget expires
                                    409 turn in flight / 503 not ready
   GET  /last   -> last completed reply (same shape as 200)
+  GET  /wait?since=<unix_ts>&timeout=<s> -> long-poll: blocks until a turn
+                 completes at/after `since` (bridge clock), then returns it
+                 (same shape as /last). 202 {partial:true} on timeout. Used by
+                 the watch app's background URLSession to fire a local
+                 notification when a turn finishes after the app is closed.
   POST /command {"command": str} -> 200 {ok}. Fire-and-forget slash command
                  (allowlist: /model, /effort). These run locally in the CLI
                  and produce no assistant turn, so they bypass the turn
@@ -25,9 +30,10 @@ API (all routes require `Authorization: Bearer <token>`):
   GET  /health -> {state, session_id, session_file, child_pid, uptime_s}
   GET  /sessions -> {sessions: [{id, kind, name, cwd, attach, pid,
                  last_activity, preview}]}. Every live claude process on this
-                 Mac mapped to its JSONL transcript. attach: "bridge" (this
-                 daemon's child), "tmux:<target>" (injectable via send-keys,
-                 e.g. vault-cc), or null (view-only).
+                 Mac mapped to its JSONL transcript, EXCEPT the bridge's own
+                 child (the watch's main chat already shows it). attach:
+                 "tmux:<target>" (injectable via send-keys, e.g. vault-cc) or
+                 null (view-only).
   GET  /sessions/<id>/messages?limit=N -> {session, messages: [{uuid, role,
                  text, ts}]}. Tail of the transcript, text turns only.
   POST /sessions/<id>/send {"message": str} -> 200 {ok}. Fire-and-forget
@@ -589,6 +595,7 @@ class TurnManager:
         self.busy = threading.Lock()
         self.last_reply = None
         self.last_session_id = None
+        self.last_completed_at = 0.0  # bridge clock, drives GET /wait
 
     def run_turn(self, message, budget_s):
         """Returns (status_code, payload). 409 if a turn is in flight; 202 with
@@ -662,6 +669,7 @@ class TurnManager:
                         "elapsed_ms": int((time.time() - start) * 1000),
                         "partial": False,
                     }
+                    self.last_completed_at = time.time()
                     emit_state("complete")
                 finally:
                     done.set()
@@ -901,15 +909,8 @@ class SessionDirectory:
             if not argv or os.path.basename(argv[0]) != "claude":
                 continue
             if pid == self.session.pid:
-                sessions.append({
-                    "id": self.session.session_id or "watch",
-                    "kind": "watch",
-                    "name": "Watch session",
-                    "cwd": VAULT,
-                    "file": own_file,
-                    "attach": "bridge",
-                    "pid": pid,
-                })
+                # The bridge's own session is the watch app's main Chat tab;
+                # listing it in /sessions would just duplicate that history.
                 continue
             cwd = self._cwd_of(pid)
             if not cwd:
@@ -1330,6 +1331,28 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                 if turns.last_reply is None:
                     return self._send(404, {"error": "no_reply_yet"})
                 return self._send(200, turns.last_reply)
+            if self.path == "/wait" or self.path.startswith("/wait?"):
+                qs = {}
+                for part in (self.path.split("?", 1)[1] if "?" in self.path else "").split("&"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        qs[k] = v
+                try:
+                    since = float(qs.get("since", "0"))
+                except ValueError:
+                    since = 0.0
+                try:
+                    hold = max(1.0, min(float(qs.get("timeout", "600")), 1500.0))
+                except ValueError:
+                    hold = 600.0
+                deadline = time.time() + hold
+                # One blocked thread per waiter (ThreadingHTTPServer); the
+                # watch holds at most one of these at a time.
+                while time.time() < deadline:
+                    if turns.last_reply is not None and turns.last_completed_at >= since:
+                        return self._send(200, dict(turns.last_reply))
+                    time.sleep(0.5)
+                return self._send(202, {"reply": None, "partial": True, "error": "wait_timeout"})
             if self.path == "/usage":
                 return self._send(*usage.fetch())
             if self.path == "/sessions":
