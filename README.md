@@ -14,8 +14,15 @@ Each chat tab spawns its own `claude --print --output-format stream-json` subpro
 
 ## Companion daemons (`scripts/`)
 
-- **watch-bridge** (`scripts/watch-bridge/bridge.py`): a zero-dependency Python daemon that holds one interactive `claude` session on a PTY and exposes it over a bearer-authed HTTP API on the Tailscale interface. Backs [ask-claude-watch](https://github.com/HenryOrtega9/ask-claude-watch), a standalone watchOS app. Endpoints cover chat turns with a partial-reply budget, a long-poll `/wait` for background notifications, a directory of every live Claude session on the Mac (with tmux input injection), and an OAuth usage proxy for plan-limit gauges.
-- **TC001 animator** (`scripts/animator.py`): mirrors Claude Code's live state (thinking, tool use, done, idle) onto an Ulanzi TC001 32x8 RGB matrix running AWTRIX 3, via a launchd daemon polling the plugin's state emitter.
+### watch-bridge
+
+`scripts/watch-bridge/bridge.py` is a zero-dependency Python daemon that holds one interactive `claude` session on a PTY and exposes it over a bearer-authed HTTP API on the Tailscale interface. It backs [ask-claude-watch](https://github.com/HenryOrtega9/ask-claude-watch), a standalone watchOS app. Endpoints cover chat turns with a partial-reply budget, a long-poll `/wait` for background notifications, a directory of every live Claude session on the Mac (with tmux input injection), and an OAuth usage proxy for plan-limit gauges.
+
+### TC001 hardware status display
+
+`scripts/animator.py` turns an Ulanzi TC001 (a 32x8 RGB LED matrix running the open [AWTRIX 3](https://blueforcer.github.io/awtrix3/) firmware) into a physical status light for Claude Code. A launchd daemon polls the plugin's state emitter every 300 ms and pushes hand-drawn frames over the device's HTTP API: distinct animations for thinking, tool use, awaiting approval, and done, with a walking-crab ambient when idle and a periodic battery readout.
+
+Implementation notes: AWTRIX rejects payloads with more than ~100 draw items, so frames are run-length compressed from per-pixel `draw` calls into `df` rectangles before sending. `screens/preview.html` mirrors the animator's render logic pixel for pixel so animations can be designed in a browser before touching the device.
 
 ## Architecture
 
