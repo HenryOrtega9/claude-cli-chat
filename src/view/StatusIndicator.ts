@@ -84,6 +84,9 @@ export class StatusIndicator {
   setThinking() {
     this.mode = "thinking";
     this.clearTimers();
+    /* Drop any stale watchdog hint from a prior stall so it doesn't linger
+       on later healthy spinners. */
+    this.root.removeAttribute("title");
     this.root.removeClass("is-retrying");
     this.root.addClass("is-thinking");
     this.root.style.display = "";
@@ -106,6 +109,7 @@ export class StatusIndicator {
   setRetrying(attempt: number, maxRetries: number, retryDelayMs: number) {
     this.mode = "retrying";
     this.clearTimers();
+    this.root.removeAttribute("title");
     this.root.removeClass("is-thinking");
     this.root.addClass("is-retrying");
     this.root.style.display = "";

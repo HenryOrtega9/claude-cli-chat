@@ -17,6 +17,12 @@
 .workspace-leaf-content[data-type="claude-cli-chat-view"] .claudian-container {
   --claudian-brand: #D97757;
   --claudian-brand-rgb: 217, 119, 87;
+  /* Claude palette blue — same tone used by the plan-mode pill (the only
+     other established blue accent in this plugin's UI). Exposed as a token
+     so folder pills, future blue accents, and any user CSS overrides can
+     share the same value. */
+  --claudian-blue: #5b8def;
+  --claudian-blue-rgb: 91, 141, 239;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -592,6 +598,73 @@ mark.claudian-search-mark.is-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Sticky badge — a 10px pin glyph appended to the file-pill label, shown
+   only when .is-sticky is on the pill root. The base rule hides it so
+   one-shot pins read identically to pre-sticky pins; sticky pins gain a
+   visible pin icon and a heavier border to signal "this survives submit." */
+.claudian-file-pill-sticky-badge {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
+  margin-left: 1px;
+  color: inherit;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+.claudian-file-pill-sticky-badge svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.claudian-file-pill.is-sticky .claudian-file-pill-sticky-badge {
+  display: inline-flex;
+}
+/* Heavier border on sticky pins so the persistence is obvious even at
+   small sizes; pairs with the badge to make sticky vs. one-shot
+   unmistakable at a glance. */
+.claudian-file-pill.is-pinned.is-sticky {
+  border-color: var(--claudian-brand);
+  border-width: 1.5px;
+  padding: 2.5px 9.5px; /* offset the +0.5px border so total height stays put */
+}
+
+/* Slow fade for the auto-drop case where the dropped pill stays visible
+   (i.e., it was the active editor file). Overrides the default 100ms
+   pill transition with a longer ease so the unpin reads as deliberate
+   visual feedback rather than a snap. Class is added by setPinnedPaths
+   for ~850ms then removed once the animation completes; pills that
+   leave the bar entirely (non-active dropped pins) skip this and just
+   disappear. */
+.claudian-file-pill.is-fading-pin {
+  transition: background 800ms ease, color 800ms ease, border-color 800ms ease;
+}
+
+/* Folder pins — recolored in Claude blue so they're visually distinct from
+   file pins (brand orange). Same shape, sizing, and behavior; only the hue
+   changes so the bar reads as "files in orange, folders in blue" at a
+   glance. Sticky styling still works because .is-sticky targets the badge
+   visibility independently. */
+.claudian-file-pill.is-folder {
+  background: rgba(var(--claudian-blue-rgb), 0.12);
+  border-color: rgba(var(--claudian-blue-rgb), 0.4);
+  color: var(--claudian-blue);
+}
+.claudian-file-pill.is-folder:hover {
+  background: rgba(var(--claudian-blue-rgb), 0.18);
+}
+.claudian-file-pill.is-folder.is-pinned {
+  background: rgba(var(--claudian-blue-rgb), 0.18);
+  border-color: rgba(var(--claudian-blue-rgb), 0.5);
+  color: var(--claudian-blue);
+}
+.claudian-file-pill.is-folder.is-pinned:hover {
+  background: rgba(var(--claudian-blue-rgb), 0.28);
+}
+.claudian-file-pill.is-folder.is-pinned.is-sticky {
+  border-color: var(--claudian-blue);
+}
 
 /* ---- Per-message action toolbar -------------------------- */
 .claudian-message {
@@ -770,6 +843,120 @@ mark.claudian-search-mark.is-active {
   text-overflow: ellipsis;
 }
 
+/* Attached-note pills — sit above a user bubble naming each note/folder that
+   was pinned in the composer's file-pill bar when the message was sent. Echoes
+   the composer pill (brand tint, file-text icon) so the turn visibly carried
+   that context. One pill per note; the row wraps when several were attached. */
+.claudian-attached-note-flags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-bottom: 4px;
+  max-width: 100%;
+}
+.claudian-attached-note-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 10px;
+  background: rgba(var(--claudian-brand-rgb), 0.14);
+  border: 1px solid rgba(var(--claudian-brand-rgb), 0.34);
+  border-radius: 999px;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  max-width: 100%;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background 100ms ease, border-color 100ms ease;
+}
+.claudian-attached-note-flag:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.22);
+  border-color: rgba(var(--claudian-brand-rgb), 0.5);
+}
+.claudian-attached-note-flag.is-folder {
+  background: rgba(var(--claudian-blue-rgb), 0.14);
+  border-color: rgba(var(--claudian-blue-rgb), 0.34);
+  cursor: default;
+}
+.claudian-attached-note-flag-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 11px;
+  color: var(--claudian-brand);
+  flex-shrink: 0;
+}
+/* Force the Lucide SVG injected by setIcon() to fill the span as a block;
+   without this it inherits vertical-align: baseline and sinks below the
+   optical center of the pill text. */
+.claudian-attached-note-flag-icon svg,
+.claudian-attached-note-chevron svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.claudian-attached-note-flag.is-folder .claudian-attached-note-flag-icon {
+  color: var(--claudian-blue);
+}
+.claudian-attached-note-flag-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Collapsed summary pill ("📎 N notes") shown once the attached-note count
+   crosses the threshold. Clicking it toggles the expanded list below. */
+.claudian-attached-note-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 10px;
+  background: rgba(var(--claudian-brand-rgb), 0.14);
+  border: 1px solid rgba(var(--claudian-brand-rgb), 0.34);
+  border-radius: 999px;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 100ms ease, border-color 100ms ease;
+}
+.claudian-attached-note-summary:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.22);
+  border-color: rgba(var(--claudian-brand-rgb), 0.5);
+}
+.claudian-attached-note-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: transform 120ms ease;
+}
+.claudian-attached-note-flags.is-expanded .claudian-attached-note-chevron {
+  transform: rotate(180deg);
+}
+/* The expanded note list breaks onto its own line below the summary pill
+   (flex-basis: 100% forces the wrap) and stays right-aligned with the bubble.
+   Hidden until the row carries is-expanded. */
+.claudian-attached-note-expanded {
+  display: none;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.claudian-attached-note-flags.is-expanded .claudian-attached-note-expanded {
+  display: flex;
+}
+
 .claudian-message {
   max-width: 100%;
   padding: 10px 14px;
@@ -796,6 +983,17 @@ mark.claudian-search-mark.is-active {
      adjacent assistant passes is the .claudian-messages `gap: 10px` plus
      intra-bubble tool margins. Same-bubble tool spacing is unchanged. */
   padding: 0;
+}
+/* Pass-boundary tightening for tool-only continuations. When the model's
+   first pass ends with a tool call and the next pass is also tool-only
+   (parallel Bash fan-out is the canonical case), the 10px .claudian-messages
+   gap reads as an awkward break against the ~2px intra-bubble tool margin
+   below it. Pull the lower wrapper up so the row-to-row rhythm matches the
+   rest of the tool stack. Scoped via :has() to assistant-after-assistant
+   pairs whose lower bubble has tool calls but no rendered text or thinking;
+   prose continuations keep the full gap. */
+.claudian-message-wrapper-assistant + .claudian-message-wrapper-assistant:has(> .claudian-message > .claudian-tool-call):not(:has(> .claudian-message > .claudian-message-content > .claudian-text-block:not(:empty))):not(:has(> .claudian-message > .claudian-message-content > .claudian-thinking-block)) {
+  margin-top: -8px;
 }
 .claudian-message-content {
   font-size: var(--font-text-size, 14px);
@@ -1024,6 +1222,70 @@ mark.claudian-search-mark.is-active {
   border-color: var(--text-error, #dc3545);
 }
 
+/* AskUserQuestion picker --------------------------------------- */
+.claudian-askuser-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 6px 0 4px;
+}
+.claudian-askuser-question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--background-primary-alt);
+  border-radius: 6px;
+}
+.claudian-askuser-prompt {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-askuser-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.claudian-askuser-option:hover {
+  background: var(--background-modifier-hover);
+}
+.claudian-askuser-option input[type="radio"],
+.claudian-askuser-option input[type="checkbox"] {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+.claudian-askuser-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.claudian-askuser-option-label {
+  font-size: 13px;
+  color: var(--text-normal);
+}
+.claudian-askuser-option-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.claudian-askuser-other-input {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 13px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* ---- Input box -------------------------------------------- */
 .claudian-input-container {
   padding: 6px 14px 28px 14px;
@@ -1040,6 +1302,14 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-input-wrapper:focus-within {
   border-color: rgba(var(--claudian-brand-rgb), 0.55);
+}
+/* Dragover affordance — toggled by InputBox when a file is dragged over the
+   wrapper. Brand-tinted border + faint background so the user gets visible
+   confirmation that releasing here will attach the file. Class is removed
+   on dragleave (whole-wrapper) and on drop. */
+.claudian-input-wrapper.is-drop-target {
+  border-color: rgba(var(--claudian-brand-rgb), 0.75);
+  background: rgba(var(--claudian-brand-rgb), 0.05);
 }
 .claudian-context-row {
   display: none;
@@ -1108,12 +1378,86 @@ mark.claudian-search-mark.is-active {
   gap: 6px;
   margin-bottom: 6px;
 }
+/* User messages are right-aligned, so their attachment rows should be too —
+   both when lifted above the bubble and when rendered inside it. */
+.claudian-message-wrapper-user .claudian-message-attachments {
+  justify-content: flex-end;
+  align-self: flex-end;
+}
 .claudian-message-attachment {
   max-width: 240px;
   max-height: 180px;
   border-radius: 6px;
   border: 1px solid var(--background-modifier-border);
   object-fit: cover;
+}
+/* Non-image attachment chip rendered in-bubble (pdf, text). object-fit: cover
+   on the base rule above only matters for <img>; for the file-chip <div>
+   variant we override the sizing so it hugs its label. */
+.claudian-message-attachment-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  height: auto;
+  padding: 6px 10px;
+  background: var(--background-primary-alt);
+  font-size: 12px;
+  color: var(--text-normal);
+  object-fit: unset;
+}
+.claudian-message-attachment-icon {
+  display: inline-flex;
+  color: var(--claudian-brand);
+}
+.claudian-message-attachment-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-message-attachment-label {
+  font-family: var(--font-monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- "+" attach button (inline in bottom toolbar) ---------------------- */
+/* Lives in the bottom toolbar between the MCP/agents pills and the usage
+   donut. Sized to match the send button (26x26) so the row has consistent
+   icon-button proportions. Visually neutral by default to keep the send
+   button as the primary action; brand-tinted on hover/focus. */
+.claudian-attach-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+  user-select: none;
+}
+.claudian-attach-button:hover,
+.claudian-attach-button:focus-visible {
+  background: var(--background-modifier-hover);
+  color: var(--claudian-brand);
+  border-color: rgba(var(--claudian-brand-rgb), 0.5);
+  outline: none;
+}
+/* Slightly stronger ring for keyboard-only focus so it's distinguishable
+   from hover — :focus-visible only matches keyboard focus. */
+.claudian-attach-button:focus-visible {
+  box-shadow: 0 0 0 2px rgba(var(--claudian-brand-rgb), 0.35);
+}
+.claudian-attach-button svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-attach-input {
+  display: none;
 }
 
 /* ---- Remote Control pairing card ---------------------------------------- */
@@ -1401,6 +1745,11 @@ mark.claudian-search-mark.is-active {
   color: var(--text-faint);
   text-transform: uppercase;
 }
+/* Second and later section headers (e.g. the model picker's OPUS / SONNET /
+   HAIKU groups) get a little breathing room above; the first stays flush. */
+.claudian-popup-header:not(:first-child) {
+  margin-top: 6px;
+}
 .claudian-popup-row {
   display: flex;
   align-items: center;
@@ -1447,6 +1796,116 @@ mark.claudian-search-mark.is-active {
 .claudian-popup-row.is-selected .claudian-popup-row-sublabel {
   color: var(--text-muted);
 }
+/* Model rows that carry an availability caveat (MODEL_NOTES) wrap the note
+   under the label instead of letting it stretch the popup wider than the
+   composer. */
+.claudian-popup-model .claudian-popup-row-sublabel {
+  max-width: 220px;
+  white-space: normal;
+  line-height: 1.3;
+}
+
+/* ---- Attach popup (+ button) ----------------------------- */
+/* Wider than the model/effort popups because trusted-folder rows carry a
+   folder name plus its full absolute path. Capped so a long $HOME path
+   doesn't make the popup wider than the input wrapper itself. */
+.claudian-popup-attach {
+  min-width: 280px;
+  max-width: 420px;
+  padding: 4px;
+}
+.claudian-popup-attach .claudian-popup-row-action {
+  /* "Pick a file…" and "Add folder…" rows lead with an icon; align the
+     icon to the start so the label reads as a normal menu item. */
+  font-weight: 500;
+}
+.claudian-popup-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--background-modifier-border);
+}
+.claudian-popup-section-header {
+  padding: 6px 8px 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.claudian-popup-section-empty {
+  padding: 4px 8px 8px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.claudian-popup-row-folder {
+  /* Folder rows do NOT trigger an action on click — the checkbox owns the
+     interaction. Drop the hover background tint that the default
+     .claudian-popup-row gets so the row reads as a settings entry, not a
+     clickable menu item. */
+  cursor: default;
+  padding: 4px 8px;
+}
+.claudian-popup-row-folder:hover {
+  background: transparent;
+}
+.claudian-popup-row-checkbox {
+  margin: 0;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.claudian-popup-row-labels {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.claudian-popup-row-folder .claudian-popup-row-label {
+  font-size: 12px;
+  line-height: 1.2;
+  /* Single-line truncation for long folder names. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-popup-row-folder .claudian-popup-row-sublabel {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-popup-row-folder:not(.is-enabled) .claudian-popup-row-label,
+.claudian-popup-row-folder:not(.is-enabled) .claudian-popup-row-sublabel {
+  /* Disabled folders read muted so the active set is scannable at a
+     glance. Path stays visible because the user may still want to remove
+     or re-enable. */
+  opacity: 0.55;
+}
+.claudian-popup-row-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.6;
+  transition: opacity 100ms ease, background 100ms ease, color 100ms ease;
+}
+.claudian-popup-row-remove:hover {
+  opacity: 1;
+  color: var(--text-error, var(--text-normal));
+  background: var(--background-modifier-hover);
+}
+.claudian-popup-row-remove svg {
+  width: 12px;
+  height: 12px;
+}
 
 /* Mode pill is rendered as a *filled chip* in the two-row layout —
    visually loud because Mode is the highest-blast-radius runtime control.
@@ -1483,6 +1942,46 @@ mark.claudian-search-mark.is-active {
   background: rgba(220, 53, 69, 0.22);
 }
 .claudian-mode-pill.mode-bypass .claudian-toolbar-pill-value { color: #dc3545; }
+
+/* ---- Incognito pill -------------------------------------------------
+   Binary toggle (no popup). Quiet when off; tinted violet when on so the
+   "this leaves nothing behind" state reads at a glance. Greyed + non-
+   interactive once locked (a live session has fixed the choice). */
+.claudian-incognito-pill {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  opacity: 0.7;
+}
+.claudian-incognito-pill:hover {
+  background: var(--background-modifier-hover);
+  opacity: 1;
+}
+.claudian-incognito-pill .claudian-toolbar-pill-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.claudian-incognito-pill .claudian-toolbar-pill-value {
+  color: var(--text-muted);
+  filter: grayscale(1);
+}
+.claudian-incognito-pill.is-active {
+  background: rgba(139, 92, 246, 0.2);
+  opacity: 1;
+}
+.claudian-incognito-pill.is-active .claudian-toolbar-pill-label { color: #a78bfa; }
+.claudian-incognito-pill.is-active .claudian-toolbar-pill-value { filter: none; }
+.claudian-incognito-pill.is-disabled {
+  cursor: default;
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* Incognito tabs in the tab bar get a violet ring so they're distinguishable
+   from persisted tabs at a glance. */
+.claudian-tab-badge-incognito {
+  border-color: #8b5cf6;
+}
 
 /* ---- Context window indicators --------------------------- */
 /* Hover-revealed "Nk / Mk" tooltip on the donut pill. Sits inside
@@ -1521,6 +2020,153 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-usage-pill.warn { color: #e0a83a; }
 .claudian-usage-pill.danger { color: #dc3545; }
+
+/* Cost-surface pill: hover-driven, so use the help cursor to signal
+   "more info on hover" while keeping the click-toggle affordance. */
+.claudian-cost-pill {
+  cursor: help;
+}
+
+/* Hover popup anchored above the cost-surface pill. Shares the visual
+   language of .claudian-popup (background, border, shadow) but is wider
+   to accommodate per-server detail and uses a denser internal layout. */
+.claudian-cost-popup {
+  position: absolute;
+  z-index: 50;
+  min-width: 280px;
+  max-width: 360px;
+  padding: 10px 12px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-family: var(--font-interface);
+  font-size: 12px;
+  color: var(--text-normal);
+  /* Flex column so the server list can scroll while the header and footer
+     stay pinned. max-height is a CSS fallback; openCostPopup() also sets a
+     pixel cap from the pill's viewport position so a server with dozens of
+     tools (e.g. webull's 68) doesn't push the popup off the top of screen. */
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 520px);
+  overflow: hidden;
+}
+.claudian-cost-popup-header {
+  margin-bottom: 8px;
+  flex: 0 0 auto;
+}
+.claudian-cost-popup-title {
+  font-weight: 600;
+  color: var(--claudian-brand);
+  font-size: 12px;
+}
+.claudian-cost-popup-subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.claudian-cost-popup-empty {
+  padding: 8px 0;
+  color: var(--text-muted);
+  font-style: italic;
+}
+.claudian-cost-popup-server-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* The one scrollable region. flex:1 + min-height:0 lets it shrink below
+     its content height so overflow-y actually engages inside the capped
+     popup; the negative-margin/padding pair bleeds the scrollbar to the
+     popup edge while keeping cards clear of it. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
+.claudian-cost-popup-server {
+  padding: 8px 10px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  transition: opacity 120ms ease;
+}
+.claudian-cost-popup-server.is-disabled {
+  opacity: 0.55;
+}
+.claudian-cost-popup-server-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.claudian-cost-popup-server-head input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+.claudian-cost-popup-server-name {
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claudian-cost-popup-server-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-cost-popup-tool-list {
+  margin-top: 6px;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.claudian-cost-popup-tool {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-cost-popup-pending {
+  font-style: italic;
+  font-family: var(--font-interface);
+  font-size: 11px;
+}
+.claudian-cost-popup-footer {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--background-modifier-border);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+  flex: 0 0 auto;
+}
+
+/* Disabled-state row styling in the MCP manager modal. Muted opacity +
+   subtle italic on the name so the user can tell at a glance which
+   servers are inactive. */
+.claudian-mcp-server-row.is-disabled {
+  opacity: 0.6;
+}
+.claudian-mcp-server-row.is-disabled .claudian-mcp-server-name {
+  font-style: italic;
+}
+.claudian-mcp-server-toggle {
+  margin-right: 6px;
+  cursor: pointer;
+}
+.claudian-mcp-section-divider {
+  margin-top: 14px;
+  margin-bottom: 8px;
+  padding: 4px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
 
 /* ---- @ / slash suggestion popup -------------------------- */
 /* Floats ABOVE the entire input-wrapper so it never overlaps the textarea.
@@ -1744,4 +2390,348 @@ mark.claudian-search-mark.is-active {
 @keyframes claudian-status-pulse {
   0%, 100% { opacity: 0.35; transform: scale(0.85); }
   50%      { opacity: 1;    transform: scale(1.1); }
+}
+
+/* ---- Create Subagent modal --------------------------------- */
+.claudian-create-subagent-modal {
+  width: min(560px, 90vw);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.claudian-create-subagent-intro p {
+  margin: 0 0 8px 0;
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.claudian-create-subagent-intro-secondary {
+  color: var(--text-muted) !important;
+  font-size: 12px !important;
+}
+.claudian-create-subagent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 14px 0;
+}
+.claudian-create-subagent-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-normal);
+  letter-spacing: 0.01em;
+}
+.claudian-create-subagent-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.claudian-create-subagent-field input[type="text"],
+.claudian-create-subagent-field textarea,
+.claudian-create-subagent-field select {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font-interface);
+  font-size: 13px;
+}
+.claudian-create-subagent-field textarea {
+  font-family: var(--font-monospace);
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 140px;
+}
+.claudian-create-subagent-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ---- Subagent Manager modal -------------------------------- */
+.claudian-subagent-modal {
+  width: min(560px, 90vw);
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.claudian-subagent-intro p {
+  margin: 0 0 12px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.claudian-subagent-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 12px 0;
+  flex-wrap: wrap;
+}
+.claudian-subagent-header-row h3 {
+  margin: 0;
+  flex: 1 1 auto;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.claudian-subagent-header-row button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.claudian-subagent-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-faint);
+  font-style: italic;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 8px;
+}
+.claudian-subagent-section-divider {
+  margin-top: 14px;
+  margin-bottom: 8px;
+  padding: 4px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.claudian-subagent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.claudian-subagent-row {
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.claudian-subagent-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.claudian-subagent-name {
+  font-weight: 600;
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+  font-size: 13px;
+}
+.claudian-subagent-plugin-tag {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.claudian-subagent-model-tag {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+}
+.claudian-subagent-row .claudian-subagent-description {
+  margin: 4px 0;
+  font-size: 12px;
+  color: var(--text-normal);
+}
+.claudian-subagent-tools {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.claudian-subagent-tools-label {
+  color: var(--text-faint);
+}
+.claudian-subagent-meta {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-faint);
+  word-break: break-all;
+  margin: 4px 0 8px 0;
+  line-height: 1.4;
+}
+.claudian-subagent-row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.claudian-subagent-row-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* ---- Subagent nested event timeline (Task tool) ------------ */
+/* Rendered inside .claudian-subagent-summary when Claude calls the Task
+   tool. The timeline shows the subagent's internal events (text deltas,
+   tool calls, thinking traces) tailed live from its session JSONL. */
+.claudian-subagent-events {
+  margin-top: 8px;
+  padding-left: 6px;
+  border-left: 1px dashed var(--background-modifier-border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.claudian-subagent-event {
+  font-size: 12px;
+  color: var(--text-normal);
+  line-height: 1.4;
+}
+.claudian-subagent-event-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.claudian-subagent-event-thinking {
+  font-style: italic;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.claudian-subagent-event-tool {
+  padding-left: 1.25em;
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.claudian-subagent-event-tool-name {
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-subagent-event-tool-status {
+  margin-left: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.claudian-subagent-events-truncated {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+/* Toggle row that gates the nested timeline. Reads as one compact status
+   line (chevron · state · N steps · pulse) and the whole row is clickable. */
+.claudian-subagent-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: default;
+  user-select: none;
+}
+.claudian-subagent-toggle:has(.claudian-subagent-chevron) {
+  cursor: pointer;
+}
+.claudian-subagent-toggle:has(.claudian-subagent-chevron):hover {
+  color: var(--text-normal);
+}
+.claudian-subagent-toggle.is-spawning {
+  color: var(--text-faint);
+  font-style: italic;
+}
+.claudian-subagent-toggle.is-running {
+  color: var(--claudian-brand);
+}
+.claudian-subagent-toggle.is-failed {
+  color: var(--text-error);
+}
+.claudian-subagent-chevron {
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+  transition: transform 150ms ease;
+  transform: rotate(-90deg);
+}
+.claudian-subagent-summary.is-events-open .claudian-subagent-chevron {
+  transform: rotate(0deg);
+}
+.claudian-subagent-toggle-label {
+  font-weight: 500;
+}
+.claudian-subagent-step-count {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.claudian-subagent-step-count::before {
+  content: "· ";
+}
+.claudian-subagent-pulse {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: claudian-status-pulse 1.2s ease-in-out infinite;
+}
+
+/* Collapsed live preview: the subagent's latest step on a single line. */
+.claudian-subagent-current {
+  margin-top: 3px;
+  padding-left: 19px;
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The full timeline is hidden until the summary is toggled open. */
+.claudian-subagent-events-wrap {
+  display: none;
+}
+.claudian-subagent-summary.is-events-open .claudian-subagent-events-wrap {
+  display: block;
+}
+
+/* ---- Agents pill in the input toolbar ---------------------- */
+.claudian-agents-pill {
+  cursor: pointer;
+}
+.claudian-agents-pill .claudian-toolbar-pill-value {
+  font-variant-numeric: tabular-nums;
+}
+/* Active-subagent indication. Toggled by InputBox.refreshAgentsPill when
+   one or more Task/Agent tools are in flight. Tinted with the Claude blue
+   token (the same blue used for folder pins, plan mode, and the Sonnet via
+   badge) and pulses subtly so the row reads as "something is happening"
+   from peripheral vision. */
+.claudian-agents-pill.is-running {
+  color: var(--claudian-blue);
+  background: rgba(var(--claudian-blue-rgb), 0.14);
+  animation: claudian-agents-pulse 1.6s ease-in-out infinite;
+}
+.claudian-agents-pill.is-running .claudian-toolbar-pill-value,
+.claudian-agents-pill.is-running .claudian-toolbar-pill-label {
+  color: var(--claudian-blue);
+}
+@keyframes claudian-agents-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(var(--claudian-blue-rgb), 0); }
+  50%      { box-shadow: 0 0 0 3px rgba(var(--claudian-blue-rgb), 0.2); }
+}
+
+/* ---- SubagentPicker SuggestModal --------------------------- */
+.claudian-subagent-pick-primary {
+  font-weight: 600;
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+}
+.claudian-subagent-pick-secondary {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.claudian-subagent-pick-description {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin-top: 2px;
+  font-style: italic;
 }

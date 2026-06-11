@@ -13,14 +13,18 @@ export type EditOp = {
 /* Hunk of diff lines to render. `kind` controls coloring. */
 type DiffLine = { kind: "del" | "add" | "ctx"; text: string };
 
-/* Splits an Edit op into a sequence of diff lines. Trailing-newline tweaks
-   are normalized so a single-line change doesn't read as "added a newline". */
+/* Splits an Edit op into a sequence of diff lines: every old line becomes a
+   `del` row and every new line an `add` row. An empty oldString or newString
+   emits no rows for that side, so a pure-insertion edit doesn't show a
+   misleading blank deletion line (and vice versa). */
 export function diffLinesFromEdit(op: EditOp): DiffLine[] {
-  const oldLines = op.oldString.split("\n");
-  const newLines = op.newString.split("\n");
   const lines: DiffLine[] = [];
-  for (const l of oldLines) lines.push({ kind: "del", text: l });
-  for (const l of newLines) lines.push({ kind: "add", text: l });
+  if (op.oldString.length) {
+    for (const l of op.oldString.split("\n")) lines.push({ kind: "del", text: l });
+  }
+  if (op.newString.length) {
+    for (const l of op.newString.split("\n")) lines.push({ kind: "add", text: l });
+  }
   return lines;
 }
 

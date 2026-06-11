@@ -53,6 +53,13 @@ export class RemotePairingCard {
   setUrl(url: string) {
     this.url = url;
     this.urlEl.setText(url);
+    /* Empty string is the reset value used when (re)starting remote mode before
+       the real pairing URL arrives — not a non-http(s) attack, so return before
+       the warn below instead of logging a spurious warning on every start. */
+    if (!url) {
+      this.urlEl.removeAttribute("href");
+      return;
+    }
     /* Guard against javascript: / data: / file: URLs that could ride in via
        a compromised pairing transport — assigning straight to `.href` would
        make them clickable. Only http(s) gets to be a real link; anything else

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the Apple Watch -> Claude vault chat bridge.
+
+  Prerequisites:
+    - Tailscale installed and running on this Mac (bridge binds the tailnet IP)
+    - Bearer token at ~/.config/watch-bridge/token:
+        mkdir -p ~/.config/watch-bridge
+        openssl rand -hex 24 > ~/.config/watch-bridge/token
+        chmod 600 ~/.config/watch-bridge/token
+    - Consider `sudo pmset -c sleep 0` so the Mac stays reachable on AC power.
+
+  Install:
+    cp ~/Developer/claude-cli-chat/scripts/dev.claude-cli-chat.watch-bridge.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/dev.claude-cli-chat.watch-bridge.plist
+
+  Stop / unload:
+    launchctl bootout gui/$(id -u) \
+       ~/Library/LaunchAgents/dev.claude-cli-chat.watch-bridge.plist
+
+  Logs:
+    tail -f /tmp/watch-bridge.log /tmp/watch-bridge.err
+
+  Config overrides go in EnvironmentVariables (WATCH_BRIDGE_PORT,
+  WATCH_BRIDGE_BIND, WATCH_BRIDGE_VAULT, WATCH_BRIDGE_CLAUDE,
+  WATCH_BRIDGE_REPLY_BUDGET_S). Defaults are correct for this machine.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.claude-cli-chat.watch-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string>
+        <string>/Users/henryortega/Developer/claude-cli-chat/scripts/watch-bridge/bridge.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/watch-bridge.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/watch-bridge.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

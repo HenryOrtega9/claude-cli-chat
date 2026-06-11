@@ -6,3 +6,5 @@ main.js.map
 .vscode/
 .idea/
 data.json
+__pycache__/
+*.pyc

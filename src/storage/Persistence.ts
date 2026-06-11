@@ -22,6 +22,10 @@ type StoredTab = {
   permissionMode?: string;
   envSnippetId?: string;
   pinnedFilePaths?: string[];
+  /* Subset of pinnedFilePaths flagged sticky (won't be auto-dropped after
+     submit). Undefined on legacy state predating the field; TabController
+     treats undefined as "all pins sticky" so behavior is preserved. */
+  stickyPinnedFilePaths?: string[];
 };
 
 type StoredMessage = {
@@ -33,6 +37,7 @@ type StoredMessage = {
   durationMs?: number;
   thinking?: string;
   selectionContext?: ChatMessage["selectionContext"];
+  attachedNotePaths?: string[];
 };
 
 type TabMeta = {
@@ -54,6 +59,18 @@ export class Persistence {
   /* Per-tab in-flight save promise. Used by deleteTab/flush to await a save
      that's already started before issuing remove() or returning. */
   private inflightSaves = new Map<string, Promise<void>>();
+  /* Last index payload written to disk (serialized). saveIndex is called once
+     per streaming token via onStateChange, but the index only changes on tab
+     add/remove/select, a title-gen result, or a sessionId landing. Dedupe on
+     the serialized form so token-rate calls do zero disk I/O. */
+  private lastIndexJson: string | null = null;
+  /* Most recent saveIndex dispatch, rejection pre-swallowed. The view fires
+     saveIndex fire-and-forget, so without this handle flush() (the unload
+     path) has no way to await a still-in-flight index write — a tab
+     close/title/sessionId change landing right before quit would be lost,
+     leaving tabs.json referencing deleted files (phantom blank tab on next
+     load). */
+  private lastIndexWrite: Promise<void> = Promise.resolve();
 
   constructor(private app: App) {}
 
@@ -67,7 +84,14 @@ export class Persistence {
     const adapter = this.app.vault.adapter;
     if (!(await adapter.exists(this.indexPath))) return null;
     try {
-      return JSON.parse(await adapter.read(this.indexPath)) as TabIndex;
+      const parsed = JSON.parse(await adapter.read(this.indexPath));
+      /* Validate the shape before trusting it. Valid-but-wrong JSON ({}, [],
+         {tabs:"x"}) passes JSON.parse and would then throw in the caller's
+         index.tabs iteration — loadTab is defensive per-field, loadIndex was not. */
+      if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as TabIndex).tabs)) {
+        return null;
+      }
+      return parsed as TabIndex;
     } catch {
       return null;
     }
@@ -106,33 +130,57 @@ export class Persistence {
       permissionMode: typeof stored.permissionMode === "string" ? stored.permissionMode : undefined,
       envSnippetId: typeof stored.envSnippetId === "string" ? stored.envSnippetId : undefined,
       pinnedFilePaths: Array.isArray(stored.pinnedFilePaths) ? stored.pinnedFilePaths : undefined,
+      stickyPinnedFilePaths: Array.isArray(stored.stickyPinnedFilePaths) ? stored.stickyPinnedFilePaths : undefined,
     };
   }
 
   async saveIndex(index: TabIndex): Promise<void> {
-    await this.ensureDirs();
-    await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
+    /* Content-dedupe: the index payload is identical on virtually every
+       streaming token, so skip the atomic rewrite when nothing changed.
+       Setting lastIndexJson before the await is intentional — the synchronous
+       compare-and-set must complete before any concurrent call's microtask so
+       the per-token flood is suppressed; the catch reverts so a transient
+       failure retries on the next state change rather than being masked. */
+    const json = JSON.stringify(index);
+    if (json === this.lastIndexJson) return;
+    this.lastIndexJson = json;
+    const write = (async () => {
+      try {
+        await this.ensureDirs();
+        await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
+      } catch (err) {
+        this.lastIndexJson = null;
+        throw err;
+      }
+    })();
+    /* Track the dispatch so flush() can await it on unload. Swallow the
+       rejection on the tracked copy only — callers awaiting saveIndex still
+       see the error. */
+    this.lastIndexWrite = write.catch(() => undefined);
+    return write;
   }
 
   /* Debounced per-tab write. Coalesces rapid streaming updates so we write
-     at most once every 500ms per tab. The TabState is snapshotted at
-     schedule time so a later mutation (or destroy) doesn't corrupt the
-     write payload mid-flight. */
+     at most once every 500ms per tab. The TabState is snapshotted synchronously
+     at write time (when the timer fires), still immediately before saveTab's
+     async work, so a later mutation (or destroy) can't corrupt the write
+     payload mid-flight. Cloning at schedule time instead would clone on every
+     token only to discard all but the last snapshot before a quiet period. */
   scheduleSaveTab(state: TabState): void {
     const existing = this.pendingWrites.get(state.id);
     if (existing) clearTimeout(existing.handle);
-    const snapshot = this.snapshotState(state);
     const handle = setTimeout(() => {
       this.pendingWrites.delete(state.id);
-      void this.saveTab(snapshot);
+      void this.saveTab(this.snapshotState(state));
     }, 500);
-    this.pendingWrites.set(state.id, { handle, state: snapshot });
+    this.pendingWrites.set(state.id, { handle, state });
   }
 
   /* Shallow-clone the persisted-relevant fields into a fresh object so
-     a tab destroy or message mutation between schedule and flush doesn't
-     surface as a torn write. messages is array-cloned with each entry
-     shallow-cloned too, since streaming mutates entry.content in place. */
+     a tab destroy or message mutation between this synchronous snapshot and
+     saveTab's async work doesn't surface as a torn write. messages is
+     array-cloned with each entry shallow-cloned too, since streaming mutates
+     entry.content in place. */
   private snapshotState(state: TabState): TabState {
     return {
       id: state.id,
@@ -148,6 +196,7 @@ export class Persistence {
       permissionMode: state.permissionMode,
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths ? [...state.pinnedFilePaths] : undefined,
+      stickyPinnedFilePaths: state.stickyPinnedFilePaths ? [...state.stickyPinnedFilePaths] : undefined,
     };
   }
 
@@ -186,6 +235,7 @@ export class Persistence {
         durationMs: m.durationMs,
         thinking: m.thinking,
         selectionContext: m.selectionContext,
+        attachedNotePaths: m.attachedNotePaths,
       })),
       messageCount: state.messages.length,
       model: state.model,
@@ -193,18 +243,24 @@ export class Persistence {
       permissionMode: state.permissionMode,
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths,
+      stickyPinnedFilePaths: state.stickyPinnedFilePaths,
     };
     const adapter = this.app.vault.adapter;
-    await writeJsonAtomic(adapter, this.convPath(state.id), stored);
     /* Sidecar meta file lets listConversations skip the full body read.
        Written atomically too so a crash mid-rotation never leaves the
-       History dropdown reading half-written JSON. */
+       History dropdown reading half-written JSON. Meta is written FIRST:
+       the pair isn't atomic, and listConversations treats an existing meta
+       as authoritative — a crash between the two writes with meta-first
+       leaves the History dropdown at worst one save optimistic, whereas
+       body-first left it stale indefinitely (the fallback body read only
+       runs when the meta file is entirely absent). */
     const meta: TabMeta = {
       title: stored.title,
       updatedAt: stored.updatedAt,
       messageCount: stored.messages.length,
     };
     await writeJsonAtomic(adapter, this.metaPath(state.id), meta);
+    await writeJsonAtomic(adapter, this.convPath(state.id), stored);
   }
 
   async deleteTab(id: string): Promise<void> {
@@ -239,7 +295,7 @@ export class Persistence {
     const triggered: Promise<void>[] = [];
     for (const { handle, state } of pending) {
       clearTimeout(handle);
-      triggered.push(this.saveTab(state));
+      triggered.push(this.saveTab(this.snapshotState(state)));
     }
     /* Await both the writes we just triggered AND any already-running
        saves dispatched by prior timer fires. Snapshotting inflightSaves
@@ -247,7 +303,19 @@ export class Persistence {
        flush — the dispatch already removed the pending entry, so the
        only handle on it is in inflightSaves. */
     const inflight = Array.from(this.inflightSaves.values());
-    await Promise.allSettled([...triggered, ...inflight]);
+    const results = await Promise.allSettled([...triggered, ...inflight]);
+    /* allSettled never rejects, so without this a failed final write (disk
+       full, EACCES) would vanish silently on unload and the user would lose
+       their last edits with no signal. Surface the failures. */
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed.length > 0) {
+      console.warn(`[claude-cli-chat] ${failed.length} tab write(s) failed during flush`, failed.map(f => f.reason));
+    }
+    /* The index is written fire-and-forget by the view; await the most
+       recent dispatch so a tab add/remove/title/sessionId change landing
+       just before quit isn't truncated mid-write. Rejection is already
+       swallowed on this handle. */
+    await this.lastIndexWrite;
   }
 
   /* List stored tab files (used by the History dropdown). Returns metadata

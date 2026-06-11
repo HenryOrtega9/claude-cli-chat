@@ -6,24 +6,27 @@ import type { StreamEvent, ControlRequestEvent, ContentBlock } from "./Events";
 import { RemoteControlSession } from "./RemoteControlSession";
 import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from "../settings";
 
-/* Returns PIDs of every running process whose command line matches
-   `claude --remote-control`. Used by the settings UI to count live remote
-   sessions and by killAllRemoteAndOrphans() to sweep up anything the
-   in-process registry doesn't know about (e.g. survivors of a prior plugin
-   instance that exited before this cleanup logic landed).
+/* Returns PIDs of every running Remote Control process. Used by the settings
+   UI to count live remote sessions and by killAllRemoteAndOrphans() to sweep
+   up anything the in-process registry doesn't know about (e.g. survivors of a
+   prior plugin instance that exited before this cleanup logic landed).
 
-   The pattern uses pgrep's BRE (`-f` matches the full argv) to require
+   We spawn the `claude remote-control` subcommand, but older orphans may still
+   be running as the `claude --remote-control` flag form, so the pattern
+   accepts both: optional `--` before `remote-control`.
+
+   The pattern uses pgrep's ERE (`-f` matches the full argv) to require
    `claude` either at the start of the argv or after a `/` (so an absolute
-   path matches), followed by whitespace, then `--remote-control` bounded by
+   path matches), followed by whitespace, then `(--)?remote-control` bounded by
    whitespace or end. This avoids false positives like man pages, editor
-   buffers, or another tool with `claude --remote-control` embedded in a
+   buffers, or another tool with `claude remote-control` embedded in a
    longer command. After parsing, we cross-check via `ps -p <pid> -o
    command=` so we only return PIDs whose argv actually begins with the
    claude binary. */
 export function findRemoteControlPids(): number[] {
   let raw: string;
   try {
-    raw = execSync('pgrep -f "(^|/)claude[[:space:]]+--remote-control([[:space:]]|$)"', { encoding: "utf8" }).trim();
+    raw = execSync('pgrep -f "(^|/)claude[[:space:]]+(--)?remote-control([[:space:]]|$)"', { encoding: "utf8" }).trim();
   } catch {
     return [];
   }
@@ -40,12 +43,13 @@ export function findRemoteControlPids(): number[] {
     try {
       const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf8" }).trim();
       /* The argv as ps shows it: first token should be `claude` (possibly
-         absolute path) and `--remote-control` should appear as its own token. */
+         absolute path) and `remote-control` should appear as its own token
+         (or the legacy `--remote-control` flag, for old orphans). */
       const argv = cmd.split(/\s+/);
       const first = argv[0] ?? "";
       const isClaude = first === "claude" || /\/claude$/.test(first);
-      const hasFlag = argv.includes("--remote-control");
-      if (isClaude && hasFlag) verified.push(pid);
+      const hasRc = argv.includes("remote-control") || argv.includes("--remote-control");
+      if (isClaude && hasRc) verified.push(pid);
     } catch {
       /* Process gone between pgrep and ps. Skip. */
     }
@@ -67,6 +71,14 @@ export type SpawnOptions = {
   includePartialMessages: boolean;
   /** Text appended to the system prompt via `--append-system-prompt`. */
   appendSystemPrompt?: string;
+  /** Incognito tabs: launch with `--no-session-persistence` so the CLI writes
+      no session transcript to ~/.claude/projects. */
+  noSessionPersistence?: boolean;
+  /** Per-vault MCP deny rules (`mcp__<server>` patterns). Passed via
+      `--settings` so they apply only to this plugin's subprocesses, never to
+      the user's other Claude Code instances. Each pattern removes that
+      server's tools from the model's advertised tool list. */
+  mcpDenyPatterns?: string[];
 };
 
 export type TabSessionStatus = "starting" | "ready" | "running" | "exited" | "error";
@@ -153,6 +165,13 @@ export class TabSession {
       console.warn(`[claude-cli-chat] stderr:`, chunk);
       for (const cb of this.stderrListeners) cb(chunk);
     });
+    /* Read-side stream errors (EIO/EPIPE after an abnormal child death)
+       emit 'error' on the stream object itself — the child-level 'error'
+       handler below only covers spawn failures. Unhandled, they become an
+       uncaught exception in the renderer. stdout's handler lives in
+       StreamJsonParser.attach; stdin write errors are absorbed by
+       InputWriter's per-write callbacks. */
+    this.child.stderr.on("error", err => console.warn(`[claude-cli-chat] stderr stream error:`, err));
 
     this.child.on("error", err => {
       console.error(`[claude-cli-chat] child error:`, err);
@@ -186,10 +205,20 @@ export class TabSession {
       "--add-dir", opts.cwd,
     ];
     if (opts.includePartialMessages) args.push("--include-partial-messages");
+    if (opts.noSessionPersistence) args.push("--no-session-persistence");
     if (opts.model) args.push("--model", opts.model);
     if (opts.effort) args.push("--effort", opts.effort);
     if (opts.appendSystemPrompt && opts.appendSystemPrompt.trim().length > 0) {
       args.push("--append-system-prompt", opts.appendSystemPrompt);
+    }
+    /* Per-vault MCP disable. `--settings` accepts an inline JSON string and
+       layers on top of the user's own settings; deny rules union across
+       layers and win over allow, so this hides the named servers' tools
+       without touching ~/.claude.json or any shared settings file. Only
+       emitted when something is actually disabled so a fully-enabled vault
+       spawns byte-for-byte as before. */
+    if (opts.mcpDenyPatterns && opts.mcpDenyPatterns.length > 0) {
+      args.push("--settings", JSON.stringify({ permissions: { deny: opts.mcpDenyPatterns } }));
     }
     if (opts.sessionId) args.push("--resume", opts.sessionId);
     return args;
@@ -272,17 +301,31 @@ export class TabSession {
   onStderr(cb: StderrListener) { this.stderrListeners.push(cb); }
 
   async dispose(): Promise<void> {
-    if (this.status === "exited") return;
+    /* "error" means the child never started (synchronous spawn failure —
+       ENOENT/EACCES). There is no process to SIGTERM and no 'exit' event
+       will ever fire, so falling through would block the full 2s timeout
+       for nothing on every disposal of a failed tab. */
+    if (this.status === "exited" || this.status === "error") return;
     this.writer.closeStdin();
     return new Promise(resolve => {
+      /* `status` flips to "exited" asynchronously inside the 'exit' handler, so
+         the process can already be gone here even though the check above passed.
+         If it is, once('exit') would never fire and we'd block the full 2s for
+         nothing (multiplied across tabs on plugin unload). Resolve immediately. */
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      const onExit = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
       const timeout = setTimeout(() => {
+        this.child.removeListener("exit", onExit);
         try { this.child.kill("SIGKILL"); } catch { /* ignore */ }
         resolve();
       }, 2000);
-      this.child.once("exit", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
+      this.child.once("exit", onExit);
       try { this.child.kill("SIGTERM"); } catch { /* ignore */ }
     });
   }
@@ -328,7 +371,14 @@ export class SubprocessManager {
 
   spawn(tabId: string, opts: SpawnOptions): TabSession {
     const existing = this.sessions.get(tabId);
-    if (existing && existing.status !== "exited") return existing;
+    /* A spawn-level failure (ENOENT on a wrong/missing claudePath, EACCES,
+       etc.) leaves the session in status "error" and Node fires only the
+       child 'error' event, never 'exit' — so the onExit reaper below never
+       runs and the dead session lingers in `sessions`. Treat "error" as
+       terminal alongside "exited" so the next attempt replaces it. The
+       `this.sessions.set` below overwrites the stale entry; the failed
+       child never started, so no manual delete or dispose is needed. */
+    if (existing && existing.status !== "exited" && existing.status !== "error") return existing;
     const session = new TabSession(tabId, opts);
     session.onExit(() => {
       const current = this.sessions.get(tabId);
@@ -412,7 +462,8 @@ export class SubprocessManager {
         const argv = cmd.split(/\s+/);
         const first = argv[0] ?? "";
         const isClaude = first === "claude" || /\/claude$/.test(first);
-        if (!isClaude || !argv.includes("--remote-control")) continue;
+        const hasRc = argv.includes("remote-control") || argv.includes("--remote-control");
+        if (!isClaude || !hasRc) continue;
       } catch {
         continue;
       }
@@ -437,6 +488,8 @@ export function spawnOptionsFromSettings(
     effort?: string;
     permissionMode?: ClaudeChatSettings["permissionMode"];
     appendSystemPrompt?: string;
+    noSessionPersistence?: boolean;
+    mcpDenyPatterns?: string[];
   }
 ): SpawnOptions {
   return {
@@ -448,5 +501,7 @@ export function spawnOptionsFromSettings(
     permissionMode: overrides?.permissionMode ?? settings.permissionMode,
     includePartialMessages: settings.includePartialMessages,
     appendSystemPrompt: overrides?.appendSystemPrompt,
+    noSessionPersistence: overrides?.noSessionPersistence,
+    mcpDenyPatterns: overrides?.mcpDenyPatterns,
   };
 }

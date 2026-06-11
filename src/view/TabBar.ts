@@ -10,6 +10,7 @@ export type TabBadgeState = {
   id: string;
   busy: boolean;
   hasPendingApproval: boolean;
+  isIncognito?: boolean;
 };
 
 export class TabBar {
@@ -38,7 +39,7 @@ export class TabBar {
       const badge = this.badgesEl.createSpan({
         cls: this.badgeClass(tab, tab.id === activeTabId),
         text: String(idx + 1),
-        attr: { "data-tab-id": tab.id, title: `Tab ${idx + 1}` },
+        attr: { "data-tab-id": tab.id, title: tab.isIncognito ? `Tab ${idx + 1} · Incognito` : `Tab ${idx + 1}` },
       });
       badge.addEventListener("click", () => this.callbacks.onSelect(tab.id));
       badge.addEventListener("auxclick", e => {
@@ -71,6 +72,7 @@ export class TabBar {
     if (active) parts.push("claudian-tab-badge-active");
     if (tab.busy) parts.push("claudian-tab-badge-streaming");
     if (tab.hasPendingApproval) parts.push("claudian-tab-badge-attention");
+    if (tab.isIncognito) parts.push("claudian-tab-badge-incognito");
     return parts.join(" ");
   }
 }

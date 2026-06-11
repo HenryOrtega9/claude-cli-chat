@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the TC001 animator daemon.
+
+  Install (only after the TC001 is on the network and pingable):
+    cp ~/Developer/claude-cli-chat/scripts/dev.claude-cli-chat.tc001-animator.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/dev.claude-cli-chat.tc001-animator.plist
+
+  Stop / unload:
+    launchctl bootout gui/$(id -u) \
+       ~/Library/LaunchAgents/dev.claude-cli-chat.tc001-animator.plist
+
+  Logs:
+    tail -f /tmp/tc001-animator.log /tmp/tc001-animator.err
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.claude-cli-chat.tc001-animator</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string>
+        <string>/Users/henryortega/Developer/claude-cli-chat/scripts/animator.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TC001_IP</key>
+        <string>192.168.12.126</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/tc001-animator.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/tc001-animator.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

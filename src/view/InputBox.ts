@@ -1,6 +1,8 @@
-import { setIcon } from "obsidian";
+import { setIcon, Notice } from "obsidian";
 import {
   MODEL_LABELS,
+  MODEL_GROUPS,
+  MODEL_NOTES,
   EFFORT_LABELS,
   effortLevelsForModel,
   contextWindowForModel,
@@ -12,11 +14,95 @@ import {
   type ModelKey,
   type EffortLevel,
   type PermissionMode,
+  type TrustedFolder,
 } from "../settings";
 import type { UsageSnapshot } from "../claude/Events";
 import { CLAUDE_ASTERISK_DATA_URI } from "./Welcome";
 import type { Attachment } from "./state";
 import type { ActiveSelection } from "./SelectionTracker";
+
+/* Resolve a picked File to its absolute on-disk path inside Obsidian's
+   Electron environment. Two APIs may apply:
+     - `File.path` (Electron-specific extension) — available through
+       Electron 31. Removed in Electron 32+.
+     - `webUtils.getPathForFile(file)` — the replacement, available from
+       Electron 28 onward via `require("electron").webUtils`.
+   We try `.path` first because it's a free check on older builds, then
+   fall back to webUtils. Returns "" when neither yields a path so the
+   caller can surface a precise error to the user rather than a generic
+   "couldn't read" — most often that means the renderer isn't seeing the
+   `electron` module (sandboxed context, packaged build without node
+   integration), which calls for a different remedy than a code fix. */
+function resolveElectronFilePath(file: File): string {
+  const fromExtension = (file as File & { path?: string }).path;
+  if (fromExtension) return fromExtension;
+  try {
+    const electron = (window as unknown as { require?: (id: string) => unknown }).require?.("electron") as
+      | { webUtils?: { getPathForFile?: (file: File) => string } }
+      | undefined;
+    const resolved = electron?.webUtils?.getPathForFile?.(file);
+    if (resolved) return resolved;
+  } catch (err) {
+    console.warn("[claude-cli-chat] electron.webUtils.getPathForFile threw:", err);
+  }
+  return "";
+}
+
+/* btoa() needs a binary string. Building one with String.fromCharCode(...arr)
+   blows the call stack on large images, so feed it in chunks. */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(binary);
+}
+
+/* Common image MIME types — Finder drops sometimes give an empty `file.type`
+   (especially for less-common formats), so we sniff the extension as a fallback
+   so the file still rides as an image block instead of getting decoded as text. */
+const EXT_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  svg: "image/svg+xml",
+  heic: "image/heic",
+  heif: "image/heif",
+  pdf: "application/pdf",
+};
+
+function guessMimeFromName(name: string): string {
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  return EXT_MIME[ext] ?? "";
+}
+
+/* Cap on bytes a single attachment may carry. Base64 inflates by ~4/3, and
+   text attachments get re-embedded into wireText, so very large files would
+   blow past Claude's per-turn input limit and waste tokens regardless. 10MB
+   is comfortably above typical PDFs/screenshots and well under any model's
+   per-turn budget. */
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+/* Pulls a candidate vault path out of an arbitrary drag payload. Handles
+   the formats Obsidian's drag source produces:
+   - bare path (file explorer):   `MBA/Note.md`
+   - wikilink:                    `[[Note]]`
+   - wikilink with alias:         `[[Note|Alias]]`
+   - wikilink with subpath/alias: `[[Note#Section|Alias]]`
+   Returns null for things that obviously aren't a single path (multi-line,
+   empty, has internal whitespace at line bounds). The caller still has to
+   verify the result resolves in the vault — this only extracts the candidate. */
+function extractVaultPathCandidate(text: string): string | null {
+  const t = text.trim();
+  if (!t || t.includes("\n")) return null;
+  const wl = t.match(/^\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]+)?\]\]$/);
+  if (wl) return wl[1].trim();
+  return t;
+}
 
 export type SubmitPayload = {
   text: string;
@@ -33,6 +119,11 @@ export type Suggestion = {
   secondary?: string;  // muted subtitle (path, hint, etc.)
   icon?: string;       // Obsidian icon name
   insert: string;      // text to insert at the trigger position
+  /* When set to "folder", acceptSuggestion routes the selection to the
+     onPinFolder callback (rendering as a pinned pill at the top) instead of
+     inserting `insert` into the textarea. Files and slash commands continue
+     to use text insertion. Other kinds are reserved for future use. */
+  kind?: "file" | "folder" | "command" | "skill";
 };
 
 export type InputBoxCallbacks = {
@@ -40,6 +131,9 @@ export type InputBoxCallbacks = {
   onModelChange: (model: ModelKey) => void;
   onEffortChange: (effort: EffortLevel) => void;
   onPermissionModeChange: (mode: PermissionMode) => void;
+  /* Fired when the user toggles the incognito pill. Only fires while the pill
+     is unlocked (no live session yet). */
+  onIncognitoChange: (incognito: boolean) => void;
   /* Return vault file matches for an @-mention query. Caller (TabController)
      reads from app.vault and ranks. Limit to ~20 results. */
   onMentionQuery: (query: string) => Suggestion[];
@@ -55,6 +149,61 @@ export type InputBoxCallbacks = {
      keeps working without it but the chip will reappear on the next cursor
      move in the source editor. */
   onSelectionDismissed?: () => void;
+  /* Fired when the user clicks the agents pill in the bottom toolbar.
+     Caller (TabController) is expected to open the SubagentPicker. Optional —
+     when undefined the pill stays hidden regardless of catalog count. */
+  onAgentLaunch?: () => void;
+  /* Fired when a folder is picked from the @-mention popup. Caller
+     (TabController) is expected to add the folder path to the pinned-pill
+     bar. Without this callback the folder suggestion silently no-ops on
+     accept — InputBox doesn't know how to render pinned items itself. */
+  onPinFolder?: (path: string) => void;
+  /* Fired when something with a text/plain payload is dropped on the input
+     and InputBox wants to know whether it's a vault item that should be
+     pinned (as opposed to free text that should be inserted at the cursor).
+     Return true if the path was recognized and pinned — InputBox will then
+     skip its text-insertion fallback. Return false to fall through. Used by
+     the Obsidian file-explorer drag path (files and folders both route here;
+     pill rendering picks the kind via vault lookup). */
+  onTryPinVaultPath?: (path: string) => boolean;
+  /* Called from `dragover` so InputBox can decide whether to preventDefault
+     (and show the drop-target affordance) when the browser-level dataTransfer
+     is empty. Obsidian's file-explorer drags often don't populate
+     `dataTransfer.types` at all — the dragged TFile/TFolder lives on
+     `app.dragManager.draggable` instead. Without this hook the dragover skips
+     preventDefault, the browser rejects the target, and the `drop` event
+     never fires. TabController implements it by peeking at the dragManager. */
+  onIsVaultDragActive?: () => boolean;
+  /* Called from `drop` BEFORE the text/plain fallback. Lets TabController
+     consume the drop directly from `app.dragManager.draggable` (the canonical
+     source for files/folders dragged from Obsidian's file explorer). Return
+     true if the drag was consumed and pinned. Pairs with onIsVaultDragActive. */
+  onTryConsumeVaultDrag?: () => boolean;
+  /* Trusted-folder bridge. InputBox renders the list inside the attach
+     popup; the parent (TabController) owns the persisted state and the
+     permissions writes. Callbacks let the popup query the list on each
+     open (no state sync needed) and request mutations. All are optional —
+     when undefined, the popup degrades to "Pick a file…" only. */
+  onListTrustedFolders?: () => TrustedFolder[];
+  onToggleTrustedFolder?: (path: string, enabled: boolean) => void;
+  onAddTrustedFolder?: (path: string) => void;
+  onRemoveTrustedFolder?: (path: string) => void;
+};
+
+/* Payload TabController hands to InputBox.setCostSurface() to populate the
+   cost-surface pill and its hover popup. mcpServers lists every server
+   configured in mcp.json (enabled or disabled); tools is the live tool
+   list announced by the most recent init event (empty until the first
+   turn). onMcpToggle, when provided, lets the popup wire its checkboxes
+   to TabController.setMcpEnabled. */
+export type CostSurfacePayload = {
+  pinCount: number;
+  mcpServers: Array<{
+    name: string;
+    enabled: boolean;
+    tools: string[];
+  }>;
+  onMcpToggle?: (name: string, enabled: boolean) => void;
 };
 
 /* Map a raw Anthropic model id ("claude-opus-4-7", "claude-sonnet-4-6",
@@ -87,11 +236,54 @@ export class InputBox {
   private effortPillValue: HTMLElement;
   private modePill: HTMLElement;
   private modePillValue: HTMLElement;
+  /* Incognito ("temporary chat") toggle pill. Active = this tab persists
+     nothing. Editable only before the first message; locked once a session
+     exists (the --no-session-persistence decision is fixed at spawn time). */
+  private incognitoPill: HTMLElement;
+  private currentIncognito = false;
+  private incognitoLocked = false;
   private usageChip: HTMLElement;
   private usageDonutCircle: SVGCircleElement;
   private usagePercentEl: HTMLElement;
   private usagePill: HTMLElement;
+  /* "Cost surface" pill — shows how much configuration ships with every turn
+     (pinned files + connected MCP servers). Hidden when both counts are zero
+     so empty tabs stay quiet. See setCostSurface(). */
+  private costPill: HTMLElement;
+  private costPillText: HTMLElement;
+  /* Agents pill — shows the count of discovered subagent definitions and
+     opens the SubagentPicker on click. Hidden when the catalog is empty or
+     when the parent hasn't wired onAgentLaunch. */
+  private agentsPill: HTMLElement | null = null;
+  private agentsPillValue: HTMLElement | null = null;
+  /* Two distinct numbers feed the pill:
+     - agentsCount: total user-defined subagents discovered on disk (catalog
+       size — set by TabController on mount and on /agent refresh).
+     - runningAgentsCount: Task/Agent tools currently in-flight in this tab.
+       Updated by TabController whenever a Task tool starts or completes.
+     The pill is visible when either is > 0, so an empty catalog with a live
+     subagent in flight still surfaces activity. */
+  private agentsCount = 0;
+  private runningAgentsCount = 0;
+  /* Hover popup anchored to the costPill, showing per-server MCP details
+     and an enable/disable checkbox per server. Built lazily on first
+     hover and re-rendered when setCostSurface lands a new payload.
+     Visibility driven by mouseenter/leave on pill+popup with a small
+     grace window so cursor travel between the two doesn't close it. */
+  private costPopup: HTMLElement | null = null;
+  private costPopupHideTimer: number | null = null;
+  /* Most-recent cost-surface payload, retained so the hover popup can
+     re-render itself when shown without needing a fresh data load. */
+  private costPayload: CostSurfacePayload | null = null;
   private sendBtn: HTMLElement;
+  /* Floating "+" button at the bottom-left of the textarea — opens the native
+     OS file picker. Pairs with the Finder drop handler so both ingest paths
+     land in the same addFiles() pipeline. */
+  private attachBtn: HTMLElement;
+  private hiddenFileInput: HTMLInputElement;
+  /* Mirror of hiddenFileInput but with webkitdirectory set — surfaces the
+     OS directory chooser for the "Add folder…" row in the attach popup. */
+  private hiddenDirInput!: HTMLInputElement;
   private callbacks: InputBoxCallbacks;
   private currentModel: ModelKey;
   private currentEffort: EffortLevel;
@@ -120,12 +312,13 @@ export class InputBox {
     container: HTMLElement,
     settings: ClaudeChatSettings,
     callbacks: InputBoxCallbacks,
-    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode }
+    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode; incognito?: boolean }
   ) {
     this.callbacks = callbacks;
     this.currentModel = initial?.model ?? settings.defaultModel;
     this.currentEffort = initial?.effort ?? settings.defaultEffort;
     this.currentMode = initial?.permissionMode ?? settings.permissionMode;
+    this.currentIncognito = initial?.incognito ?? false;
 
     this.root = container.createDiv({ cls: "claudian-input-container" });
     this.wrapper = this.root.createDiv({ cls: "claudian-input-wrapper" });
@@ -153,11 +346,95 @@ export class InputBox {
     });
     this.textarea.addEventListener("paste", e => this.handlePaste(e));
 
-    /* Drop handler on the wrapper covers both the textarea and the chip row. */
+    /* Drop handler on the wrapper covers both the textarea and the chip row.
+       Adds a `.is-drop-target` class during a file drag so the user gets
+       visible feedback that the drop will be accepted. `dragenter` /
+       `dragleave` fire per-child as the cursor moves through descendants —
+       gating on `containsFiles` keeps the affordance off for non-file drags
+       (vault @-mention drags, text selections from other apps). */
+    const containsFiles = (e: DragEvent) =>
+      !!e.dataTransfer && Array.from(e.dataTransfer.types ?? []).includes("Files");
     this.wrapper.addEventListener("dragover", e => {
-      if (e.dataTransfer?.types?.length) e.preventDefault();
+      /* Obsidian's file-explorer drag leaves dataTransfer.types empty (the
+         payload lives on app.dragManager.draggable). Without preventDefault
+         on dragover the browser rejects the target and the drop event never
+         fires — so we ask the parent whether an Obsidian vault drag is
+         currently in flight and accept on that signal too. */
+      const vaultDrag = this.callbacks.onIsVaultDragActive?.() ?? false;
+      if (e.dataTransfer?.types?.length || vaultDrag) e.preventDefault();
+      if (containsFiles(e) || vaultDrag) this.wrapper.addClass("is-drop-target");
     });
-    this.wrapper.addEventListener("drop", e => this.handleDrop(e));
+    this.wrapper.addEventListener("dragleave", e => {
+      /* Fired on every child boundary. Only clear when leaving the wrapper
+         entirely — relatedTarget is null or outside when truly leaving. */
+      const related = e.relatedTarget as Node | null;
+      if (!related || !this.wrapper.contains(related)) {
+        this.wrapper.removeClass("is-drop-target");
+      }
+    });
+    this.wrapper.addEventListener("drop", e => {
+      this.wrapper.removeClass("is-drop-target");
+      this.handleDrop(e);
+    });
+
+    /* Hidden <input type=file> kept at wrapper-level so the attach button
+       (which now lives in the bottom toolbar — see further down) can trigger
+       it via .click(). Both the picker and Finder drops route through
+       addFiles(). */
+    this.hiddenFileInput = this.wrapper.createEl("input", {
+      cls: "claudian-attach-input",
+      attr: { type: "file", multiple: "true" },
+    });
+    this.hiddenFileInput.addEventListener("change", () => {
+      const files = Array.from(this.hiddenFileInput.files ?? []);
+      /* Clear so re-picking the same file fires change again. */
+      this.hiddenFileInput.value = "";
+      if (files.length > 0) void this.addFiles(files);
+    });
+
+    /* Hidden directory picker for the "Add folder…" row in the attach
+       popup. webkitdirectory is the Electron-supported way to surface the
+       OS folder chooser without pulling in @electron/remote. The browser
+       hands back File objects for every entry under the chosen folder; we
+       only need the first one's absolute path (resolved via the
+       Electron-specific `File.path` extension on older Electron, or
+       `webUtils.getPathForFile(file)` on Electron 32+ where `File.path`
+       was removed) to derive the folder by stripping its
+       webkitRelativePath tail. */
+    this.hiddenDirInput = this.wrapper.createEl("input", {
+      cls: "claudian-attach-input",
+      attr: { type: "file", webkitdirectory: "true", directory: "true" },
+    });
+    this.hiddenDirInput.addEventListener("change", () => {
+      const files = Array.from(this.hiddenDirInput.files ?? []);
+      this.hiddenDirInput.value = "";
+      if (files.length === 0) return;
+      const first = files[0];
+      const rel = first.webkitRelativePath ?? "";
+      if (!rel) {
+        new Notice("Couldn't read the folder path (no webkitRelativePath).");
+        return;
+      }
+      const abs = resolveElectronFilePath(first);
+      if (!abs) {
+        new Notice("Couldn't read the folder path (Electron didn't expose an absolute path).");
+        console.error("[claude-cli-chat] No File.path and no webUtils.getPathForFile available for picked folder; first file:", first);
+        return;
+      }
+      /* webkitRelativePath is "<folderName>/<...children>"; strip that tail
+         from the absolute path to get the folder itself. The trailing /
+         is implicit between abs's prefix and rel; len(rel)+1 covers it. */
+      const folderPath = abs.slice(0, Math.max(0, abs.length - rel.length - 1));
+      if (!folderPath) {
+        new Notice("Couldn't resolve the folder's absolute path.");
+        return;
+      }
+      this.callbacks.onAddTrustedFolder?.(folderPath);
+      /* Re-open the popup so the user sees the new entry land without
+         needing a second click. Defer one tick so the file-input close
+         doesn't swallow the popup-mount. */
+      window.setTimeout(() => this.openAttachPopup(), 0);
+    });
 
     /* Floating "42k / 1000k" chip — positioned absolutely just above the
        toolbar, right side. Hidden until the first usage snapshot arrives. */
@@ -181,6 +458,23 @@ export class InputBox {
     this.modePill.addEventListener("click", e => {
       e.stopPropagation();
       this.toggleModePopup();
+    });
+
+    /* Incognito pill — sits right of the mode pill. A binary toggle (no
+       popup): click flips temporary-chat on/off. Disabled once a session
+       exists, since --no-session-persistence is fixed at spawn time. */
+    this.incognitoPill = this.topToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-incognito-pill",
+      attr: {
+        "aria-label": "Incognito (temporary chat) — leaves nothing on disk",
+        title: "Incognito — temporary chat that is never saved to history or disk",
+      },
+    });
+    this.incognitoPill.createSpan({ cls: "claudian-toolbar-pill-value", text: "🕶" });
+    this.incognitoPill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Incognito" });
+    this.incognitoPill.addEventListener("click", e => {
+      e.stopPropagation();
+      this.toggleIncognito();
     });
 
     this.topToolbar.createDiv({ cls: "claudian-input-toolbar-spacer" });
@@ -219,6 +513,93 @@ export class InputBox {
     this.refreshModelPill();
     this.refreshEffortPill();
     this.refreshModePill();
+    this.refreshIncognitoPill();
+
+    /* Cost-surface pill — sits between effort and usage. Shows pinned-file
+       count + connected MCP server count, both of which ride on every turn's
+       input as cache-discounted but real tokens. Compact dual-count format
+       keeps it scannable; tooltip carries the fuller explanation. Hidden
+       until populated by TabController.refreshCostSurface(). */
+    this.costPill = this.bottomToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-cost-pill",
+      attr: {
+        "aria-label": "Per-turn cost surface (pinned files + MCP servers)",
+        title: "Pinned files and connected MCP servers ride on every turn. Hover for details.",
+      },
+    });
+    this.costPillText = this.costPill.createSpan({ cls: "claudian-toolbar-pill-value" });
+    this.costPill.style.display = "none";
+
+    /* Agents pill — persistent toolbar entry. Always visible when the parent
+       wired onAgentLaunch (which becomes "open Create-subagent dialog" by
+       contract; legacy name kept to avoid churning the callback API). The
+       value shows running count when subagents are in flight, otherwise
+       catalog size — so an empty-catalog tab reads "Agents 0" inviting the
+       user to click and create one. */
+    if (this.callbacks.onAgentLaunch) {
+      this.agentsPill = this.bottomToolbar.createSpan({
+        cls: "claudian-toolbar-pill claudian-agents-pill",
+        attr: {
+          "aria-label": "Create a subagent",
+          title: "Create a subagent definition. Click to open the creation dialog.",
+        },
+      });
+      this.agentsPill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Agents" });
+      this.agentsPillValue = this.agentsPill.createSpan({ cls: "claudian-toolbar-pill-value", text: "0" });
+      this.agentsPill.addEventListener("click", e => {
+        e.stopPropagation();
+        this.callbacks.onAgentLaunch?.();
+      });
+      /* Paint the initial value so the pill doesn't read blank before the
+         first setAgentCount/setRunningAgentCount lands. */
+      this.refreshAgentsPill();
+    }
+    /* Popup-trigger wiring: enter shows, leave schedules a close that the
+       popup's own enter handler cancels — that handoff is what lets the
+       cursor travel from pill to popup without the popup vanishing
+       mid-flight. closeNow / scheduleClose live as instance methods so
+       the popup-side handlers can call into them too. */
+    this.costPill.addEventListener("mouseenter", () => this.openCostPopup());
+    this.costPill.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
+    /* Click also toggles the popup (in addition to hover) so keyboard /
+       touch users have a stable affordance. Tapping the pill while the
+       popup is open closes it. */
+    this.costPill.addEventListener("click", e => {
+      e.stopPropagation();
+      if (this.costPopup && this.costPopup.style.display !== "none") {
+        this.closeCostPopupNow();
+      } else {
+        this.openCostPopup();
+      }
+    });
+
+    /* Attach button — small icon button in the bottom toolbar. Sits between
+       the MCP/agents pills and the usage donut, so it reads as "things you
+       add to this turn" alongside the cost-surface controls. Clicking opens
+       the OS file picker; the same addFiles() pipeline also receives Finder
+       drops. Keyboard accessible via role + tabindex (span, not <button>,
+       to keep visual parity with the toolbar pills). */
+    this.attachBtn = this.bottomToolbar.createSpan({
+      cls: "claudian-attach-button",
+      attr: {
+        "aria-label": "Attach file",
+        title: "Attach file from your computer",
+        role: "button",
+        tabindex: "0",
+      },
+    });
+    setIcon(this.attachBtn, "plus");
+    this.attachBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      this.toggleAttachPopup();
+    });
+    this.attachBtn.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleAttachPopup();
+      }
+    });
 
     /* Usage donut + percentage — inline in the bottom toolbar. Hidden
        until the first usage snapshot lands. */
@@ -284,6 +665,240 @@ export class InputBox {
     this.sendBtn.toggleClass("is-disabled", busy);
   }
 
+  /* Update the cost-surface pill and refresh the hover popup. Caller
+     passes a structured payload (see CostSurfacePayload). The pill shows
+     a compact "Pinned N · MCP M (T tools)" summary; the popup expands
+     into per-server detail with enable/disable checkboxes. Pill hides
+     entirely when there's nothing to surface.
+
+     Tool count is the sum across ENABLED servers only — disabled servers
+     don't contribute to the on-wire token cost, so they shouldn't show
+     up in the headline number even though they appear in the popup. */
+  setCostSurface(payload: CostSurfacePayload) {
+    this.costPayload = payload;
+    const pinCount = payload.pinCount;
+    const enabledServers = payload.mcpServers.filter(s => s.enabled);
+    const mcpCount = enabledServers.length;
+    const toolCount = enabledServers.reduce((sum, s) => sum + s.tools.length, 0);
+
+    if (pinCount <= 0 && payload.mcpServers.length <= 0) {
+      this.costPill.style.display = "none";
+      this.closeCostPopupNow();
+      return;
+    }
+    const parts: string[] = [];
+    if (pinCount > 0) parts.push(`Pinned ${pinCount}`);
+    if (payload.mcpServers.length > 0) {
+      /* "MCP 2 (5 tools)" once we know tool counts; just "MCP 2" before
+         the first init lands. Singular tool stays "tool". */
+      const mcpLabel = toolCount > 0
+        ? `MCP ${mcpCount} (${toolCount} tool${toolCount === 1 ? "" : "s"})`
+        : `MCP ${mcpCount}`;
+      parts.push(mcpLabel);
+    }
+    this.costPillText.setText(parts.join(" · "));
+    this.costPill.setAttribute(
+      "title",
+      `${pinCount} pinned file${pinCount === 1 ? "" : "s"} + ${mcpCount} active MCP server${mcpCount === 1 ? "" : "s"} (${toolCount} tool${toolCount === 1 ? "" : "s"}) ride on every turn. Hover for details + toggles.`
+    );
+    this.costPill.style.display = "";
+    /* If the popup is currently visible, re-render its contents so the
+       checkbox states / tool counts stay in sync with the new payload. */
+    if (this.costPopup && this.costPopup.style.display !== "none") {
+      this.renderCostPopupContent();
+    }
+  }
+
+  /* Updates the catalog count (user-defined subagents on disk). Visibility
+     is decided by the combined catalog+running state in refreshAgentsPill. */
+  setAgentCount(count: number): void {
+    this.agentsCount = count;
+    this.refreshAgentsPill();
+  }
+
+  /* Updates the running count (Task/Agent tools currently in flight in this
+     tab). Drives the .is-running tone on the pill and forces visibility even
+     when the catalog is empty, so users see subagent activity at a glance. */
+  setRunningAgentCount(count: number): void {
+    this.runningAgentsCount = count;
+    this.refreshAgentsPill();
+  }
+
+  private refreshAgentsPill(): void {
+    if (!this.agentsPill || !this.agentsPillValue) return;
+    const catalog = this.agentsCount;
+    const running = this.runningAgentsCount;
+    /* Pill is persistent — always shown when the parent wired onAgentLaunch
+       (we only get here if the constructor created the element). Four display
+       states; the rest button is what the user clicks to open the Create
+       dialog regardless of count. */
+    let valueText: string;
+    let title: string;
+    if (running > 0 && catalog > 0) {
+      valueText = `${running} / ${catalog}`;
+      title = `${running} subagent${running === 1 ? "" : "s"} running · ${catalog} in catalog. Click to create a new one (use /agent to launch an existing one).`;
+    } else if (running > 0) {
+      valueText = String(running);
+      title = `${running} subagent${running === 1 ? "" : "s"} running. Click to create a new one (use /agent to launch an existing one).`;
+    } else if (catalog > 0) {
+      valueText = String(catalog);
+      title = `${catalog} subagent${catalog === 1 ? "" : "s"} in catalog. Click to create another (use /agent to launch an existing one).`;
+    } else {
+      valueText = "0";
+      title = "No subagents yet. Click to create your first one.";
+    }
+    this.agentsPillValue.setText(valueText);
+    this.agentsPill.setAttribute("title", title);
+    this.agentsPill.toggleClass("is-running", running > 0);
+    this.agentsPill.style.display = "";
+  }
+
+  private openCostPopup() {
+    if (!this.costPayload) return;
+    if (this.costPopupHideTimer !== null) {
+      window.clearTimeout(this.costPopupHideTimer);
+      this.costPopupHideTimer = null;
+    }
+    if (!this.costPopup) {
+      this.costPopup = this.wrapper.createDiv({ cls: "claudian-cost-popup" });
+      /* Stop clicks inside the popup from bubbling — checkbox clicks
+         shouldn't propagate to outside listeners that might close us. */
+      this.costPopup.addEventListener("click", e => e.stopPropagation());
+      /* Hover handoff: cursor moving from pill onto the popup cancels
+         the scheduled close, so the user can actually click checkboxes
+         without the popup vanishing under their cursor. */
+      this.costPopup.addEventListener("mouseenter", () => {
+        if (this.costPopupHideTimer !== null) {
+          window.clearTimeout(this.costPopupHideTimer);
+          this.costPopupHideTimer = null;
+        }
+      });
+      this.costPopup.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
+    }
+    this.renderCostPopupContent();
+    this.costPopup.style.display = "";
+    /* Re-anchor on every open — the pill's position can shift between
+       opens (window resize, toolbar items added/removed). Same anchoring
+       contract as anchorPopup() for click-driven popups: pin to the pill
+       horizontally, sit just above the wrapper edge so the popup grows
+       upward into the message area. */
+    const pillRect = this.costPill.getBoundingClientRect();
+    const wrapperRect = this.wrapper.getBoundingClientRect();
+    this.costPopup.style.position = "absolute";
+    const wrapperMidX = (wrapperRect.left + wrapperRect.right) / 2;
+    const pillMidX = (pillRect.left + pillRect.right) / 2;
+    if (pillMidX > wrapperMidX) {
+      this.costPopup.style.right = `${wrapperRect.right - pillRect.right}px`;
+      this.costPopup.style.left = "";
+    } else {
+      this.costPopup.style.left = `${pillRect.left - wrapperRect.left}px`;
+      this.costPopup.style.right = "";
+    }
+    this.costPopup.style.bottom = `${wrapperRect.bottom - pillRect.top + 6}px`;
+    this.costPopup.style.top = "";
+    /* Cap the height to the gap between the viewport top and the popup's
+       bottom edge (which sits just above the pill). The popup grows upward
+       from a bottom anchor, so without this a server with many tools — e.g.
+       webull's 68 — would overflow off the top of the screen with no way to
+       scroll to the hidden servers/footer. 8px keeps it off the very edge;
+       160px floor stops it collapsing to nothing in a tiny window. The inner
+       server list (.claudian-cost-popup-server-list) is the scroll region. */
+    const available = pillRect.top - 6 - 8;
+    this.costPopup.style.maxHeight = `${Math.max(160, available)}px`;
+  }
+
+  private scheduleCostPopupClose() {
+    if (this.costPopupHideTimer !== null) window.clearTimeout(this.costPopupHideTimer);
+    /* 250ms grace gives enough time for cursor travel between pill and
+       popup; longer feels sluggish, shorter races with normal hand
+       motion. */
+    this.costPopupHideTimer = window.setTimeout(() => {
+      this.closeCostPopupNow();
+    }, 250);
+  }
+
+  private closeCostPopupNow() {
+    if (this.costPopupHideTimer !== null) {
+      window.clearTimeout(this.costPopupHideTimer);
+      this.costPopupHideTimer = null;
+    }
+    if (this.costPopup) this.costPopup.style.display = "none";
+  }
+
+  /* Build the popup body from the cached payload. Cleared and rebuilt
+     on every render so toggle state transitions land cleanly without
+     having to diff individual checkboxes. */
+  private renderCostPopupContent() {
+    if (!this.costPopup || !this.costPayload) return;
+    this.costPopup.empty();
+    const payload = this.costPayload;
+
+    /* Header line summarizing the on-wire cost surface. Same info as the
+       pill text but expanded — gives context for the controls below. */
+    const header = this.costPopup.createDiv({ cls: "claudian-cost-popup-header" });
+    const enabledServers = payload.mcpServers.filter(s => s.enabled);
+    const toolCount = enabledServers.reduce((sum, s) => sum + s.tools.length, 0);
+    header.createDiv({
+      cls: "claudian-cost-popup-title",
+      text: `MCP: ${enabledServers.length} active · ${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+    });
+    header.createDiv({
+      cls: "claudian-cost-popup-subtitle",
+      text: "Every turn ships these tool definitions. Toggle to disable.",
+    });
+
+    if (payload.mcpServers.length === 0) {
+      this.costPopup.createDiv({
+        cls: "claudian-cost-popup-empty",
+        text: "No MCP servers configured.",
+      });
+      return;
+    }
+
+    /* One card per server, enabled or disabled. Disabled servers render
+       muted with the checkbox unchecked; clicking the checkbox toggles
+       state via the payload-supplied callback. */
+    const list = this.costPopup.createDiv({ cls: "claudian-cost-popup-server-list" });
+    for (const server of payload.mcpServers) {
+      const card = list.createDiv({
+        cls: "claudian-cost-popup-server" + (server.enabled ? "" : " is-disabled"),
+      });
+      const head = card.createDiv({ cls: "claudian-cost-popup-server-head" });
+      /* Native checkbox — accessible by default, works with shift+click
+         and keyboard, no need to reinvent. Wired to onMcpToggle. */
+      const checkbox = head.createEl("input", { attr: { type: "checkbox" } });
+      checkbox.checked = server.enabled;
+      checkbox.addEventListener("change", () => {
+        payload.onMcpToggle?.(server.name, checkbox.checked);
+      });
+      head.createSpan({ cls: "claudian-cost-popup-server-name", text: server.name });
+      const toolLabel = server.enabled
+        ? `${server.tools.length} tool${server.tools.length === 1 ? "" : "s"}`
+        : "disabled";
+      head.createSpan({ cls: "claudian-cost-popup-server-count", text: toolLabel });
+
+      if (server.tools.length > 0) {
+        const toolList = card.createDiv({ cls: "claudian-cost-popup-tool-list" });
+        for (const tool of server.tools) {
+          toolList.createDiv({ cls: "claudian-cost-popup-tool", text: tool });
+        }
+      } else if (server.enabled) {
+        /* Enabled but no tools yet means the init event hasn't landed
+           (brand-new tab, no first message). Surface this so the user
+           doesn't think the server is broken. */
+        card.createDiv({
+          cls: "claudian-cost-popup-tool-list claudian-cost-popup-pending",
+          text: "Tool list arrives after first message.",
+        });
+      }
+    }
+
+    this.costPopup.createDiv({
+      cls: "claudian-cost-popup-footer",
+      text: "Restart chat (/clear) to apply toggles.",
+    });
+  }
+
   /* Tear down the InputBox cleanly. Removes any document-level listeners that
      popups installed, closes any visible popup/suggestion (which also pulls
      their listeners), and flips `destroyed` so late callbacks (deferred
@@ -296,6 +911,13 @@ export class InputBox {
     this.destroyed = true;
     if (this.openPopup) this.closePopup();
     if (this.suggestion) this.hideSuggestion();
+    /* The cost popup's 250ms close-grace timer is not owned by closePopup/
+       hideSuggestion. Left pending, it fires after teardown and touches the
+       already-detached costPopup node. */
+    if (this.costPopupHideTimer !== null) {
+      window.clearTimeout(this.costPopupHideTimer);
+      this.costPopupHideTimer = null;
+    }
   }
 
   /* Mounts an external element (e.g. the active-file pill bar) just
@@ -447,6 +1069,26 @@ export class InputBox {
     else if (this.currentMode === "auto") this.modePill.addClass("mode-auto");
   }
 
+  private refreshIncognitoPill() {
+    this.incognitoPill.toggleClass("is-active", this.currentIncognito);
+    this.incognitoPill.toggleClass("is-disabled", this.incognitoLocked);
+  }
+
+  private toggleIncognito() {
+    if (this.incognitoLocked) return;
+    this.currentIncognito = !this.currentIncognito;
+    this.refreshIncognitoPill();
+    this.callbacks.onIncognitoChange(this.currentIncognito);
+  }
+
+  /* Lock/unlock the incognito pill. TabController locks once a session exists
+     (the decision is fixed at spawn time) and on restore of a tab that already
+     has history. */
+  setIncognitoLocked(locked: boolean) {
+    this.incognitoLocked = locked;
+    this.refreshIncognitoPill();
+  }
+
   private toggleModePopup() {
     if (this.openPopup) {
       const wasMode = this.openPopup.el.classList.contains("claudian-popup-mode");
@@ -489,21 +1131,32 @@ export class InputBox {
       if (wasModel) return;
     }
     const popup = this.createPopup("claudian-popup-model");
-    popup.createDiv({ cls: "claudian-popup-header", text: "CLAUDE" });
-    for (const key of Object.keys(MODEL_LABELS) as ModelKey[]) {
-      const row = popup.createDiv({
-        cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
-      });
-      const icon = row.createSpan({ cls: "claudian-popup-row-icon" });
-      const img = icon.createEl("img");
-      img.src = CLAUDE_ASTERISK_DATA_URI;
-      img.alt = "";
-      row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
-      row.addEventListener("click", e => {
-        e.stopPropagation();
-        this.selectModel(key);
-        this.closePopup();
-      });
+    for (const group of MODEL_GROUPS) {
+      popup.createDiv({ cls: "claudian-popup-header", text: group.header });
+      for (const key of group.keys) {
+        const row = popup.createDiv({
+          cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
+        });
+        const icon = row.createSpan({ cls: "claudian-popup-row-icon" });
+        const img = icon.createEl("img");
+        img.src = CLAUDE_ASTERISK_DATA_URI;
+        img.alt = "";
+        const note = MODEL_NOTES[key];
+        if (note) {
+          /* Models with an availability caveat stack label over the note,
+             reusing the icon + labels-column shell from folder rows. */
+          const labels = row.createDiv({ cls: "claudian-popup-row-labels" });
+          labels.createDiv({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+          labels.createDiv({ cls: "claudian-popup-row-sublabel", text: note });
+        } else {
+          row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+        }
+        row.addEventListener("click", e => {
+          e.stopPropagation();
+          this.selectModel(key);
+          this.closePopup();
+        });
+      }
     }
     this.anchorPopup(popup, this.modelPill);
   }
@@ -544,6 +1197,115 @@ export class InputBox {
       });
     }
     this.anchorPopup(popup, this.effortPill);
+  }
+
+  /* Attach popup — anchored to the + button. Mirrors the
+     model/effort/mode popup pattern but carries two sections:
+       1) "Pick a file…" row that fires the OS file picker (current
+          behavior of the bare + button, preserved here).
+       2) Trusted folders list with per-row checkboxes that toggle
+          Read/Glob/Grep allowlist patterns for that absolute path,
+          plus an "Add folder…" row that surfaces the OS directory
+          chooser. The list persists across sessions in plugin settings.
+
+     Toggling the same + click again closes the popup (true toggle, same
+     contract as the toolbar pills). */
+  private toggleAttachPopup() {
+    if (this.openPopup) {
+      const wasAttach = this.openPopup.el.classList.contains("claudian-popup-attach");
+      this.closePopup();
+      if (wasAttach) return;
+    }
+    this.openAttachPopup();
+  }
+
+  private openAttachPopup() {
+    if (this.openPopup) this.closePopup();
+    const popup = this.createPopup("claudian-popup-attach");
+
+    /* "Pick a file…" — first row so it stays the keyboard-default action
+       and dominates muscle memory for users who just want what + used to
+       do. Routes through the same hiddenFileInput / addFiles pipeline as
+       Finder drops. */
+    const pickRow = popup.createDiv({ cls: "claudian-popup-row claudian-popup-row-action" });
+    const pickIcon = pickRow.createSpan({ cls: "claudian-popup-row-icon" });
+    setIcon(pickIcon, "folder-open");
+    pickRow.createSpan({ cls: "claudian-popup-row-label", text: "Pick a file…" });
+    pickRow.addEventListener("click", e => {
+      e.stopPropagation();
+      this.closePopup();
+      this.openFilePicker();
+    });
+
+    /* Trusted folders section — only renders when the parent wired the
+       list callback. Without onListTrustedFolders, the popup degrades
+       gracefully to "Pick a file…" alone. */
+    const list = this.callbacks.onListTrustedFolders?.() ?? null;
+    if (list !== null) {
+      popup.createDiv({ cls: "claudian-popup-divider" });
+      popup.createDiv({ cls: "claudian-popup-section-header", text: "Trusted folders" });
+
+      if (list.length === 0) {
+        popup.createDiv({
+          cls: "claudian-popup-section-empty",
+          text: "None yet — add a folder below to let Claude read it on demand.",
+        });
+      } else {
+        for (const folder of list) {
+          this.renderTrustedFolderRow(popup, folder);
+        }
+      }
+
+      const addRow = popup.createDiv({ cls: "claudian-popup-row claudian-popup-row-action" });
+      const addIcon = addRow.createSpan({ cls: "claudian-popup-row-icon" });
+      setIcon(addIcon, "plus");
+      addRow.createSpan({ cls: "claudian-popup-row-label", text: "Add folder…" });
+      addRow.addEventListener("click", e => {
+        e.stopPropagation();
+        this.hiddenDirInput.click();
+      });
+    }
+
+    this.anchorPopup(popup, this.attachBtn);
+  }
+
+  /* One row per trusted folder. Checkbox toggles enabled/disabled (which in
+     turn writes/removes the permission patterns). The label shows the
+     folder's basename for scannability; the full absolute path lives in the
+     row's title attribute and as the secondary line under the basename when
+     space allows. Trash button removes the entry entirely. */
+  private renderTrustedFolderRow(popup: HTMLElement, folder: TrustedFolder) {
+    const row = popup.createDiv({
+      cls: "claudian-popup-row claudian-popup-row-folder" + (folder.enabled ? " is-enabled" : ""),
+    });
+    row.setAttr("title", folder.path);
+
+    const checkbox = row.createEl("input", {
+      cls: "claudian-popup-row-checkbox",
+      attr: { type: "checkbox" },
+    });
+    checkbox.checked = folder.enabled;
+    checkbox.addEventListener("click", e => e.stopPropagation());
+    checkbox.addEventListener("change", () => {
+      this.callbacks.onToggleTrustedFolder?.(folder.path, checkbox.checked);
+      row.toggleClass("is-enabled", checkbox.checked);
+    });
+
+    const labels = row.createDiv({ cls: "claudian-popup-row-labels" });
+    const basename = folder.path.split("/").filter(Boolean).pop() ?? folder.path;
+    labels.createSpan({ cls: "claudian-popup-row-label", text: basename });
+    labels.createSpan({ cls: "claudian-popup-row-sublabel", text: folder.path });
+
+    const removeBtn = row.createSpan({
+      cls: "claudian-popup-row-remove",
+      attr: { "aria-label": "Remove folder", title: "Remove from trusted folders" },
+    });
+    setIcon(removeBtn, "x");
+    removeBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      this.callbacks.onRemoveTrustedFolder?.(folder.path);
+      row.remove();
+    });
   }
 
   private createPopup(extraClass: string): HTMLElement {
@@ -607,12 +1369,17 @@ export class InputBox {
       if (e.key === "Escape") this.closePopup();
     };
     /* Defer attaching so the click that opened the popup doesn't immediately
-       close it via the document listener firing in the same tick. */
+       close it via the document listener firing in the same tick. Guard the
+       deferred attach: if the box was destroyed or a different popup opened
+       during this tick, closePopup already ran (for this popup or the one that
+       replaced it) and these handlers would leak on document with nothing left
+       to remove them. */
+    this.openPopup = { el: popup, outsideHandler, keyHandler };
     window.setTimeout(() => {
+      if (this.destroyed || this.openPopup?.el !== popup) return;
       document.addEventListener("mousedown", outsideHandler);
       document.addEventListener("keydown", keyHandler);
     }, 0);
-    this.openPopup = { el: popup, outsideHandler, keyHandler };
   }
 
   private closePopup() {
@@ -627,6 +1394,11 @@ export class InputBox {
     /* When the suggestion popup is open, arrow keys + Enter/Tab navigate it.
        Esc closes it. Everything else falls through to normal typing. */
     if (this.suggestion) {
+      /* Mid-IME-composition, ArrowUp/Down move the IME candidate window and Esc
+         dismisses it — those keystrokes belong to the IME, not the popup. The
+         Enter/Tab branch below already guards on isComposing; do the same for
+         the whole block so a CJK/accent composition isn't hijacked. */
+      if (e.isComposing) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         this.moveSuggestion(1);
@@ -778,6 +1550,23 @@ export class InputBox {
     if (!this.suggestion) return;
     const item = this.suggestion.items[this.suggestion.activeIndex];
     if (!item) return;
+    /* Folders are sideloaded into the pinned-pill bar rather than typed into
+       the textarea. We still strip the `@query` fragment the user typed
+       (otherwise it lingers as orphaned text) but the pill bar becomes the
+       canonical reference. If the caller didn't wire onPinFolder we fall
+       through to plain text insertion so the popup remains useful. */
+    if (item.kind === "folder" && this.callbacks.onPinFolder) {
+      const cursor = this.textarea.selectionStart ?? this.textarea.value.length;
+      const before = this.textarea.value.slice(0, this.suggestion.triggerStart);
+      const after = this.textarea.value.slice(cursor);
+      this.textarea.value = before + after;
+      this.textarea.selectionStart = this.textarea.selectionEnd = before.length;
+      this.callbacks.onPinFolder(item.id);
+      this.hideSuggestion();
+      this.autoResize();
+      this.textarea.focus();
+      return;
+    }
     const cursor = this.textarea.selectionStart ?? this.textarea.value.length;
     const before = this.textarea.value.slice(0, this.suggestion.triggerStart);
     const after = this.textarea.value.slice(cursor);
@@ -796,7 +1585,7 @@ export class InputBox {
     this.suggestion = null;
   }
 
-  private handlePaste(e: ClipboardEvent) {
+  private async handlePaste(e: ClipboardEvent) {
     const items = e.clipboardData?.items;
     if (!items) return;
     const imageItems = Array.from(items).filter(it => it.kind === "file" && it.type.startsWith("image/"));
@@ -807,36 +1596,134 @@ export class InputBox {
        presence, silently dropping the text. Instead: only preventDefault when
        the clipboard is image-only. When text is also present, let the browser
        handle the text paste normally and process the image asynchronously into
-       the attachment list (FileReader is already async, so the text paste
+       the attachment list (Blob.arrayBuffer() is async, so the text paste
        lands first regardless). */
     const hasText = Array.from(items).some(it => it.kind === "string" && it.type === "text/plain");
     if (!hasText) e.preventDefault();
+    /* Snapshot the array identity so a submit() that lands mid-decode (which
+       rebinds this.attachments to a fresh array for the next message) doesn't
+       cause the decoded image to ride on the next turn. */
+    const target = this.attachments;
     for (const item of imageItems) {
       const file = item.getAsFile();
       if (!file) continue;
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (this.destroyed) return;
-        const result = reader.result as string;
-        const comma = result.indexOf(",");
-        const data = comma >= 0 ? result.slice(comma + 1) : result;
-        this.attachments.push({ mediaType: file.type, data });
+      /* Avoid FileReader: in some Obsidian/Electron renderer configurations
+         the FileReader instance is missing readAsDataURL, which silently
+         broke image paste. Blob.arrayBuffer() works universally. */
+      try {
+        const buf = await file.arrayBuffer();
+        if (this.destroyed || this.attachments !== target) return;
+        const data = bytesToBase64(new Uint8Array(buf));
+        this.attachments.push({ kind: "image", mediaType: file.type, data });
         this.renderAttachmentChips();
-      };
-      reader.readAsDataURL(file);
+      } catch (err) {
+        console.error("claude-cli-chat: failed to read pasted image", err);
+      }
     }
   }
 
   private handleDrop(e: DragEvent) {
     const dt = e.dataTransfer;
     if (!dt) return;
+    /* Always swallow the drop if dataTransfer carries anything — without
+       this Electron may navigate to a dropped file:// URL or open it in a
+       new window. Matches the dragover preventDefault gate. We also swallow
+       when an Obsidian vault drag is active (which leaves dt.types empty). */
+    const vaultDrag = this.callbacks.onIsVaultDragActive?.() ?? false;
+    if (dt.types?.length || vaultDrag) e.preventDefault();
+    /* Finder drops carry File objects on dt.files. Take that path first.
+       Falls through to the text/plain branch only when no files were
+       dropped — that branch still handles vault file drag-ins (which arrive
+       as a path string) and editor selection drops. */
+    const files = Array.from(dt.files ?? []);
+    if (files.length > 0) {
+      void this.addFiles(files);
+      return;
+    }
+    /* Obsidian internal drags (file explorer): the TFile/TFolder lives on
+       app.dragManager.draggable, not on the dataTransfer. Ask the parent
+       to consume the drop from there before falling through to text/plain
+       (which Obsidian sometimes populates with a wikilink, sometimes not). */
+    if (this.callbacks.onTryConsumeVaultDrag?.()) return;
     const text = dt.getData("text/plain");
     if (!text) return;
-    e.preventDefault();
+    /* Obsidian's file explorer puts the vault-relative path on text/plain
+       when you drag a note or folder. Strip wikilink wrappers and alias
+       suffixes so [[Foo|Bar]] resolves the same as a bare Foo path. If the
+       result resolves to a vault item, route through the pin callback —
+       the pill bar handles file-vs-folder styling via its own vault lookup.
+       Anything else (external app text, multi-line, unresolved path) falls
+       through to the original cursor-insert behavior. */
+    const candidate = extractVaultPathCandidate(text);
+    if (candidate && this.callbacks.onTryPinVaultPath?.(candidate)) return;
     const sel = this.textarea.selectionStart ?? this.textarea.value.length;
     const prevChar = this.textarea.value.charAt(sel - 1);
     const needsSpace = sel > 0 && prevChar && !/\s/.test(prevChar);
     this.insertAtCursor((needsSpace ? " " : "") + text + " ");
+  }
+
+  private openFilePicker() {
+    this.hiddenFileInput.click();
+  }
+
+  /* Shared ingest path for both the + button and Finder drops. Decides per
+     file whether it rides as an image block, a PDF document block, or as
+     inlined text. Anything that fails the size cap or can't be decoded
+     surfaces a Notice and is skipped so one bad file doesn't abort the rest. */
+  private async addFiles(files: File[]) {
+    /* Snapshot the array identity so a submit() that lands mid-decode (which
+       rebinds this.attachments to a fresh array for the next message) doesn't
+       cause the decoded file to ride on the next turn. */
+    const target = this.attachments;
+    for (const file of files) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        new Notice(`${file.name} is too large (max 10MB)`);
+        continue;
+      }
+      try {
+        const att = await this.fileToAttachment(file);
+        if (this.destroyed || this.attachments !== target) return;
+        this.attachments.push(att);
+      } catch (err) {
+        console.error("claude-cli-chat: failed to attach file", file.name, err);
+        const msg = err instanceof Error ? err.message : String(err);
+        new Notice(`Couldn't attach ${file.name}: ${msg}`);
+      }
+    }
+    if (this.destroyed) return;
+    this.renderAttachmentChips();
+  }
+
+  private async fileToAttachment(file: File): Promise<Attachment> {
+    const mime = file.type || guessMimeFromName(file.name);
+    if (mime.startsWith("image/")) {
+      const buf = await file.arrayBuffer();
+      return {
+        kind: "image",
+        mediaType: mime,
+        data: bytesToBase64(new Uint8Array(buf)),
+        filename: file.name,
+      };
+    }
+    if (mime === "application/pdf") {
+      const buf = await file.arrayBuffer();
+      return {
+        kind: "pdf",
+        mediaType: "application/pdf",
+        data: bytesToBase64(new Uint8Array(buf)),
+        filename: file.name,
+      };
+    }
+    /* Everything else is best-effort text. Binaries will look like noise to
+       Claude but won't crash the pipeline — the user explicitly chose this
+       file, so we let them try rather than silently rejecting. */
+    const content = await file.text();
+    return {
+      kind: "text",
+      mediaType: mime || "text/plain",
+      content,
+      filename: file.name,
+    };
   }
 
   /* Push the active editor selection into the input as a pinned chip.
@@ -891,9 +1778,29 @@ export class InputBox {
     this.attachments.forEach((att, i) => {
       const chip = this.contextRow.createDiv({ cls: "claudian-context-chip" });
       const iconEl = chip.createSpan({ cls: "claudian-context-chip-icon" });
-      setIcon(iconEl, "image");
-      const subtype = att.mediaType.split("/")[1] || "image";
-      chip.createSpan({ cls: "claudian-context-chip-label", text: `${subtype.toUpperCase()} attachment` });
+      const kind = att.kind ?? "image";
+      let iconName: string;
+      let label: string;
+      if (kind === "image") {
+        iconName = "image";
+        if (att.filename) label = att.filename;
+        else {
+          const subtype = att.mediaType.split("/")[1] || "image";
+          label = `${subtype.toUpperCase()} attachment`;
+        }
+      } else if (kind === "pdf") {
+        iconName = "file-text";
+        label = att.filename ?? "document.pdf";
+      } else {
+        iconName = "file";
+        label = att.filename ?? "text file";
+      }
+      setIcon(iconEl, iconName);
+      chip.createSpan({
+        cls: "claudian-context-chip-label",
+        text: label,
+        attr: att.filename ? { title: att.filename } : {},
+      });
       const remove = chip.createSpan({ cls: "claudian-context-chip-remove", attr: { "aria-label": "Remove", title: "Remove" } });
       setIcon(remove, "x");
       remove.addEventListener("click", e => {

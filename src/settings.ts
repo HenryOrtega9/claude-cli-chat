@@ -7,6 +7,8 @@ import {
   RECOMMENDED_ALLOW_PATTERNS,
 } from "./permissions/PermissionsConfig";
 import { findRemoteControlPids } from "./claude/SubprocessManager";
+import { StateEmitter } from "./claude/StateEmitter";
+import { SubagentManagerModal } from "./view/SubagentManagerModal";
 
 /* Per-control debounce helper used to coalesce rapid text-input keystrokes
    into a single saveSettings() call. The synchronous in-memory state is
@@ -33,7 +35,10 @@ function debounced<A extends unknown[]>(fn: (...args: A) => void, ms: number): (
    itself does the model selection; the underlying Opus path still gets
    1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
-  "opus-1m": "claude-opus-4-7[1m]",
+  "fable-5": "claude-fable-5[1m]",
+  "opus-1m": "claude-opus-4-8[1m]",
+  "opus-4-7-1m": "claude-opus-4-7[1m]",
+  "opus-4-6-1m": "claude-opus-4-6[1m]",
   "opus-plan": "opusplan",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
   "haiku": "haiku",
@@ -42,11 +47,39 @@ export const MODEL_IDS = {
 export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
-  "opus-1m": "Opus 1M",
+  "fable-5": "Fable 5 1M",
+  "opus-1m": "Opus 4.8 1M",
+  "opus-4-7-1m": "Opus 4.7 1M",
+  "opus-4-6-1m": "Opus 4.6 1M",
   "opus-plan": "Opus Plan",
-  "sonnet-1m": "Sonnet 1M",
+  "sonnet-1m": "Sonnet 4.6 1M",
   "haiku": "Haiku",
 };
+
+/* Availability caveats surfaced under the model name in the picker popup
+   and appended to the settings dropdown. fable-5 is a fresh release (June
+   2026) whose subscription-plan access is not guaranteed past 2026-06-22.
+   If Anthropic pulls it, delete the "fable-5" entries here and in
+   MODEL_IDS/MODEL_LABELS/MODEL_GROUPS — the defaultModel guard in main.ts
+   and the per-tab ModelKey guard in TabController fall back gracefully for
+   anyone who had it persisted. 1M context and xhigh effort are confirmed
+   supported, so it carries the `[1m]` suffix and the full effort ladder
+   like the Opus 1M variants. */
+export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
+  "fable-5": "New release. Subscription access may end after Jun 22, 2026.",
+};
+
+/* Ordered sections for the model-picker popup; each renders under its own
+   header. Fable (the newest family) leads, then Opus variants (including
+   the opus-plan alias, which routes to Opus), then Sonnet, then Haiku.
+   Keep in sync with MODEL_IDS: every ModelKey must appear in exactly one
+   group. */
+export const MODEL_GROUPS: { header: string; keys: ModelKey[] }[] = [
+  { header: "FABLE", keys: ["fable-5"] },
+  { header: "OPUS", keys: ["opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
+  { header: "SONNET", keys: ["sonnet-1m"] },
+  { header: "HAIKU", keys: ["haiku"] },
+];
 
 /* Effort levels mirror Claude Code CLI's `--effort` flag (v2.1.141:
    low, medium, high, xhigh, max). xhigh is Opus-only — the UI hides it
@@ -62,20 +95,21 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   Opus today (including opus-plan, which routes to Opus when in plan mode);
-   everything else shows the standard four. */
+   Fable 5 and Opus today (Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which
+   routes to Opus when in plan mode); everything else shows the standard
+   four. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "opus-1m" || model === "opus-plan") return EFFORT_ORDER;
+  if (model === "fable-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
 /* Total context window size for a model, used as the denominator when the
    usage snapshot doesn't include `contextWindow` directly. The `[1m]` suffix
    models open the 1M-token window; everything else is 200k. opus-plan can
-   resolve to either Opus (1M) or Sonnet (200k) at runtime — we display 1M
+   resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "opus-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "fable-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 
@@ -110,6 +144,18 @@ export function nextPermissionMode(current: PermissionMode): PermissionMode {
   return PERMISSION_MODE_ORDER[(idx + 1) % PERMISSION_MODE_ORDER.length];
 }
 
+/* A folder outside the vault that the plugin has been granted "trusted"
+   status for. When `enabled`, the corresponding Read/Glob/Grep allowlist
+   patterns are present in <vault>/.claude/settings.json so Claude can read
+   anything under this path without prompting. When disabled, the patterns
+   are removed; the folder stays in the list so the user can re-enable with
+   one click instead of re-picking it. Path is absolute and normalized
+   (trailing slash stripped). */
+export type TrustedFolder = {
+  path: string;
+  enabled: boolean;
+};
+
 /* Reusable bundle of settings (model + effort + permission mode + an
    optional system-prompt addendum). Lets the user switch between work
    contexts — "Coding", "Research", "Vault writing" — with one click. */
@@ -135,14 +181,29 @@ export type ClaudeChatSettings = {
   /* Auto-generate a conversation title after the first user message +
      assistant response. */
   autoGenerateTitles: boolean;
-  /* Model alias used for title generation. "haiku" is fast + cheap and
-     well-suited to the task. */
-  titleGenerationModel: string;
   /* Always-on system-prompt addendum applied to every tab in this vault.
      Passed via --append-system-prompt on every spawn. Composes with the
      per-tab env snippet's addendum (both apply if both set). Functionally
      equivalent to a vault-scoped CLAUDE.md addition. */
   vaultSystemPromptAddendum: string;
+  /* Folders outside the vault that the user has explicitly trusted so
+     Claude can read from them on demand via the Read/Glob/Grep tools. Each
+     entry persists across sessions; toggling `enabled` adds or removes the
+     matching `Read(<path>/**)` etc. patterns from .claude/settings.json's
+     allowlist. Default empty — the user opts in folder by folder. */
+  trustedFolders: TrustedFolder[];
+  /* When true, the list of enabled trusted folders is appended to every
+     spawn's system prompt so Claude knows where it can look on demand
+     without needing the user to mention paths explicitly. Default on. */
+  trustedFoldersInSystemPrompt: boolean;
+  /* Ulanzi TC001 status display integration. When enabled, the plugin
+     drives a 32x8 LED matrix on the LAN: state changes (thinking,
+     needs_permission, complete, ready, idle) are pushed to the device
+     and written to /tmp/claude_state for the animator daemon. v1 is
+     plugin-only; terminal Claude Code does NOT emit. Default off so the
+     plugin is silent until hardware is on the network. */
+  tc001Enabled: boolean;
+  tc001Ip: string;
 };
 
 export const DEFAULT_SETTINGS: ClaudeChatSettings = {
@@ -155,9 +216,25 @@ export const DEFAULT_SETTINGS: ClaudeChatSettings = {
   permissionMode: "default",
   envSnippets: [],
   autoGenerateTitles: true,
-  titleGenerationModel: "haiku",
   vaultSystemPromptAddendum: "",
+  trustedFolders: [],
+  trustedFoldersInSystemPrompt: true,
+  tc001Enabled: false,
+  tc001Ip: "192.168.1.50",
 };
+
+/* Build the allowlist patterns that grant Read/Glob/Grep access to anything
+   under an absolute folder path. Centralized so the add and remove paths use
+   the same shape — divergence here would silently leave dangling permission
+   entries the user can't see without opening settings.json by hand. */
+export function trustedFolderAllowPatterns(absolutePath: string): string[] {
+  const normalized = absolutePath.replace(/\/+$/, "");
+  return [
+    `Read(${normalized}/**)`,
+    `Glob(${normalized}/**)`,
+    `Grep(${normalized}/**)`,
+  ];
+}
 
 export function makeSnippetId(): string {
   return `snip-${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
@@ -259,11 +336,12 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Default model")
-      .setDesc("Sonnet 1M and Opus 1M use the 1M-context window via the `[1m]` model suffix. Haiku has standard context.")
+      .setDesc("Fable 5, Sonnet 1M, and Opus 1M use the 1M-context window via the `[1m]` model suffix. Haiku has standard context.")
       .addDropdown(dd => {
         const options: Record<string, string> = {};
         for (const key of Object.keys(MODEL_LABELS) as ModelKey[]) {
-          options[key] = `${MODEL_LABELS[key]} (${MODEL_IDS[key]})`;
+          const note = MODEL_NOTES[key];
+          options[key] = `${MODEL_LABELS[key]} (${MODEL_IDS[key]})${note ? ` - ${note}` : ""}`;
         }
         dd.addOptions(options)
           .setValue(this.plugin.settings.defaultModel)
@@ -374,22 +452,8 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Title generation model")
-      .setDesc("Model alias to use for auto-titling. Haiku is fast and cheap; pass any alias the CLI understands.")
-      .addText(text => {
-        const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
-        text
-          .setPlaceholder("haiku")
-          .setValue(this.plugin.settings.titleGenerationModel)
-          .onChange(value => {
-            this.plugin.settings.titleGenerationModel = value.trim() || "haiku";
-            debouncedSave();
-          });
-      });
-
-    new Setting(containerEl)
-      .setName("Remote Control session prefix")
-      .setDesc("Optional prefix for auto-generated Remote Control session names. Defaults to your machine hostname.")
+      .setName("Remote Control session name")
+      .setDesc("Label shown for this machine in the Remote Control session list on the web and phone. Used verbatim when set; defaults to your machine hostname when blank.")
       .addText(text => {
         const debouncedSave = debounced(() => { void this.plugin.saveSettings(); }, 250);
         text
@@ -403,7 +467,85 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     this.renderSnippetsSection(containerEl);
 
+    this.renderSubagentsSection(containerEl);
+
+    this.renderTC001Section(containerEl);
+
     this.renderProcessCleanupSection(containerEl);
+  }
+
+  /* Subagent definitions discovered on disk. Read-only catalog browser —
+     edits happen by opening the file in its default app. */
+  private renderSubagentsSection(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Subagents" });
+    containerEl.createEl("p", {
+      text:
+        "Markdown files with YAML frontmatter that Claude can invoke via the Task tool. " +
+        "Scanned from <vault>/.claude/agents, ~/.claude/agents, and installed-plugin agents/ dirs.",
+      cls: "setting-item-description",
+    });
+
+    const count = this.plugin.subagentCatalog.agents.length;
+    new Setting(containerEl)
+      .setName("Discovered subagents")
+      .setDesc(count === 0 ? "None discovered." : `${count} subagent${count === 1 ? "" : "s"} found.`)
+      .addButton(btn => {
+        btn.setButtonText("Manage subagents")
+          .setCta()
+          .onClick(() => {
+            new SubagentManagerModal(this.app, this.plugin).open();
+          });
+      })
+      .addExtraButton(btn => {
+        btn.setIcon("refresh-cw")
+          .setTooltip("Rescan disk for subagent definitions")
+          .onClick(() => {
+            this.plugin.refreshSubagentCatalog();
+            this.display();
+            new Notice(`Rescanned subagents: ${this.plugin.subagentCatalog.agents.length} discovered.`);
+          });
+      });
+  }
+
+  /* Ulanzi TC001 status display. v1 is plugin-only: terminal Claude Code
+     does NOT emit state, only this plugin does. Toggle is default-off so
+     the plugin makes no network calls until the user has hardware on the
+     LAN and explicitly opts in. */
+  private renderTC001Section(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Status display (Ulanzi TC001)" });
+    containerEl.createEl("p", {
+      text: "Drives a 32x8 LED matrix on the LAN with Claude's current state (idle, thinking, needs_permission, complete, ready). Plugin-only in v1; terminal Claude Code does not emit. Pushes are fail-silent with a 0.5s timeout, so toggling on when the device is unreachable will never block plugin events.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("Enable display integration")
+      .setDesc("Push state changes to the TC001 and write /tmp/claude_state for the animator daemon.")
+      .addToggle(t =>
+        t.setValue(this.plugin.settings.tc001Enabled).onChange(async value => {
+          this.plugin.settings.tc001Enabled = value;
+          await this.plugin.saveSettings();
+          StateEmitter.configure(value, this.plugin.settings.tc001Ip);
+          if (value) StateEmitter.setState("idle");
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("TC001 IP address")
+      .setDesc("LAN address of the device (set a DHCP reservation for stability). Awtrix Light HTTP API listens on port 80.")
+      .addText(text => {
+        const debouncedSave = debounced(() => {
+          void this.plugin.saveSettings();
+          StateEmitter.configure(this.plugin.settings.tc001Enabled, this.plugin.settings.tc001Ip);
+        }, 250);
+        text
+          .setPlaceholder("192.168.1.50")
+          .setValue(this.plugin.settings.tc001Ip)
+          .onChange(value => {
+            this.plugin.settings.tc001Ip = value.trim();
+            debouncedSave();
+          });
+      });
   }
 
   /* Surfaces a count of live `claude --remote-control` processes (tracked

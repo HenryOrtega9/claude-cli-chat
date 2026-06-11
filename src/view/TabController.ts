@@ -1,4 +1,4 @@
-import { Notice, TFile, type App, type Component } from "obsidian";
+import { Notice, TFile, TFolder, type App, type Component, type EventRef } from "obsidian";
 import { MessageListRenderer } from "./MessageRenderer";
 import { ApprovalArea, type ApprovalDecision } from "./ApprovalModal";
 import { InputBox, type SubmitPayload, type Suggestion } from "./InputBox";
@@ -8,12 +8,21 @@ import { StatusIndicator } from "./StatusIndicator";
 import { SearchBar } from "./SearchBar";
 import { ActiveFileIndicator } from "./ActiveFileIndicator";
 import { SelectionTracker, type ActiveSelection } from "./SelectionTracker";
-import { makeMessageId, makeTabState, type ChatMessage, type TabState, type PendingApproval, type ToolCall } from "./state";
+import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
-import { resolveModelId, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet } from "../settings";
-import { RemoteControlSession, sessionFilePathFor } from "../claude/RemoteControlSession";
+import { resolveModelId, trustedFolderAllowPatterns, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
+import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
+import { RemoteControlSession, sessionFilePathFor, projectDirFor } from "../claude/RemoteControlSession";
+import { rm } from "node:fs/promises";
 import { JsonlTailer } from "../claude/JsonlTailer";
+import { SubagentSessionTracker, type SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
 import { generateTitle } from "../claude/TitleGenerator";
+import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
+import { SubagentPicker } from "./SubagentPicker";
+import { CreateSubagentModal } from "./CreateSubagentModal";
+import type { SubagentEntry } from "../claude/SubagentDiscovery";
+import { StateEmitter } from "../claude/StateEmitter";
+import { extractOfficeText, isExtractableOffice } from "../util/officeExtract";
 import type ClaudeChatPlugin from "../main";
 import type {
   StreamEvent,
@@ -29,8 +38,10 @@ import type {
   ThinkingBlock,
   ControlRequestEvent,
   ResultEvent,
+  RateLimitEvent,
   ErrorEvent,
   ImageBlock,
+  DocumentBlock,
   UsageEvent,
   UsageSnapshot,
 } from "../claude/Events";
@@ -50,6 +61,13 @@ export class TabController {
   private component: Component;
   private session: TabSession | null = null;
   private remoteSession: RemoteControlSession | null = null;
+  /* Session ids this tab has used while incognito. `--no-session-persistence`
+     suppresses the transcript but the CLI still writes a one-line `ai-title`
+     record (and any subagent session files) keyed by session id. We delete
+     those on teardown so an incognito tab truly leaves nothing on disk. Only
+     ever holds ids belonging to THIS tab, so deletion never touches another
+     tab's files in the shared project dir. */
+  private incognitoSessionIds = new Set<string>();
   /* Set true at the start of cancelStream() so the SIGTERM-driven exit event
      gets handled as a clean cancel (italic prompt) instead of an error. */
   private userCancelInitiated = false;
@@ -74,13 +92,44 @@ export class TabController {
      events can find their parent bubble. */
   private toolToMessage = new Map<string, string>();
 
+  /* One SubagentSessionTracker per active Task tool call. Created when the
+     tool's input finalizes (content_block_stop or assistant event) and
+     disposed when the matching tool_result arrives or the session is torn
+     down. The map's keys are tool_use_ids. */
+  private subagentTrackers = new Map<string, SubagentSessionTracker>();
+  /* Spawn timestamps per Task tool call, used to compute nestedDurationMs
+     when the tool_result arrives. */
+  private subagentSpawnTimes = new Map<string, number>();
+
+  /* Cached @-mention index: a flat snapshot of every vault file and folder.
+     Built lazily on first use and invalidated on vault create/delete/rename so
+     queryFileSuggestions doesn't re-walk the whole vault tree and re-allocate
+     N entries on every keystroke. Scoring and sorting still run per query; only
+     the O(N) enumeration is memoized. File mtime is snapshotted too, so the
+     empty-query "recently modified" ordering can lag a content edit until the
+     next structural change — an accepted trade for the typing-latency win. */
+  private mentionIndex: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> | null = null;
+  private mentionIndexRefs: EventRef[] = [];
+
   /* Optional fork handler — provided by ClaudeChatView so the controller can
      ask the view to create a new tab branching from a given message id. */
   onForkRequest?: (sourceTab: TabController, messageId: string) => void;
+  /* Set by the view. Fired when the user toggles incognito on a still-empty
+     tab so the view can reconcile disk state (delete any persisted file when
+     turning on, resume persistence when turning off). */
+  onIncognitoToggle?: (tabId: string, incognito: boolean) => void;
 
   /* Set to true while teardownSession() is executing so re-entrant callers
      (e.g. an onExit firing mid-dispose) don't double-dispose. */
   private tearingDown = false;
+
+  /* In-flight teardown started by restartSubprocess() (fire-and-forget so the
+     picker callback stays sync). ensureSession() awaits this before spawning
+     so a model/effort/mode change followed by a quick submit can't race the
+     not-yet-exited subprocess: spawn() returns a still-"running" session if
+     the old process hasn't died, reusing the stale model and double-binding
+     listeners. Awaiting the dispose closes that ~2s window. */
+  private pendingRestartTeardown: Promise<void> | null = null;
 
   /* Tracks whether handleError has already pushed an error bubble for the
      current pass. onError and onExit can both fire for the same failure
@@ -104,6 +153,17 @@ export class TabController {
     this.component = component;
     this.state = state ?? makeTabState();
     this.onStateChangeCb = onStateChange;
+
+    /* Invalidate the cached @-mention index when the vault tree changes. Torn
+       down in destroy() via offref so the listeners don't outlive the tab.
+       Content "modify" is intentionally not watched — it would rebuild the
+       index mid-edit and defeat the cache; only structural changes matter. */
+    const invalidateMentionIndex = () => { this.mentionIndex = null; };
+    this.mentionIndexRefs.push(
+      this.app.vault.on("create", invalidateMentionIndex),
+      this.app.vault.on("delete", invalidateMentionIndex),
+      this.app.vault.on("rename", invalidateMentionIndex),
+    );
 
     this.root = parent.createDiv({ cls: "claudian-tab-content" });
 
@@ -164,34 +224,77 @@ export class TabController {
         onModelChange: model => this.handleModelChange(model),
         onEffortChange: effort => this.handleEffortChange(effort),
         onPermissionModeChange: mode => this.handlePermissionModeChange(mode),
+        onIncognitoChange: incognito => this.handleIncognitoChange(incognito),
         onMentionQuery: query => this.queryFileSuggestions(query),
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
         onSelectionDismissed: () => this.selectionTracker?.clear(),
+        /* Pill click opens the Create-subagent modal. Launching an existing
+           agent is still reachable via the /agent slash command, which keeps
+           the SubagentPicker path alive without needing a second toolbar
+           button. */
+        onAgentLaunch: () => this.openCreateSubagentModal(),
+        onPinFolder: path => this.activeFileIndicator.addPinnedPath(path),
+        onTryPinVaultPath: path => this.tryPinVaultPath(path),
+        onIsVaultDragActive: () => this.isVaultDragActive(),
+        onTryConsumeVaultDrag: () => this.tryConsumeVaultDrag(),
+        onListTrustedFolders: () => this.plugin.settings.trustedFolders ?? [],
+        onToggleTrustedFolder: (path, enabled) => void this.toggleTrustedFolder(path, enabled),
+        onAddTrustedFolder: path => void this.addTrustedFolder(path),
+        onRemoveTrustedFolder: path => void this.removeTrustedFolder(path),
       },
       {
         model: (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel,
         effort: (this.state.effort as EffortLevel | undefined) ?? this.plugin.settings.defaultEffort,
         permissionMode: (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode,
+        incognito: this.state.incognito,
       }
     );
+    /* Lock the incognito choice if this tab already has history or a session
+       (e.g. restored from disk, or forked). The --no-session-persistence flag
+       can only be applied at spawn time, so it can't change retroactively. */
+    if (this.state.messages.length > 0 || this.state.sessionId !== null) {
+      this.inputBox.setIncognitoLocked(true);
+    }
+    /* Initial paint for the agents pill — visible whenever the catalog has
+       at least one entry. Re-painted in handlePluginSlashCommand after the
+       catalog refreshes. */
+    this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
     /* Mount the active-file pill bar inside the input wrapper (above the
        textarea) instead of letting it float above the entire input box.
        Parent is this.root only to satisfy the constructor; the next line
        reparents to the wrapper. */
+    /* Legacy-state migration for sticky pins. If the persisted state
+       predates the sticky field (undefined), assume all currently-pinned
+       files were sticky (matches old behavior where every pin survived
+       across submits). Once stickyPinnedFilePaths is defined, it's
+       authoritative — even when empty. */
+    const initialPinned = this.state.pinnedFilePaths ?? [];
+    const initialSticky = this.state.stickyPinnedFilePaths ?? initialPinned;
     this.activeFileIndicator = new ActiveFileIndicator(
       this.root,
       this.app,
-      this.state.pinnedFilePaths ?? [],
+      initialPinned,
+      initialSticky,
       {
-        onPinChange: paths => {
+        onPinChange: (paths, stickyPaths) => {
           this.state.pinnedFilePaths = paths;
+          this.state.stickyPinnedFilePaths = stickyPaths;
           this.state.updatedAt = Date.now();
           this.onStateChangeCb();
+          /* Pin count is half of the cost-surface pill's payload; refresh
+             so the toolbar count reflects this change immediately. MCP
+             count comes along for the ride from the same async load. */
+          void this.refreshCostSurface();
         },
       }
     );
     this.inputBox.mountTopBar(this.activeFileIndicator.root);
+    /* Seed the cost-surface pill on mount: counts pinned files in this tab
+       and MCP servers configured in <vault>/.claude/mcp.json. Async because
+       the MCP config is read from disk. Re-fires from onPinChange and from
+       refreshCostSurface() after the MCP manager closes. */
+    void this.refreshCostSurface();
 
     this.pairingCard = new RemotePairingCard(this.root, {
       onDisconnect: () => void this.switchMode("local"),
@@ -210,6 +313,11 @@ export class TabController {
     this.inputBox.setBusy(true);
     this.replayDone = this.replayMessages().finally(() => {
       if (!this.state.busy) this.inputBox.setBusy(false);
+      /* After replay, surface any in-flight Task/Agent tools the persisted
+         state still has marked running. Resumed tabs from a hard reload may
+         carry stale "running" statuses; surfacing them is honest to what's
+         in state and lets the user see something is unresolved. */
+      this.refreshRunningAgentCount();
     });
     this.updateWelcomeVisibility();
   }
@@ -221,12 +329,15 @@ export class TabController {
        race against our own teardown. teardownSession() awaits SIGTERM and
        the eventual process-exit. */
     if (this.remoteSession) this.plugin.subprocessManager.unregisterRemote(this.state.id);
+    for (const ref of this.mentionIndexRefs) this.app.vault.offref(ref);
+    this.mentionIndexRefs = [];
     await this.teardownSession("destroy");
     const remoteWork = this.remoteSession ? [this.remoteSession.dispose()] : [];
     const tailerWork = this.jsonlTailer ? [this.jsonlTailer.stop()] : [];
     this.statusIndicator.destroy();
     this.activeFileIndicator.destroy();
     this.selectionTracker.destroy();
+    this.searchBar.destroy();
     this.renderer.destroy();
     this.inputBox.destroy();
     this.root.remove();
@@ -235,6 +346,13 @@ export class TabController {
 
   async switchMode(mode: TabMode): Promise<void> {
     if (this.mode === mode) return;
+    /* Remote Control tails the session JSONL, which an incognito tab never
+       writes (--no-session-persistence). Block the switch rather than start a
+       remote session that can never receive events. */
+    if (mode === "remote" && this.state.incognito) {
+      new Notice("Incognito chats are local-only — Remote Control needs the session file that incognito disables.", 6000);
+      return;
+    }
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] switchMode tab=${this.state.id} ${this.mode} -> ${mode}`);
 
@@ -279,9 +397,41 @@ export class TabController {
     try {
       const s = this.session;
       this.session = null;
+      if (s && reason === "restart") {
+        /* A control_request can be in flight when the user flips the model/
+           effort/permission-mode pill (setBusy only disables Send, not the
+           pills). The fresh subprocess knows nothing about the old request,
+           so deny it best-effort BEFORE dispose (the denial rides the write
+           chain that closeStdin flushes). Without this the entry ghosts in
+           pendingApprovals forever: hasPendingApprovals() keeps the tab
+           badge lit and the orphaned card's Allow/Deny no-op against the
+           nulled session. */
+        for (const requestId of Array.from(this.state.pendingApprovals.keys())) {
+          try { s.deny(requestId, "Session restarted"); } catch { /* ignore — best-effort */ }
+        }
+      }
       if (s) {
         try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
       }
+      if (reason === "restart") {
+        this.state.pendingApprovals.clear();
+      }
+      /* The CLI writes an `ai-title` residue file even under
+         --no-session-persistence. Once the process has exited (dispose above
+         awaited it), purge this incognito tab's session files. Only on
+         terminal teardowns — "restart"/"cancel"/"switch" keep chatting and
+         the residue is cleaned on the eventual destroy/clear. */
+      if (this.state.incognito && (reason === "destroy" || reason === "clear")) {
+        await this.cleanupIncognitoSessionFiles();
+      }
+      /* Stop any in-flight subagent JSONL trackers so they don't keep
+         pinging the disk after the parent session is gone. Fire and
+         forget; releasing the session-file claim happens inside stop(). */
+      for (const tracker of this.subagentTrackers.values()) {
+        void tracker.stop();
+      }
+      this.subagentTrackers.clear();
+      this.subagentSpawnTimes.clear();
       this.clearStreamingPointer();
       this.streamingBlocks.clear();
       this.passStartedAt = null;
@@ -290,7 +440,7 @@ export class TabController {
         this.state.busy = false;
         this.inputBox.setBusy(false);
       }
-      if (reason === "cancel" || reason === "clear" || reason === "destroy") {
+      if (reason === "cancel" || reason === "restart" || reason === "clear" || reason === "destroy") {
         this.approvalArea.dismissAll();
       }
     } finally {
@@ -298,10 +448,106 @@ export class TabController {
     }
   }
 
+  /* Delete every on-disk file the CLI wrote for this incognito tab's sessions:
+     the per-session `<id>.jsonl` (which holds the ai-title) and the `<id>/`
+     subdirectory (subagent transcripts). Best-effort and idempotent — rm with
+     `force` never throws on a missing path. Only this tab's session ids are in
+     the set, so we never touch another tab's files in the shared project dir. */
+  private async cleanupIncognitoSessionFiles(): Promise<void> {
+    if (this.incognitoSessionIds.size === 0) return;
+    const cwd = this.plugin.getVaultPath();
+    const ids = Array.from(this.incognitoSessionIds);
+    this.incognitoSessionIds.clear();
+    const work: Promise<unknown>[] = [];
+    for (const id of ids) {
+      work.push(rm(sessionFilePathFor(cwd, id), { force: true }).catch(() => {}));
+      work.push(rm(`${projectDirFor(cwd)}/${id}`, { force: true, recursive: true }).catch(() => {}));
+    }
+    await Promise.all(work);
+  }
+
+  /* Reload the cost-surface pill: count pinned files for this tab and read
+     MCP server config (both enabled and disabled) from
+     <vault>/.claude/mcp.json. Public so the parent view can re-trigger
+     after the MCP manager modal closes (which may have added/removed
+     servers). Pin changes call this from the indicator callback directly.
+
+     Tool lists come from the most recent init event's tool catalog,
+     stashed on state.mcpToolsByServer. Until the first init arrives
+     (brand-new tab, no messages yet), tools arrays are empty and the
+     pill shows server count without tool count. After init the pill
+     gains "(N tools)".
+
+     Errors swallowed because this is a UI hint, not load-bearing — the
+     chat works regardless of whether the pill is accurate. */
+  public async refreshCostSurface(): Promise<void> {
+    const pinCount = (this.state.pinnedFilePaths ?? []).length;
+    let mcpServers: Array<{ name: string; enabled: boolean; tools: string[] }> = [];
+    try {
+      const disabled = new Set(await new MCPConfigStore(this.app).getDisabledServerNames());
+      const toolMap = this.state.mcpToolsByServer ?? {};
+      /* Authoritative server set from the CLI (cached). Tool counts come from
+         this tab's init event, keyed by the sanitized server name. A disabled
+         server is denied at spawn, so its tools never arrive — show it with an
+         empty list regardless. */
+      const list = await this.plugin.getMcpServers().catch(() => []);
+      if (list.length > 0) {
+        mcpServers = list.map(s => {
+          const enabled = !disabled.has(s.name);
+          return {
+            name: s.name,
+            enabled,
+            tools: enabled ? (toolMap[sanitizeMcpServerName(s.name)] ?? []) : [],
+          };
+        });
+      } else {
+        /* No list yet (CLI slow/unavailable). Fall back to whatever the
+           runtime announced: enabled servers from the init tool map, plus the
+           disabled names so they stay visible and re-enableable. */
+        const fromRuntime = Object.keys(toolMap).map(sid => ({ name: sid, enabled: true, tools: toolMap[sid] }));
+        const fromDisabled = Array.from(disabled).map(name => ({ name, enabled: false, tools: [] as string[] }));
+        mcpServers = [...fromRuntime, ...fromDisabled];
+      }
+    } catch {
+      /* ignore — leave mcpServers empty */
+    }
+    this.inputBox.setCostSurface({
+      pinCount,
+      mcpServers,
+      onMcpToggle: (name, enabled) => void this.setMcpEnabled(name, enabled),
+    });
+  }
+
+  /* Toggle a server's per-vault enabled state and refresh the pill. Disabling
+     records the server name so the next spawn passes an `mcp__<server>` deny
+     rule (scoped to this plugin's subprocesses — other Claude Code instances
+     are untouched). The change lands on the next subprocess respawn (/clear
+     or new tab); we surface that via a Notice and refresh the cached deny
+     patterns so the next spawn reads the new value. */
+  public async setMcpEnabled(name: string, enabled: boolean): Promise<void> {
+    try {
+      const changed = await new MCPConfigStore(this.app).setServerDisabled(name, !enabled);
+      if (changed) {
+        await this.plugin.refreshMcpDenyPatterns();
+        new Notice(
+          `${enabled ? "Enabled" : "Disabled"} MCP server "${name}" for this vault. Restart this chat (/clear) for the change to take effect.`,
+          6000
+        );
+      }
+    } catch (err) {
+      new Notice(`Failed to ${enabled ? "enable" : "disable"} MCP server: ${(err as Error).message}`, 6000);
+    }
+    void this.refreshCostSurface();
+  }
+
   private startRemoteMode() {
     const cwd = this.plugin.getVaultPath();
-    const prefix = this.plugin.settings.remoteSessionNamePrefix?.trim() || undefined;
-    const sessionName = prefix ? `${prefix}-${this.state.id.slice(-6)}` : undefined;
+    /* When the user sets a name, use it verbatim. Earlier behavior appended
+       `-<last 6 of tab id>` to keep concurrent sessions distinct, but that
+       leaked into the remote session list on the web/phone where the user
+       just wants the configured label. If the field is blank, hand undefined
+       to the proxy and let it fall back to the upstream default (hostname). */
+    const sessionName = this.plugin.settings.remoteSessionNamePrefix?.trim() || undefined;
 
     this.pairingCard.show();
     this.pairingCard.setStatus("starting");
@@ -309,7 +555,6 @@ export class TabController {
 
     this.remoteSession = new RemoteControlSession({
       cwd,
-      sessionId: this.state.sessionId ?? undefined,
       sessionName,
       claudePath: this.plugin.settings.claudePath || undefined,
     });
@@ -412,7 +657,8 @@ export class TabController {
     const trimmed = text.trim();
     if (!trimmed.startsWith("/")) return false;
     /* Split on first whitespace so commands with args are matchable later. */
-    const [head] = trimmed.toLowerCase().split(/\s+/);
+    const parts = trimmed.split(/\s+/);
+    const head = parts[0].toLowerCase();
     switch (head) {
       case "/clear":
         void this.clear();
@@ -424,14 +670,19 @@ export class TabController {
         const builtins = allSlash.filter(s => !skills.includes(s));
         const skillsLine = skills.length > 0 ? `Skills (${skills.length}): ${skills.join(", ")}` : "Skills: (none discovered yet — send a message to spawn a session)";
         const builtinsLine = builtins.length > 0 ? `Slash commands: ${builtins.map(s => "/" + s).join(", ")}` : "";
+        const agentsLine = this.plugin.subagentCatalog.agents.length > 0
+          ? `Subagents (${this.plugin.subagentCatalog.agents.length}): ${this.plugin.subagentCatalog.agents.map(a => a.name).join(", ")}`
+          : "Subagents: (none discovered — add .md files under <vault>/.claude/agents/)";
         new Notice(
           [
             "Plugin commands:",
             "  /clear — reset this tab to a fresh session",
             "  /help — show this help",
+            "  /agent [name] — launch a subagent (Task tool); opens picker if name omitted",
             "",
             skillsLine,
             builtinsLine,
+            agentsLine,
             "",
             "Pick Opus Plan in the model pill for Anthropic's opusplan alias (Opus while in plan mode, Sonnet otherwise). Shift+Tab cycles permission modes.",
           ].filter(Boolean).join("\n"),
@@ -439,9 +690,80 @@ export class TabController {
         );
         return true;
       }
+      case "/agent": {
+        /* Refresh the catalog so edits made since the tab opened land
+           without a plugin reload. */
+        this.plugin.refreshSubagentCatalog();
+        this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
+        const name = parts[1];
+        const followup = parts.slice(2).join(" ").trim();
+        if (!name) {
+          this.openSubagentPicker(followup);
+          return true;
+        }
+        const entry = this.plugin.subagentCatalog.agents.find(a => a.name === name);
+        if (!entry) {
+          new Notice(
+            `No subagent named "${name}". Run /agent (no name) to pick from the discovered catalog.`,
+            8000,
+          );
+          return true;
+        }
+        this.launchSubagent(entry, followup);
+        return true;
+      }
       default:
         return false;
     }
+  }
+
+  /* Opens the Create-subagent modal. After a successful save the modal
+     calls back and we refresh the toolbar pill count so the new agent
+     surfaces immediately. */
+  openCreateSubagentModal(): void {
+    new CreateSubagentModal(this.app, this.plugin, () => {
+      this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
+    }).open();
+  }
+
+  /* Opens the SubagentPicker (Obsidian SuggestModal) and dispatches the
+     chosen entry. Optional `followup` is appended to the synthetic prompt
+     so the user can type `/agent some-followup-text` and have the picker
+     ask the chosen subagent to act on that text. */
+  openSubagentPicker(followup?: string): void {
+    const agents = this.plugin.subagentCatalog.agents;
+    if (agents.length === 0) {
+      new Notice(
+        "No subagents discovered. Add a markdown file under <vault>/.claude/agents/ or ~/.claude/agents/.",
+        8000,
+      );
+      return;
+    }
+    new SubagentPicker(this.app, agents, (entry) => {
+      this.launchSubagent(entry, followup ?? "");
+    }).open();
+  }
+
+  /* Build a synthetic user message asking Claude to invoke the Task tool
+     with the chosen subagent, then route it through submit() so the bubble
+     renders, persistence fires, and Phase 3's nested rendering activates
+     automatically. The synthetic prompt is the simplest reliable trigger;
+     phrasing here may need tuning per model (Haiku is the most literal,
+     Opus the most creative interpretation). */
+  launchSubagent(entry: SubagentEntry, followup?: string): void {
+    if (this.state.busy) {
+      new Notice("Wait for the current turn to finish before launching a subagent.");
+      return;
+    }
+    const followupText = (followup ?? "").trim();
+    const descBit = entry.description ? ` Description: "${entry.description}".` : "";
+    let text: string;
+    if (followupText) {
+      text = `Use the Task tool to launch the "${entry.name}" subagent.${descBit} ${followupText}`;
+    } else {
+      text = `Use the Task tool to launch the "${entry.name}" subagent.${descBit}`;
+    }
+    void this.submit({ text, attachments: [] });
   }
 
   /* Resets the active tab in place: kills the subprocess, wipes messages and
@@ -467,6 +789,10 @@ export class TabController {
     this.inputBox.setActiveSubModel(undefined);
     this.updateWelcomeVisibility();
     this.onStateChangeCb();
+    /* Reset the TC001 to "ready" so it doesn't sit on whatever state the
+       cancelled turn left it in (thinking / needs_permission). Animator's
+       60s timeout will flip ready → idle if no follow-up turn arrives. */
+    StateEmitter.setState("ready");
   }
 
   /* Esc-cancel: kill the in-flight subprocess so streaming stops, but keep
@@ -489,7 +815,31 @@ export class TabController {
       this.remoteSession = null;
     }
     await this.teardownSession("cancel");
+    /* Mark any tools that were still running as errored — the subprocess just
+       died, so none of them will receive a tool_result. Without this they
+       linger at status=running indefinitely (and for Task/Agent tools the
+       Agents pill's running counter stays stuck). nestedStatus is only
+       meaningful for Task/Agent, so it's flipped for those alone. */
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      let touched = false;
+      for (const t of m.toolCalls) {
+        if (t.status !== "running") continue;
+        t.status = "errored";
+        t.isError = true;
+        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
+        touched = true;
+      }
+      /* Re-render so the DOM tool row drops its running spinner. Mutating the
+         ToolCall object alone leaves the bubble visually stuck on "running". */
+      if (touched) void this.renderer.upsertMessage(m);
+    }
+    this.refreshRunningAgentCount();
     this.statusIndicator.hide();
+    /* Cancel leaves the last emitted device state as a held one (thinking /
+       needs_permission), whose 5s heartbeat would otherwise re-assert that app
+       on the TC001 forever. Drop back to ready, mirroring clearConversation. */
+    StateEmitter.setState("ready");
     new Notice("Stopped Claude.");
     this.onStateChangeCb();
   }
@@ -504,30 +854,79 @@ export class TabController {
     setWelcomeVisible(this.welcomeEl, this.state.messages.length === 0);
   }
 
-  private ensureSession(): TabSession {
-    if (this.session && this.session.status !== "exited") return this.session;
+  private async ensureSession(): Promise<TabSession> {
+    /* Treat "error" as terminal alongside "exited": a spawn-level failure
+       (ENOENT/EACCES) leaves the session in status "error" with no 'exit'
+       event ever firing, so reusing it here would permanently brick the tab.
+       Falling through lets ensureSession() spawn a fresh session, mirroring
+       SubprocessManager.spawn's matching reuse guard. */
+    if (this.session && this.session.status !== "exited" && this.session.status !== "error") return this.session;
+    /* Await any in-flight restart teardown so the old subprocess has fully
+       exited (and been dropped from SubprocessManager's session map) before we
+       spawn. Otherwise spawn() finds the not-yet-exited session and returns it
+       on the OLD model, and we'd re-bind listeners onto a stale session. */
+    if (this.pendingRestartTeardown) {
+      const pending = this.pendingRestartTeardown;
+      this.pendingRestartTeardown = null;
+      await pending;
+    }
     const cwd = this.plugin.getVaultPath();
-    const modelKey = (this.state.model as ModelKey | undefined) ?? this.plugin.settings.defaultModel;
-    const effortKey = (this.state.effort as EffortLevel | undefined) ?? this.plugin.settings.defaultEffort;
-    const modeKey = (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode;
+    /* Validate persisted enum fields before trusting them. On disk these are
+       `string | undefined`, so a hand-edited file or a key removed in a later
+       plugin version would otherwise cast straight through — an unknown model
+       key makes resolveModelId() return undefined and the CLI silently spawns
+       on its default model. Fall back to the configured default whenever the
+       stored value isn't a currently-known key. */
+    const sm = this.state.model;
+    const modelKey: ModelKey = sm !== undefined && Object.prototype.hasOwnProperty.call(MODEL_IDS, sm)
+      ? (sm as ModelKey)
+      : this.plugin.settings.defaultModel;
+    const se = this.state.effort;
+    const effortKey: EffortLevel = se !== undefined && (EFFORT_ORDER as readonly string[]).includes(se)
+      ? (se as EffortLevel)
+      : this.plugin.settings.defaultEffort;
+    const spm = this.state.permissionMode;
+    const modeKey: PermissionMode = spm !== undefined && (PERMISSION_MODE_ORDER as readonly string[]).includes(spm)
+      ? (spm as PermissionMode)
+      : this.plugin.settings.permissionMode;
     /* If a snippet is applied, look it up at spawn time so edits to the
        snippet's systemPromptAddendum take effect on the next restart. */
     const snippet = this.state.envSnippetId
       ? this.plugin.settings.envSnippets.find(s => s.id === this.state.envSnippetId)
       : undefined;
     /* Compose the vault-wide addendum (always applies in this vault) with the
-       per-tab snippet addendum (overlay). Either or both may be empty. */
+       per-tab snippet addendum (overlay) and the trusted-folders hint. Any
+       of the three may be empty. Trusted-folders hint is gated by the
+       trustedFoldersInSystemPrompt setting (default on); it lists only
+       enabled entries so disabled-but-remembered folders don't leak into
+       discoverability. The hint is read-only discovery context — actual
+       permission to read those paths comes from .claude/settings.json's
+       allowlist, written when the user toggled the folder on. */
     const vaultAddendum = (this.plugin.settings.vaultSystemPromptAddendum ?? "").trim();
     const snippetAddendum = (snippet?.systemPromptAddendum ?? "").trim();
+    const trustedAddendum = this.buildTrustedFoldersAddendum();
     const composedAddendum =
-      [vaultAddendum, snippetAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
-    const opts = spawnOptionsFromSettings(this.plugin.settings, cwd, this.state.sessionId ?? undefined, {
+      [vaultAddendum, snippetAddendum, trustedAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
+    /* Incognito sessions are never persisted, so `--resume` would point at a
+       transcript that doesn't exist. On respawn (model/effort/mode change)
+       start a fresh session instead — context is lost, which is the accepted
+       incognito trade-off, rather than attempting a doomed resume. */
+    const resumeId = this.state.incognito ? undefined : (this.state.sessionId ?? undefined);
+    const opts = spawnOptionsFromSettings(this.plugin.settings, cwd, resumeId, {
       model: resolveModelId(modelKey),
       effort: effortKey,
       permissionMode: modeKey,
       appendSystemPrompt: composedAddendum,
+      noSessionPersistence: this.state.incognito,
+      /* Per-vault MCP disables, read from the plugin's in-memory cache (kept
+         fresh by refreshMcpDenyPatterns on every toggle). Empty unless the
+         user switched a server off in the MCP manager. */
+      mcpDenyPatterns: this.plugin.mcpDenyPatterns,
     });
     this.session = this.plugin.subprocessManager.spawn(this.state.id, opts);
+    /* The incognito decision is now baked into the live subprocess — lock the
+       pill so it can't change for the rest of this tab's life. */
+    this.inputBox.setIncognitoLocked(true);
     this.session.onEvent(e => this.onEvent(e));
     this.session.onExit((code, signal) => this.onExit(code, signal));
     this.session.onError(err => this.onErrorRaw(err));
@@ -544,7 +943,22 @@ export class TabController {
   private lastStderr = "";
 
   private restartSubprocess() {
-    void this.teardownSession("restart");
+    /* If a teardown is already in flight (e.g. a prior model/effort/mode
+       change still inside its ~2s SIGTERM window), don't start a second one.
+       teardownSession()'s re-entrancy guard would return a resolved no-op that
+       overwrites pendingRestartTeardown, dropping the reference to the real
+       in-flight dispose so ensureSession() spawns onto the not-yet-exited
+       session and double-binds its listeners. The latest state.model/effort/
+       mode is read at spawn time, so the single in-flight teardown plus the
+       next ensureSession() still pick up the newest selection. */
+    if (this.tearingDown) return;
+    /* Capture the teardown promise (still fire-and-forget here) so the next
+       ensureSession() can await the old subprocess's actual exit before
+       spawning. Without this, a quick submit during the ~2s SIGTERM window
+       would get the stale (still-running) session back from spawn() on the old
+       model, with listeners re-bound. A swallowed rejection keeps this
+       non-throwing for the unawaited path. */
+    this.pendingRestartTeardown = this.teardownSession("restart").catch(() => {});
     this.lastStderr = "";
   }
 
@@ -567,6 +981,16 @@ export class TabController {
     this.state.updatedAt = Date.now();
     this.restartSubprocess();
     this.onStateChangeCb();
+  }
+
+  /* Toggle incognito on a still-empty tab. The InputBox only fires this while
+     its pill is unlocked (no live session), so we never flip a tab that has
+     already spawned. The view reconciles disk state via onIncognitoToggle:
+     deleting any file written while the tab was a normal empty tab. */
+  private handleIncognitoChange(incognito: boolean) {
+    this.state.incognito = incognito || undefined;
+    this.state.updatedAt = Date.now();
+    this.onIncognitoToggle?.(this.state.id, incognito);
   }
 
   /* Apply an environment snippet — overwrites model + effort + permission
@@ -627,14 +1051,35 @@ export class TabController {
     /* Pinned files from the file-pill bar inject as @-context. The pill bar
        is the new explicit mechanism (replaces the prior autoAttachActiveFile
        setting). Each pinned path is prepended once; duplicates the user
-       already wrote into the message are skipped. */
+       already wrote into the message are skipped.
+
+       Office binaries (.pptx, .docx) can't ride as @-refs — Claude Code's
+       Read tool rejects them. For those we extract plain text on the plugin
+       side and inline it as a fenced block; everything else still uses the
+       @-ref path so the CLI handles file expansion + caching. */
     const pinnedPaths = this.activeFileIndicator.getPinnedPaths();
-    const pinnedRefs = pinnedPaths
+    const officePaths = pinnedPaths.filter(p => isExtractableOffice(p));
+    const refPaths = pinnedPaths.filter(p => !isExtractableOffice(p));
+
+    const pinnedRefs = refPaths
       .filter(p => !text.includes(`@${p}`))
       .map(p => `@${p}`)
       .join(" ");
     if (pinnedRefs) {
       wireText = `${pinnedRefs} ${wireText}`;
+    }
+
+    const officeInlines: string[] = [];
+    for (const p of officePaths) {
+      try {
+        const extracted = await extractOfficeText(this.app, p);
+        officeInlines.push(`<file path="${p}">\n${extracted}\n</file>`);
+      } catch (err) {
+        new Notice(`Couldn't extract text from ${p}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (officeInlines.length > 0) {
+      wireText = `${officeInlines.join("\n\n")}\n\n${wireText}`;
     }
 
     /* If a selection was attached, render it as a small flag chip ABOVE
@@ -659,6 +1104,10 @@ export class TabController {
       timestamp: Date.now(),
       attachments: attachments.length > 0 ? attachments : undefined,
       selectionContext,
+      /* Record the notes pinned for this turn so the bubble can surface them
+         as note pills. Captured before the post-submit auto-drop below clears
+         non-sticky pins off the bar. */
+      attachedNotePaths: pinnedPaths.length > 0 ? [...pinnedPaths] : undefined,
     };
     this.state.messages.push(msg);
     this.state.busy = true;
@@ -669,15 +1118,28 @@ export class TabController {
          selection block prefix. */
       this.state.title = text.slice(0, 48);
     } else if (this.state.title === "New chat" && attachments.length > 0) {
-      this.state.title = `Image (${attachments.length})`;
+      const allImages = attachments.every(a => (a.kind ?? "image") === "image");
+      this.state.title = allImages
+        ? `Image (${attachments.length})`
+        : `Attachment (${attachments.length})`;
     }
     this.updateWelcomeVisibility();
     await this.renderer.upsertMessage(msg);
     this.renderer.forceStickToBottom();
     this.inputBox.setBusy(true);
     this.statusIndicator.setThinking();
+    StateEmitter.setState("thinking");
     this.passStartedAt = Date.now();
     this.onStateChangeCb();
+
+    /* Auto-drop non-sticky pins. The file contents are already inlined
+       into THIS turn's wireText (built above), and once the API request
+       lands they live forever in the conversation history. Re-shipping
+       them on every follow-up turn is the cost we're trying to avoid.
+       Sticky pins survive; non-sticky pins fall off the pill bar.
+       setPinnedPaths is a no-op when sticky == pinned (nothing to drop). */
+    const stickyOnly = this.activeFileIndicator.getStickyPaths();
+    this.activeFileIndicator.setPinnedPaths(stickyOnly);
 
     /* Parallel-fire title generation: kick off the Haiku subprocess the
        moment we have the user's message, so it runs concurrently with the
@@ -687,26 +1149,65 @@ export class TabController {
        follow-up turns and when the setting is off. */
     void this.maybeGenerateTitle();
 
-    const session = this.ensureSession();
+    const session = await this.ensureSession();
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] submit -> session.status=${session.status}`);
     /* Claude Code stream-json mode does NOT emit `system/init` until it has
        read at least one user message from stdin. Writing immediately after
        spawn is the correct pattern. The CLI processes the message, then
        emits init + response together. */
-    if (attachments.length === 0) {
-      session.sendUserText(wireText);
+    /* Build per-kind output. Text attachments don't ride as content blocks —
+       they get inlined into wireText as <file path="…"> envelopes, same shape
+       as the office-extraction path above. Images and PDFs ride as blocks.
+       Anything that fails its data/content invariant (shouldn't happen in
+       practice; defensive against future persisted-shape drift) is logged
+       and skipped rather than silently dropped or sent with bad data. */
+    const mediaBlocks: ContentBlock[] = [];
+    const textInlines: string[] = [];
+    for (const att of attachments) {
+      const kind = att.kind ?? "image";
+      if (kind === "image") {
+        if (!att.data) {
+          console.warn("[claude-cli-chat] image attachment missing data; skipping", att);
+          continue;
+        }
+        const block: ImageBlock = {
+          type: "image",
+          source: { type: "base64", media_type: att.mediaType, data: att.data },
+        };
+        mediaBlocks.push(block);
+      } else if (kind === "pdf") {
+        if (!att.data) {
+          console.warn("[claude-cli-chat] pdf attachment missing data; skipping", att);
+          continue;
+        }
+        /* No `title` field — undocumented for base64-PDF document blocks and
+           may trip the CLI's Zod schema validation (see CLAUDE.md wire-format
+           gotcha #4). The filename rides on the chip in the bubble, which is
+           enough for the user; Claude infers context from the PDF content. */
+        const block: DocumentBlock = {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: att.data },
+        };
+        mediaBlocks.push(block);
+      } else if (kind === "text") {
+        if (att.content === undefined) {
+          console.warn("[claude-cli-chat] text attachment missing content; skipping", att);
+          continue;
+        }
+        const path = att.filename ?? "attached.txt";
+        textInlines.push(`<file path="${path}">\n${att.content}\n</file>`);
+      }
+    }
+    const finalText = textInlines.length > 0
+      ? `${textInlines.join("\n\n")}\n\n${wireText}`
+      : wireText;
+    if (mediaBlocks.length === 0) {
+      session.sendUserText(finalText);
       return;
     }
-    const blocks: ContentBlock[] = [];
-    for (const att of attachments) {
-      const block: ImageBlock = {
-        type: "image",
-        source: { type: "base64", media_type: att.mediaType, data: att.data },
-      };
-      blocks.push(block);
-    }
-    if (wireText) blocks.push({ type: "text", text: wireText });
+    const blocks: ContentBlock[] = [...mediaBlocks];
+    if (finalText) blocks.push({ type: "text", text: finalText });
     session.sendUserContent(blocks);
   }
 
@@ -716,7 +1217,11 @@ export class TabController {
         const sys = event as SystemInitEvent | SystemApiRetryEvent | { type: "system"; subtype: string };
         if (sys.subtype === "init") {
           const init = sys as SystemInitEvent;
-          if (init.session_id) this.state.sessionId = init.session_id;
+          if (init.session_id) {
+            this.state.sessionId = init.session_id;
+            /* Remember this id so teardown can delete its on-disk residue. */
+            if (this.state.incognito) this.incognitoSessionIds.add(init.session_id);
+          }
           /* Cache the slash-command and skill lists the CLI just announced.
              Reset on every spawn — when the user switches model / effort /
              permission mode the subprocess restarts and a new init arrives
@@ -724,6 +1229,26 @@ export class TabController {
              depends on permission mode). */
           if (init.slash_commands) this.state.availableSlashCommands = init.slash_commands;
           if (init.skills) this.state.availableSkills = init.skills;
+          /* Group MCP-namespaced tools by server. The CLI names every MCP
+             tool as `mcp__<server>__<tool>` (double-underscore separator),
+             so parsing is mechanical. Other tools (Read, Bash, Edit, etc.)
+             are non-MCP and skipped. Result feeds the cost-surface pill
+             and its hover popup. */
+          if (Array.isArray(init.tools)) {
+            const grouped: Record<string, string[]> = {};
+            for (const tool of init.tools) {
+              if (!tool.startsWith("mcp__")) continue;
+              const parts = tool.split("__");
+              if (parts.length < 3) continue;
+              const server = parts[1];
+              const toolName = parts.slice(2).join("__");
+              (grouped[server] ??= []).push(toolName);
+            }
+            this.state.mcpToolsByServer = grouped;
+            /* Init carries the full tool list, so this is the canonical
+               moment to refresh the pill with real tool counts. */
+            void this.refreshCostSurface();
+          }
         } else if (sys.subtype === "api_retry") {
           const retry = sys as SystemApiRetryEvent;
           this.statusIndicator.setRetrying(retry.attempt, retry.max_retries, retry.retry_delay_ms);
@@ -765,6 +1290,10 @@ export class TabController {
       }
       case "error": {
         await this.handleError(event as ErrorEvent);
+        break;
+      }
+      case "rate_limit_event": {
+        this.handleRateLimit(event as RateLimitEvent);
         break;
       }
       default:
@@ -831,6 +1360,7 @@ export class TabController {
         if (!msg.toolCalls.find(t => t.id === block.id)) {
           msg.toolCalls.push({ id: block.id, name: block.name, input: block.input ?? {}, status: "running" });
           this.toolToMessage.set(block.id, msg.id);
+          if (block.name === "Task" || block.name === "Agent") this.refreshRunningAgentCount();
         }
         this.streamingBlocks.set(inner.index, { kind: "tool", toolId: block.id, partialJson: "" });
         /* Re-arm the gerund spinner. Tool execution is a silent server-side
@@ -865,24 +1395,30 @@ export class TabController {
         const slot = this.streamingBlocks.get(inner.index);
         if (slot && slot.kind === "tool") {
           slot.partialJson += inner.delta.partial_json;
-          /* Attempt a partial parse so the user sees the tool input filling in.
-             If JSON is incomplete this throws — silently ignore until it parses. */
-          try {
-            const parsed = JSON.parse(slot.partialJson);
-            /* Resolve the owning message via toolToMessage first — that map
-               is the authoritative registry of which message owns each
-               tool_use_id (handled at content_block_start / handleToolUse).
-               Fall back to scanning state.messages for legacy compat in case
-               we somehow received deltas before the start event. */
-            const ownerId = this.toolToMessage.get(slot.toolId);
-            let msg = ownerId ? this.state.messages.find(m => m.id === ownerId) : undefined;
-            if (!msg) msg = this.state.messages.find(m => m.toolCalls?.some(t => t.id === slot.toolId));
-            const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
-            if (tool) {
-              tool.input = parsed;
-              if (msg) await this.renderer.upsertMessage(msg);
-            }
-          } catch { /* incomplete JSON — wait for more deltas */ }
+          /* A top-level tool-input object only becomes parseable on the delta
+             that carries its closing brace; skip the full-buffer parse on
+             interior-content deltas to avoid O(n^2) scans + thrown SyntaxErrors
+             while a large value (e.g. Write/Edit content) streams. The
+             authoritative final input is set in handleAssistant, so these
+             intermediate parses are a cosmetic live preview only. */
+          if (inner.delta.partial_json.includes("}")) {
+            try {
+              const parsed = JSON.parse(slot.partialJson);
+              /* Resolve the owning message via toolToMessage first — that map
+                 is the authoritative registry of which message owns each
+                 tool_use_id (handled at content_block_start / handleToolUse).
+                 Fall back to scanning state.messages for legacy compat in case
+                 we somehow received deltas before the start event. */
+              const ownerId = this.toolToMessage.get(slot.toolId);
+              let msg = ownerId ? this.state.messages.find(m => m.id === ownerId) : undefined;
+              if (!msg) msg = this.state.messages.find(m => m.toolCalls?.some(t => t.id === slot.toolId));
+              const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
+              if (tool) {
+                tool.input = parsed;
+                if (msg) await this.renderer.upsertMessage(msg);
+              }
+            } catch { /* incomplete JSON — wait for more deltas */ }
+          }
         }
       }
       return;
@@ -894,6 +1430,15 @@ export class TabController {
         const msg = this.getOrCreateStreamingAssistantMessage();
         msg.thinkingStreaming = false;
         await this.renderer.upsertMessage(msg);
+      } else if (slot?.kind === "tool") {
+        /* Tool input is now finalized. Start the subagent tracker if this
+           is a Task tool — by spawn time the CLI has already begun running
+           the subagent, so kicking off the JSONL watcher here gives us the
+           earliest window before any nested events land. */
+        const msgId = this.toolToMessage.get(slot.toolId);
+        const msg = msgId ? this.state.messages.find(m => m.id === msgId) : undefined;
+        const tool = msg?.toolCalls?.find(t => t.id === slot.toolId);
+        if (tool && msg) this.maybeStartSubagentTracker(tool, msg);
       }
       this.streamingBlocks.delete(inner.index);
       /* If a tool block is still streaming after this text/thinking block
@@ -942,9 +1487,16 @@ export class TabController {
       const existing = msg.toolCalls.find(t => t.id === tu.id);
       if (existing) {
         existing.input = tu.input;
+        /* Late-arriving final input may be the first place a Task tool's
+           prompt is fully populated in non-streaming mode. Try to start a
+           tracker; maybeStart is idempotent. */
+        this.maybeStartSubagentTracker(existing, msg);
       } else {
-        msg.toolCalls.push({ id: tu.id, name: tu.name, input: tu.input, status: "running" });
+        const newTool: ToolCall = { id: tu.id, name: tu.name, input: tu.input, status: "running" };
+        msg.toolCalls.push(newTool);
         this.toolToMessage.set(tu.id, msg.id);
+        this.maybeStartSubagentTracker(newTool, msg);
+        if (tu.name === "Task" || tu.name === "Agent") this.refreshRunningAgentCount();
       }
     }
 
@@ -962,18 +1514,52 @@ export class TabController {
     if (this.passStartedAt !== null) {
       msg.durationMs = Date.now() - this.passStartedAt;
     }
-    await this.renderer.upsertMessage(msg);
-
-    /* After a final assistant message, future deltas belong to a new bubble.
-       Null out passStartedAt rather than restamping to Date.now(): the old
-       code re-anchored here, which on a multi-pass tool turn caused the
-       NEXT pass's timer to include the entire tool-execution wait (since
-       no other event reset it before the next content_block_start). Nulling
-       lets getOrCreateStreamingAssistantMessage() anchor a fresh timer
-       when the next pass actually begins streaming. */
+    this.maybeMergePrefixPreamble(msg);
+    /* Reset streaming state BEFORE yielding to the render await. node:readline
+       dispatches buffered lines synchronously and onEvent is fire-and-forget, so
+       a next-pass event in the same stdout chunk would otherwise bind to the
+       stale streamingAssistantMessageId or have its streamingBlocks slot wiped
+       by the clear below. passStartedAt is nulled (not restamped) so
+       getOrCreateStreamingAssistantMessage anchors a fresh timer when the next
+       pass actually begins streaming. */
     this.clearStreamingPointer();
     this.streamingBlocks.clear();
     this.passStartedAt = null;
+    await this.renderer.upsertMessage(msg);
+  }
+
+  /* Interleaved thinking can produce two adjacent assistant passes where the
+     first is a partial preamble ("I'll build the…"), gets interrupted by a
+     thinking block, and the second pass re-emits the same opening in full
+     ("I'll build the… file now."). The degenerate case is when the second
+     pass re-emits the identical sentence verbatim — same text, two bubbles,
+     two "Thought for Ns" footers. When the second pass finalizes, fold the
+     earlier preamble into it: drop the older bubble from state + DOM, sum
+     the durations, and prefer the longer thinking trace (the long pass's
+     reasoning is the substantive one; the short pass after it is usually a
+     sanity-check). Guarded so it never collapses a real preamble that was
+     followed by a tool call, or short single-character prefixes. */
+  private maybeMergePrefixPreamble(current: ChatMessage) {
+    const idx = this.state.messages.findIndex(m => m.id === current.id);
+    if (idx <= 0) return;
+    const prev = this.state.messages[idx - 1];
+    if (prev.role !== "assistant") return;
+    if (prev.streaming) return;
+    if (prev.toolCalls && prev.toolCalls.length > 0) return;
+    const prevText = prev.content.trim();
+    const currText = current.content.trim();
+    if (prevText.length < 20) return;
+    if (prevText.length > currText.length) return;
+    if (!currText.startsWith(prevText)) return;
+
+    if (prev.durationMs !== undefined) {
+      current.durationMs = (current.durationMs ?? 0) + prev.durationMs;
+    }
+    if (prev.thinking && (!current.thinking || prev.thinking.length > current.thinking.length)) {
+      current.thinking = prev.thinking;
+    }
+    this.state.messages.splice(idx - 1, 1);
+    this.renderer.removeMessage(prev.id);
   }
 
   private async handleToolUse(event: ToolUseEvent) {
@@ -988,6 +1574,9 @@ export class TabController {
     };
     msg.toolCalls.push(tool);
     this.toolToMessage.set(event.id, msg.id);
+    /* Non-streaming fallback path. In stream mode the tracker has already
+       been started from content_block_stop; this maybeStart no-ops then. */
+    this.maybeStartSubagentTracker(tool, msg);
     await this.renderer.upsertMessage(msg);
   }
 
@@ -1002,11 +1591,114 @@ export class TabController {
     tool.status = event.is_error ? "errored" : "completed";
     tool.isError = !!event.is_error;
     tool.result = this.flattenContent(event.content);
+    /* Finalize subagent tracking on Task/Agent tool completion: stop the
+       tailer, compute duration, and flip nestedStatus. Leaves nestedEvents
+       in place so the user can keep scrolling through what the subagent
+       did. Tool name is "Task" on Claude Code 2.1.141 and "Agent" on
+       2.1.143+. */
+    if (tool.name === "Task" || tool.name === "Agent") {
+      const tracker = this.subagentTrackers.get(event.tool_use_id);
+      if (tracker) {
+        void tracker.stop();
+        this.subagentTrackers.delete(event.tool_use_id);
+      }
+      const spawnedAt = this.subagentSpawnTimes.get(event.tool_use_id);
+      if (spawnedAt !== undefined) {
+        tool.nestedDurationMs = Date.now() - spawnedAt;
+        this.subagentSpawnTimes.delete(event.tool_use_id);
+      }
+      tool.nestedStatus = event.is_error ? "failed" : "completed";
+      this.refreshRunningAgentCount();
+    }
     await this.renderer.upsertMessage(msg);
   }
 
+  /* Starts a SubagentSessionTracker for a Task/Agent tool, idempotent per
+     tool id. Triggered from three places: content_block_stop (streaming),
+     handleAssistant (final assistant event), and handleToolUse (non-
+     streaming). All three reach the same point once tool.input.prompt is
+     populated; first call wins. Tool name is "Task" on Claude Code 2.1.141
+     and "Agent" on 2.1.143+. */
+  private maybeStartSubagentTracker(tool: ToolCall, _msg: ChatMessage): void {
+    if (tool.name !== "Task" && tool.name !== "Agent") return;
+    if (this.subagentTrackers.has(tool.id)) return;
+    if (!this.state.sessionId) return;
+    const cwd = this.plugin.getVaultPath();
+    if (!cwd) return;
+    const promptVal = (tool.input as { prompt?: unknown })?.prompt;
+    const parentPrompt = typeof promptVal === "string" ? promptVal : "";
+
+    tool.nestedStatus = "spawning";
+    tool.nestedEvents = tool.nestedEvents ?? [];
+    this.subagentSpawnTimes.set(tool.id, Date.now());
+
+    const tracker = new SubagentSessionTracker({
+      cwd,
+      parentSessionId: this.state.sessionId,
+      parentToolUseId: tool.id,
+      parentPrompt,
+      onUpdate: (update) => this.applySubagentUpdate(tool.id, update),
+      subprocessManager: this.plugin.subprocessManager,
+    });
+    this.subagentTrackers.set(tool.id, tracker);
+    tracker.start();
+  }
+
+  /* Applies one tracker update to the corresponding ToolCall: appends
+     events (with cap), promotes status, applies nested tool_use status
+     updates, and triggers a renderer pass. Tolerant of late updates
+     arriving after the tool_result already finalized — the nestedStatus
+     check prevents the "running" status from clobbering "completed". */
+  private applySubagentUpdate(toolId: string, update: SubagentTrackerUpdate): void {
+    const msgId = this.toolToMessage.get(toolId);
+    if (!msgId) return;
+    const msg = this.state.messages.find(m => m.id === msgId);
+    if (!msg || !msg.toolCalls) return;
+    const tool = msg.toolCalls.find(t => t.id === toolId);
+    if (!tool) return;
+
+    if (update.sessionId && !tool.nestedSessionId) {
+      tool.nestedSessionId = update.sessionId;
+      if (tool.nestedStatus === "spawning") tool.nestedStatus = "running";
+    }
+
+    if (update.events.length > 0) {
+      tool.nestedEvents = tool.nestedEvents ?? [];
+      for (const e of update.events) tool.nestedEvents.push(e);
+      if (tool.nestedEvents.length > NESTED_EVENTS_CAP) {
+        const overflow = tool.nestedEvents.length - NESTED_EVENTS_CAP;
+        tool.nestedTruncatedCount = (tool.nestedTruncatedCount ?? 0) + overflow;
+        tool.nestedEvents = tool.nestedEvents.slice(overflow);
+      }
+    }
+
+    if (update.toolUseUpdates) {
+      for (const u of update.toolUseUpdates) {
+        const entry = tool.nestedEvents?.find(
+          (e): e is Extract<NestedSubagentEvent, { kind: "tool_use" }> =>
+            e.kind === "tool_use" && e.id === u.id,
+        );
+        if (entry) {
+          entry.status = u.status;
+          entry.result = u.result;
+          entry.isError = u.isError;
+        }
+      }
+    }
+
+    void this.renderer.upsertMessage(msg);
+    this.onStateChangeCb();
+  }
+
   private handleControlRequest(event: ControlRequestEvent) {
-    if (this.userCancelInitiated) return;
+    if (this.userCancelInitiated) {
+      /* A control_request that lands after the user hit cancel but before the
+         subprocess is actually killed still needs a response, or the CLI blocks
+         waiting for one during the (up-to-2s) teardown window. Deny it
+         immediately rather than dropping it silently — no card is shown. */
+      try { this.session?.deny(event.request_id, "User cancelled"); } catch { /* best-effort */ }
+      return;
+    }
     const approval: PendingApproval = {
       requestId: event.request_id,
       toolName: event.request.tool_name,
@@ -1018,14 +1710,88 @@ export class TabController {
     };
     this.state.pendingApprovals.set(event.request_id, approval);
     this.approvalArea.show(approval);
+    StateEmitter.setState("needs_permission");
   }
 
-  private handleResult(_event: ResultEvent) {
+  private handleResult(event: ResultEvent) {
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
     this.clearStreamingPointer();
     this.passStartedAt = null;
+    /* Turn-level failures (error_max_turns, error_during_execution,
+       error_budget_exhausted, …) arrive through this same result event —
+       there is no separate top-level error event for them. Surface a bubble
+       directly here rather than via handleError, whose errorBubbleEmitted
+       dedup could swallow it if a prior error event already fired this
+       session. Without this the conversation just stops dead with no
+       indication anything failed. */
+    const turnFailed = event.is_error === true ||
+      (typeof event.subtype === "string" && event.subtype.startsWith("error"));
+    if (turnFailed) {
+      const label = typeof event.subtype === "string" && event.subtype !== "success" ? event.subtype : "error";
+      const detail = typeof event.result === "string" && event.result ? ` — ${event.result}` : "";
+      const errorMsg: ChatMessage = {
+        id: makeMessageId(),
+        role: "assistant",
+        content: `**Turn failed (${label})**${detail}`,
+        timestamp: Date.now(),
+      };
+      this.state.messages.push(errorMsg);
+      void this.renderer.upsertMessage(errorMsg);
+    }
+    /* Turn-end reconciliation for any still-running tools. If the model
+       produced a final synthesis (we're in handleResult), every tool it relied
+       on must have returned a tool_result — otherwise the model couldn't have
+       written the answer. In practice though, a few tool_result events can be
+       missed by handleToolResult (out-of-order delivery, parser skipping a
+       synthetic user envelope, a state restore mid-turn, or a result that
+       arrived before its tool_use registered). Without a sweep those tools
+       linger at status=running, spinning forever — and for Task/Agent tools,
+       leaving the Agents pill stuck on a non-zero count. Force-close them —
+       as errored when the turn itself failed, since a dead turn never
+       finished its tools. */
+    let swept = 0;
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      let touched = false;
+      for (const t of m.toolCalls) {
+        if (t.status !== "running") continue;
+        if (t.name === "Task" || t.name === "Agent") {
+          t.status = turnFailed ? "errored" : "completed";
+          if (turnFailed) t.isError = true;
+          if (t.nestedStatus !== "completed" && t.nestedStatus !== "failed") {
+            t.nestedStatus = turnFailed ? "failed" : "completed";
+          }
+          /* This tool never received its tool_result, so handleToolResult never
+             ran to stop its subagent tracker. Stop it here, or the tracker's
+             JsonlTailer + session-file claim leak until the next teardownSession
+             (which may be many turns away in a long-lived tab). */
+          const tracker = this.subagentTrackers.get(t.id);
+          if (tracker) {
+            void tracker.stop();
+            this.subagentTrackers.delete(t.id);
+          }
+          this.subagentSpawnTimes.delete(t.id);
+          swept++;
+        } else {
+          /* A regular tool (Bash, Read, Edit, MCP, …) still running at the
+             turn-terminal result event will never get a tool_result either, so
+             close it too — otherwise its row keeps spinning for the tab's life. */
+          t.status = turnFailed ? "errored" : "completed";
+          if (turnFailed) t.isError = true;
+        }
+        touched = true;
+      }
+      /* Re-render so the swept tool row stops showing a running spinner. */
+      if (touched) void this.renderer.upsertMessage(m);
+    }
+    if (swept > 0) this.refreshRunningAgentCount();
+    /* Turn settled. StateEmitter auto-transitions complete -> ready after
+       10s (matches the daemon's COMPLETE_TIMEOUT_S), and the animator daemon
+       times ready -> idle after 60s. A failed turn goes straight to ready —
+       "complete" on the TC001 would misreport the failure as success. */
+    StateEmitter.setState(turnFailed ? "ready" : "complete");
     /* Do NOT use event.usage here — it sums across every API call in the
        turn (each tool round-trip counts the shared context again), inflating
        the displayed token count. handleAssistant updates the indicator
@@ -1039,6 +1805,13 @@ export class TabController {
 
   private async maybeGenerateTitle() {
     if (this.titleGenerationStarted) return;
+    /* Incognito tabs must touch no disk. generateTitle spawns a throwaway
+       `claude --print --no-session-persistence` subprocess whose own session
+       id is never captured in incognitoSessionIds, so the ai-title residue it
+       writes (wire-format gotcha #6) would never be cleaned up — a privacy
+       leak summarizing the chat. Skip title-gen entirely; the synchronous
+       first-message-prefix title set in submit() is the incognito fallback. */
+    if (this.state.incognito) return;
     if (!this.plugin.settings.autoGenerateTitles) return;
     /* Only fire on the very first turn. After that the title is either the
        user's choice or a previous title-gen result — don't overwrite. */
@@ -1058,14 +1831,26 @@ export class TabController {
        back to a user-only prompt when assistantResponse is empty. */
     const firstAssistant = this.state.messages.find(m => m.role === "assistant" && m.content.trim().length > 0);
     this.titleGenerationStarted = true;
+    /* Title generation is hard-pinned to Haiku 4.5. Rationale: under the
+       2026-06-15 Agent SDK credit pool, every chat turn drains a $100/mo
+       budget; auto-titling a tab is a one-shot summarization that Haiku
+       does well at ~1/20th the per-message cost of Sonnet and ~1/100th of
+       Opus. Locking the model here (rather than reading a setting) means
+       the cheap path can't drift back to Sonnet/Opus through a stale
+       settings file or a user typo. */
     const generated = await generateTitle({
       userMessage: firstUser.content,
       assistantResponse: firstAssistant?.content,
       claudePath: this.plugin.settings.claudePath || undefined,
-      model: this.plugin.settings.titleGenerationModel || "haiku",
+      model: "claude-haiku-4-5-20251001",
       cwd: this.plugin.getVaultPath(),
     });
     if (generated) {
+      /* The title-gen subprocess is independent and outlives teardownSession()/clear(),
+         which neither kill it. If the conversation we titled was cleared or replaced
+         during the multi-second await, the first user message is gone (or has a new id),
+         so a stale title would retitle and persist a fresh tab with the prior topic. */
+      if (this.state.messages.find(m => m.role === "user")?.id !== firstUser.id) return;
       this.state.title = generated;
       this.state.updatedAt = Date.now();
       this.refreshTitleBar();
@@ -1112,10 +1897,41 @@ export class TabController {
       /* Pass the original input from the request — the SDK requires
          `updatedInput` even when we're not modifying anything. */
       this.session.approve(requestId, approval?.input as Record<string, unknown> | undefined);
+      /* Recovery: the assistant is about to resume running the tool, so
+         flip the display back to thinking. handleResult will fire complete
+         when the turn finally settles. Deny doesn't fire a recovery
+         because the result event will arrive almost immediately with the
+         denial outcome. */
+      StateEmitter.setState("thinking");
     } else {
       this.session.deny(requestId, decision.reason);
     }
     this.onStateChangeCb();
+  }
+
+  /* Rate-limit telemetry. "allowed" is the steady-state no-op; warning and
+     blocked are surfaced via Notice (the same channel other non-fatal
+     signals use) — without it the user just sees the turn stall with no
+     hint that a cap was hit or when it resets. */
+  private handleRateLimit(event: RateLimitEvent) {
+    const info = event.rate_limit_info;
+    if (!info || info.status === "allowed") return;
+    if (info.status !== "warning" && info.status !== "blocked") return;
+    const cap = info.rateLimitType === "five_hour" ? "5-hour limit"
+      : info.rateLimitType === "seven_day" ? "weekly limit"
+      : "rate limit";
+    const verb = info.status === "blocked" ? "reached" : "near";
+    const resetSuffix = info.resetsAt ? ` Resets ${this.formatResetTime(info.resetsAt)}.` : "";
+    const overageSuffix = (info.isUsingOverage || info.overageStatus === "blocked") && info.overageResetsAt
+      ? ` Overage resets ${this.formatResetTime(info.overageResetsAt)}.`
+      : "";
+    new Notice(`Claude ${cap} ${verb}.${resetSuffix}${overageSuffix}`, 8000);
+  }
+
+  /* resetsAt arrives as Unix epoch seconds; tolerate ms just in case. */
+  private formatResetTime(resetsAt: number): string {
+    const ms = resetsAt > 1e12 ? resetsAt : resetsAt * 1000;
+    return new Date(ms).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
   }
 
   private onExit(code: number | null, signal?: NodeJS.Signals | null) {
@@ -1140,6 +1956,34 @@ export class TabController {
         message: `Claude exited (code=${code}${sigSuffix}) before completing the response.${stderrSuffix}`,
       });
     }
+    /* Crash-path reconciliation, mirroring what cancelStream and
+       handleResult both do but the unexpected-exit path missed: the
+       subprocess is gone, so no still-running tool will ever receive its
+       tool_result. Stop ALL subagent trackers (each holds a JsonlTailer +
+       a session-file claim that would otherwise keep polling disk until
+       the next teardownSession, possibly many turns away), flip running
+       tool rows to errored so they stop spinning, and refresh the Agents
+       pill so its running count doesn't stick. Idempotent on the teardown-
+       driven exits (cancel/restart/clear), where the maps are already
+       empty and no tools are left running. */
+    for (const tracker of this.subagentTrackers.values()) {
+      void tracker.stop();
+    }
+    this.subagentTrackers.clear();
+    this.subagentSpawnTimes.clear();
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      let touched = false;
+      for (const t of m.toolCalls) {
+        if (t.status !== "running") continue;
+        t.status = "errored";
+        t.isError = true;
+        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
+        touched = true;
+      }
+      if (touched) void this.renderer.upsertMessage(m);
+    }
+    this.refreshRunningAgentCount();
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
@@ -1160,6 +2004,12 @@ export class TabController {
 
   private onErrorRaw(err: Error) {
     void this.handleError({ type: "error", subtype: "spawn_error", message: err.message });
+    /* Persist the error bubble. Unlike the onEvent "error" case (followed by
+       the trailing onStateChangeCb) and onExit (which calls it directly), the
+       raw spawn-error path has no other persistence trigger — an ENOENT spawn
+       failure emits "error" without an "exit", so without this the bubble is
+       shown live but never written to disk and vanishes on reload. */
+    this.onStateChangeCb();
   }
 
   /* Tracks which message ID is the current "in-flight" assistant bubble so
@@ -1205,35 +2055,247 @@ export class TabController {
     this.streamingAssistantMessageId = null;
   }
 
-  /* Rank vault files for an @-mention query. Simple heuristic: prefer
-     basename matches over path matches, then prefer prefix matches over
-     substring matches. Cap at 20 results. Claude Code understands `@<path>`
-     references natively (the CLI expands them into file content). */
+  /* Walk all messages and count Task/Agent tool calls still in flight
+     (status === "running"). Cheap O(messages × toolCalls), called on every
+     tool start/finish — counts grow slowly in practice so the walk is fine.
+     "Task" matches Claude Code 2.1.141 and earlier; "Agent" matches 2.1.143+
+     where the tool was renamed. */
+  private refreshRunningAgentCount(): void {
+    let running = 0;
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      for (const t of m.toolCalls) {
+        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
+          running++;
+        }
+      }
+    }
+    this.inputBox.setRunningAgentCount(running);
+  }
+
+  /* Best-effort vault-path resolution for items dropped from the Obsidian
+     file explorer. Tries the path as-is first (full vault path from a file
+     drag), then a wikilink-style resolution for bare names (handles drags
+     of a [[Note]]). Returns true when a vault item was found and pinned —
+     the InputBox uses this to decide whether to skip its text-insert
+     fallback. The pill bar handles file-vs-folder rendering via its own
+     vault lookup, so this method doesn't need to distinguish kinds. */
+  private tryPinVaultPath(path: string): boolean {
+    const direct = this.app.vault.getAbstractFileByPath(path);
+    if (direct instanceof TFile || direct instanceof TFolder) {
+      this.activeFileIndicator.addPinnedPath(direct.path);
+      return true;
+    }
+    /* Wikilink fallback: resolve bare note names like "MyNote" against the
+       metadata cache. Sources from the active file's path so relative
+       resolution works the same as Obsidian's built-in link resolution. */
+    const activePath = this.app.workspace.getActiveFile()?.path ?? "";
+    const dest = this.app.metadataCache.getFirstLinkpathDest(path, activePath);
+    if (dest) {
+      this.activeFileIndicator.addPinnedPath(dest.path);
+      return true;
+    }
+    return false;
+  }
+
+  /* Reads Obsidian's internal drag state. The file-explorer drag populates
+     `app.dragManager.draggable` with the dragged TFile/TFolder (or a
+     `files` array for multi-select) but typically leaves the HTML5
+     dataTransfer empty, so this is the only reliable way to detect that
+     a vault drag is in flight from inside our dragover/drop handlers. The
+     `dragManager` field is internal (not in the public Obsidian d.ts), so
+     we narrow through `unknown` rather than reaching for `any`. */
+  private readDragManagerItems(): Array<TFile | TFolder> {
+    const dm = (this.app as unknown as {
+      dragManager?: {
+        draggable?: {
+          file?: unknown;
+          files?: unknown[];
+          source?: unknown;
+          type?: unknown;
+        };
+      };
+    }).dragManager;
+    const draggable = dm?.draggable;
+    if (!draggable) return [];
+    const collected: Array<TFile | TFolder> = [];
+    if (draggable.file instanceof TFile || draggable.file instanceof TFolder) {
+      collected.push(draggable.file);
+    }
+    if (Array.isArray(draggable.files)) {
+      for (const f of draggable.files) {
+        if (f instanceof TFile || f instanceof TFolder) collected.push(f);
+      }
+    }
+    return collected;
+  }
+
+  private isVaultDragActive(): boolean {
+    return this.readDragManagerItems().length > 0;
+  }
+
+  /* Consumes the active Obsidian drag (if any) by pinning every dragged
+     TFile/TFolder. Returns true when at least one item was pinned so the
+     InputBox knows to skip its text/plain fallback. Files and folders both
+     route through the same pin call — ActiveFileIndicator picks the icon
+     and color per item via its own vault lookup. */
+  private tryConsumeVaultDrag(): boolean {
+    const items = this.readDragManagerItems();
+    if (items.length === 0) return false;
+    for (const item of items) {
+      this.activeFileIndicator.addPinnedPath(item.path);
+    }
+    return true;
+  }
+
+  /* One-line system-prompt block listing every enabled trusted folder.
+     Returns "" when the feature is off, no folders are trusted, or none
+     are currently enabled — caller filters empty entries before joining,
+     so an empty string is the right neutral value. Kept terse: each folder
+     is one bullet line so the addendum costs a handful of tokens, not a
+     paragraph. */
+  private buildTrustedFoldersAddendum(): string {
+    if (!this.plugin.settings.trustedFoldersInSystemPrompt) return "";
+    const enabled = (this.plugin.settings.trustedFolders ?? []).filter(f => f.enabled);
+    if (enabled.length === 0) return "";
+    const lines = enabled.map(f => `- ${f.path}`);
+    return [
+      "Trusted folders outside the vault (Read/Glob/Grep are pre-approved here — use them on demand instead of expecting file contents inline):",
+      ...lines,
+    ].join("\n");
+  }
+
+  /* Adds a folder to the user's trusted-folder list. New entries default to
+     `enabled: true` so the picker → checkbox handoff is one step (you
+     picked it, you want it on). Idempotent: re-adding an already-present
+     path quietly bumps it to enabled rather than appending a duplicate.
+     Writes the matching Read/Glob/Grep allowlist patterns so the CLI
+     auto-approves filesystem reads under the folder on the very next tool
+     call — no session restart needed for permissions to take effect. The
+     system-prompt hint, however, only refreshes on the next spawn (see
+     ensureSession's composedAddendum). */
+  private async addTrustedFolder(rawPath: string): Promise<void> {
+    const path = rawPath.replace(/\/+$/, "");
+    if (!path) return;
+    const list = this.plugin.settings.trustedFolders ?? [];
+    const existing = list.find(f => f.path === path);
+    if (existing) {
+      if (!existing.enabled) await this.toggleTrustedFolder(path, true);
+      return;
+    }
+    list.push({ path, enabled: true });
+    this.plugin.settings.trustedFolders = list;
+    await this.plugin.saveSettings();
+    await this.plugin.permissionsStore.addAllowMany(trustedFolderAllowPatterns(path));
+    new Notice(`Trusted ${path}`);
+  }
+
+  private async toggleTrustedFolder(rawPath: string, enabled: boolean): Promise<void> {
+    const path = rawPath.replace(/\/+$/, "");
+    const list = this.plugin.settings.trustedFolders ?? [];
+    const entry = list.find(f => f.path === path);
+    if (!entry) return;
+    entry.enabled = enabled;
+    this.plugin.settings.trustedFolders = list;
+    await this.plugin.saveSettings();
+    const patterns = trustedFolderAllowPatterns(path);
+    if (enabled) {
+      await this.plugin.permissionsStore.addAllowMany(patterns);
+    } else {
+      for (const p of patterns) await this.plugin.permissionsStore.removeAllow(p);
+    }
+  }
+
+  /* Removes the folder from the list entirely. Always clears the allowlist
+     patterns whether the entry was enabled or not — keeps state consistent
+     if someone hand-edited settings.json out of sync. */
+  private async removeTrustedFolder(rawPath: string): Promise<void> {
+    const path = rawPath.replace(/\/+$/, "");
+    const list = this.plugin.settings.trustedFolders ?? [];
+    const idx = list.findIndex(f => f.path === path);
+    if (idx < 0) return;
+    list.splice(idx, 1);
+    this.plugin.settings.trustedFolders = list;
+    await this.plugin.saveSettings();
+    const patterns = trustedFolderAllowPatterns(path);
+    for (const p of patterns) await this.plugin.permissionsStore.removeAllow(p);
+  }
+
+  /* Lazily build and memoize the flat file+folder index that backs the
+     @-mention query. Invalidated by the vault create/delete/rename listeners
+     wired in the constructor, so it survives across keystrokes. The vault root
+     (path "") is skipped so the user can't pin "the entire vault"; folders
+     carry mtime 0 (folder mtime isn't exposed) so they bunch at the bottom of
+     the empty-query list, matching Obsidian's quick-switcher behavior. */
+  private getMentionIndex(): Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> {
+    if (this.mentionIndex) return this.mentionIndex;
+    const index: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> = [];
+    for (const f of this.app.vault.getFiles()) {
+      index.push({ kind: "file", path: f.path, name: f.basename, mtime: f.stat.mtime, ext: f.extension });
+    }
+    const walkFolders = (folder: TFolder) => {
+      for (const child of folder.children) {
+        if (child instanceof TFolder) {
+          if (child.path !== "" && child.path !== "/") {
+            index.push({ kind: "folder", path: child.path, name: child.name, mtime: 0, ext: "" });
+          }
+          walkFolders(child);
+        }
+      }
+    };
+    walkFolders(this.app.vault.getRoot());
+    this.mentionIndex = index;
+    return index;
+  }
+
+  /* Rank vault files AND folders for an @-mention query. Simple heuristic:
+     prefer basename matches over path matches, then prefer prefix matches
+     over substring matches. Cap at 20 results. Claude Code understands
+     `@<path>` references natively for files (the CLI expands them into file
+     content); folders are routed to onPinFolder instead and become pinned
+     pills rather than text references. Reads the memoized getMentionIndex()
+     so a keystroke costs one scored pass, not a full vault re-traversal. */
   private queryFileSuggestions(query: string): Suggestion[] {
     const q = query.toLowerCase();
-    const files = this.app.vault.getFiles();
-    type Scored = { file: TFile; score: number };
+    type Scored = { kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string; score: number };
     const scored: Scored[] = [];
-    for (const f of files) {
-      const base = f.basename.toLowerCase();
-      const path = f.path.toLowerCase();
-      let score = -1;
-      if (q.length === 0) {
-        /* Empty query: show recently modified files first. */
-        score = f.stat.mtime;
-      } else if (base.startsWith(q)) score = 1000 - f.path.length;
-      else if (base.includes(q)) score = 800 - f.path.length;
-      else if (path.includes(q)) score = 400 - f.path.length;
-      if (score >= 0) scored.push({ file: f, score });
+
+    const scoreOf = (name: string, path: string, mtime: number): number => {
+      const base = name.toLowerCase();
+      const lpath = path.toLowerCase();
+      if (q.length === 0) return mtime;
+      if (base.startsWith(q)) return 1000 - path.length;
+      if (base.includes(q)) return 800 - path.length;
+      if (lpath.includes(q)) return 400 - path.length;
+      return -1;
+    };
+
+    for (const entry of this.getMentionIndex()) {
+      const score = scoreOf(entry.name, entry.path, entry.mtime);
+      if (score >= 0) scored.push({ ...entry, score });
     }
+
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, 20).map(({ file }) => ({
-      id: file.path,
-      primary: file.basename,
-      secondary: file.path,
-      icon: file.extension === "md" ? "file-text" : "file",
-      insert: `@${file.path}`,
-    }));
+    return scored.slice(0, 20).map((s): Suggestion => s.kind === "folder"
+      ? {
+          id: s.path,
+          primary: s.name,
+          secondary: s.path,
+          icon: "folder",
+          /* `insert` is unused for folders (acceptSuggestion routes them to
+             onPinFolder) but kept non-empty so it's safe if the callback is
+             absent and we fall back to text insertion. */
+          insert: `@${s.path}`,
+          kind: "folder",
+        }
+      : {
+          id: s.path,
+          primary: s.name,
+          secondary: s.path,
+          icon: s.ext === "md" ? "file-text" : "file",
+          insert: `@${s.path}`,
+          kind: "file",
+        });
   }
 
   /* Slash-command palette. Four sources merged:
@@ -1255,10 +2317,27 @@ export class TabController {
     const pluginCmds: Cmd[] = [
       { cmd: "/clear", desc: "Reset this tab — start a fresh Claude session", icon: "rotate-ccw" },
       { cmd: "/help",  desc: "Show plugin slash-command help", icon: "circle-help" },
+      { cmd: "/agent", desc: "Launch a subagent (Task tool) — pick from the discovered catalog", icon: "users", insert: "/agent " },
     ];
+
+    /* Per-agent entries so power users can fuzzy-match directly to a named
+       subagent. Inserted as `/agent <name>` so submit() routes them through
+       handlePluginSlashCommand below. */
+    const agentCmds: Cmd[] = this.plugin.subagentCatalog.agents.map(a => ({
+      cmd: `/agent ${a.name}`,
+      desc: a.description ?? `${a.source} subagent`,
+      icon: "users",
+      insert: `/agent ${a.name}`,
+    }));
 
     const pluginNameSet = new Set(pluginCmds.map(c => c.cmd.slice(1)));
     const seen = new Set<string>(pluginNameSet);
+    /* Block raw subagent names from being shadowed by skill/builtin entries
+       of the same name. The agent entries themselves carry the `/agent `
+       prefix so they don't collide with anything else, but we add their
+       bare names to the seen set as a courtesy in case someone names an
+       agent "clear" or similar. */
+    for (const a of this.plugin.subagentCatalog.agents) seen.add(`agent ${a.name}`);
 
     /* CLI init takes priority over disk-discovered list when present —
        it's the ground truth for what's loaded right now. */
@@ -1314,7 +2393,7 @@ export class TabController {
       }
     }
 
-    const commands = [...pluginCmds, ...skillCmds, ...builtinCmds];
+    const commands = [...pluginCmds, ...agentCmds, ...skillCmds, ...builtinCmds];
     const q = query.toLowerCase();
     return commands
       .filter(c => c.cmd.slice(1).toLowerCase().includes(q))

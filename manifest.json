@@ -5,6 +5,6 @@
   "minAppVersion": "1.4.5",
   "description": "Claudian-style chat UI for Claude Code CLI. Wraps `claude --output-format stream-json` and renders responses as chat bubbles. Native Remote Control support.",
   "author": "Henry Ortega",
-  "authorUrl": "https://github.com/henryortega29",
+  "authorUrl": "https://github.com/HenryOrtega9",
   "isDesktopOnly": true
 }

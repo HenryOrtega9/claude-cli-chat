@@ -31,6 +31,14 @@ export type TitleGenOptions = {
   model: string;
   /* Working dir for the subprocess (vault root usually). */
   cwd: string;
+  /* When true, the parent tab is incognito. Title generation is skipped
+     entirely: even with --no-session-persistence the CLI still writes a
+     one-line `ai-title` record to ~/.claude/projects/<slug>/<session-id>.jsonl
+     (Wire-format gotcha #6), and that session id is independent of the chat's
+     own session — so the incognito teardown cleanup never sees it. Skipping is
+     the only way to honor the "incognito tabs must touch no disk" invariant
+     for this throwaway subprocess. */
+  incognito?: boolean;
 };
 
 /* Minimal system prompt — the only instructions Haiku needs. No vault
@@ -45,6 +53,11 @@ const TITLE_SYSTEM_PROMPT =
   "Reply with ONLY the title text — no quotes, no preamble, no trailing punctuation.";
 
 export async function generateTitle(opts: TitleGenOptions): Promise<string | null> {
+  /* Incognito tabs must touch no disk. The title-gen subprocess leaves an
+     `ai-title` jsonl behind (gotcha #6) that no cleanup path reclaims, so
+     never spawn it for an incognito tab. */
+  if (opts.incognito) return null;
+
   const cmd = opts.claudePath || autodetectClaudePath() || "claude";
 
   /* Truncate both sides of the conversation snippet so input tokens stay
@@ -146,6 +159,11 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
        with the optimizations above should be ~1.5-3s typically. */
     const timeout = setTimeout(() => {
       try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      /* Escalate to SIGKILL if SIGTERM is ignored (e.g. wedged mid-network
+         retry). We've already resolved(null), so without this a hung
+         `claude --print` survives as an orphan holding the API connection. The
+         kill is harmless if the process already exited. */
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 2000);
       console.warn(`[claude-cli-chat] title-gen TIMEOUT after ${Date.now() - t0}ms`);
       resolve(null);
     }, 30000);

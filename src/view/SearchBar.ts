@@ -73,6 +73,16 @@ export class SearchBar {
 
   isOpen(): boolean { return this.visible; }
 
+  /* Tear down on tab close. Without this, a tab destroyed while search is open
+     leaks the MutationObserver (it survives target removal until disconnected)
+     and the pending debounce timer, both of which keep the messages container
+     and the whole SearchBar/TabController graph reachable across tab churn. */
+  destroy() {
+    this.detachMutationObserver();
+    this.clearMarks();
+    this.root.remove();
+  }
+
   /* Subscribe to DOM mutations inside the messages container so streaming
      re-renders that wipe our marks trigger an automatic re-highlight. Skips
      mutations that only touched <mark> nodes (those are our own work — the
@@ -102,7 +112,7 @@ export class SearchBar {
       if (this.refreshDebounceTimer !== null) window.clearTimeout(this.refreshDebounceTimer);
       this.refreshDebounceTimer = window.setTimeout(() => {
         this.refreshDebounceTimer = null;
-        if (this.visible) this.refreshMatches();
+        if (this.visible) this.refreshMatches(true);
       }, 50);
     });
     this.mutationObserver.observe(this.messagesContainer, { childList: true, subtree: true, characterData: true });
@@ -119,7 +129,32 @@ export class SearchBar {
     }
   }
 
-  private refreshMatches() {
+  /* fromObserver=true means this refresh was triggered by a streaming
+     re-render, not an explicit user action. In that case we preserve the
+     user's navigated position (clamped to the new match count) instead of
+     snapping back to match #1, and we suppress scrollIntoView so the viewport
+     isn't yanked away from where they're reading on every debounce tick. */
+  private refreshMatches(fromObserver = false) {
+    /* Suspend the observer around our own DOM edits. wrapMatches/clearMarks
+       insert the non-matching text slices as plain text nodes whose parent is
+       the message bubble, not a <mark> — so the onlyMarks() filter in the
+       observer does NOT skip them, and every refresh would schedule another
+       refresh in 50ms: a perpetual self-feeding loop while a matching query is
+       open. Disconnecting drops the records our edits generate; refreshMatches
+       re-scans the whole container anyway, so nothing real is missed. */
+    const obs = this.mutationObserver;
+    if (obs) obs.disconnect();
+    try {
+      this.refreshMatchesInner(fromObserver);
+    } finally {
+      if (obs && this.visible) {
+        obs.observe(this.messagesContainer, { childList: true, subtree: true, characterData: true });
+      }
+    }
+  }
+
+  private refreshMatchesInner(fromObserver: boolean) {
+    const prevActiveIndex = this.activeIndex;
     this.clearMarks();
     const query = this.input.value.trim();
     if (!query) {
@@ -152,8 +187,12 @@ export class SearchBar {
       if (!lower.includes(lowerQuery)) continue;
       this.wrapMatches(textNode, text, lower, lowerQuery);
     }
-    this.activeIndex = 0;
-    this.updateActive();
+    if (fromObserver && this.marks.length > 0) {
+      this.activeIndex = Math.min(prevActiveIndex, this.marks.length - 1);
+    } else {
+      this.activeIndex = 0;
+    }
+    this.updateActive(!fromObserver);
     this.updateCount();
   }
 
@@ -184,12 +223,12 @@ export class SearchBar {
     this.updateCount();
   }
 
-  private updateActive() {
+  private updateActive(scroll = true) {
     for (const m of this.marks) m.removeClass("is-active");
     const m = this.marks[this.activeIndex];
     if (m) {
       m.addClass("is-active");
-      m.scrollIntoView({ block: "center", behavior: "auto" });
+      if (scroll) m.scrollIntoView({ block: "center", behavior: "auto" });
     }
   }
 

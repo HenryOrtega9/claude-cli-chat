@@ -3,6 +3,7 @@ import type ClaudeChatPlugin from "../main";
 import { renderHeader } from "./Header";
 import { TabBar, type TabBadgeState } from "./TabBar";
 import { TabController } from "./TabController";
+import { StateEmitter } from "../claude/StateEmitter";
 import { HistoryModal } from "./HistoryModal";
 import { SnippetPicker } from "./SnippetPicker";
 import { MCPManagerModal } from "./MCPManagerModal";
@@ -165,13 +166,33 @@ export class ClaudeChatView extends ItemView {
   }
 
   private saveIndex() {
-    void this.plugin.persistence.saveIndex({
-      activeTabId: this.activeTabId,
-      tabs: this.tabs.map(t => ({
-        id: t.state.id,
-        title: t.state.title,
-        sessionId: t.state.sessionId,
-      })),
+    /* Don't let an incognito tab's id leak into the index as activeTabId —
+       it isn't in the persisted tabs list, so persist it as null rather than
+       a dangling reference. */
+    const activeTab = this.tabs.find(t => t.state.id === this.activeTabId);
+    const activeTabId = activeTab && !activeTab.state.incognito ? this.activeTabId : null;
+    const index = {
+      activeTabId,
+      /* Incognito tabs are excluded from the index so they never get written
+         to tabs.json and thus never restore on reload. */
+      tabs: this.tabs
+        .filter(t => !t.state.incognito)
+        .map(t => ({
+          id: t.state.id,
+          title: t.state.title,
+          sessionId: t.state.sessionId,
+        })),
+    };
+    /* Dedupe against per-streaming-delta calls happens inside
+       persistence.saveIndex (content compare on the serialized payload).
+       A second view-level cache here used to shadow it, but it never
+       reverted on write failure — a transient EACCES/disk-full/iCloud
+       hiccup poisoned it with the failed payload, and every retry with
+       identical content short-circuited before reaching persistence. The
+       persistence-level cache handles failure correctly (reverts to null),
+       so it is the only one. */
+    return this.plugin.persistence.saveIndex(index).catch(err => {
+      console.warn(`[claude-cli-chat] index write failed`, err);
     });
   }
 
@@ -191,22 +212,44 @@ export class ClaudeChatView extends ItemView {
     this.createTab();
   }
 
-  private createTab(state?: TabState, opts: { skipSave?: boolean } = {}) {
+  private createTab(state?: TabState, opts: { skipSave?: boolean; incognito?: boolean } = {}) {
     const controller = new TabController(
       this.plugin,
       this.tabsContainer,
       this,
-      state ?? makeTabState(),
+      state ?? makeTabState({ incognito: opts.incognito }),
       () => {
         this.renderTabBar();
-        this.plugin.persistence.scheduleSaveTab(controller.state);
+        /* Incognito tabs never touch the vault. saveIndex() self-filters them,
+           so it stays safe to call unconditionally. */
+        if (!controller.state.incognito) {
+          this.plugin.persistence.scheduleSaveTab(controller.state);
+        }
         this.saveIndex();
       }
     );
     controller.onForkRequest = (src, messageId) => this.forkFromMessage(src, messageId);
+    controller.onIncognitoToggle = (tabId, incognito) => this.onIncognitoToggle(tabId, incognito);
     this.tabs.push(controller);
     this.selectTab(controller.state.id, { skipSave: true });
-    if (!opts.skipSave) this.saveIndex();
+    if (!opts.skipSave) {
+      this.saveIndex();
+      /* Tabs created with pre-populated history (fork, History-modal reopen)
+         carry messages that no streaming event will reproduce. saveIndex only
+         writes the index entry; without an explicit body write the conversation
+         file isn't created until the user interacts. A reload before that drops
+         the carried history (loadTab returns null, so restore replaces the
+         entry with a blank tab). Persist the body now. Empty new tabs and
+         incognito tabs are skipped; flush() on unload covers the debounce. */
+      if (!controller.state.incognito && controller.state.messages.length > 0) {
+        this.plugin.persistence.scheduleSaveTab(controller.state);
+      }
+      /* User-initiated new tab (or fork). Reset the TC001 to "ready" so a
+         lingering "thinking" / "needs_permission" from another tab doesn't
+         carry over. skipSave is set during plugin-load tab restore, where we
+         want to leave the device on whatever StateEmitter already emitted. */
+      StateEmitter.setState("ready");
+    }
   }
 
   /* Create a new tab whose state is the source tab's history truncated at
@@ -258,12 +301,32 @@ export class ClaudeChatView extends ItemView {
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
     const [removed] = this.tabs.splice(idx, 1);
+    /* Snapshot busy state before destroy(): a tab closed mid-stream left
+       StateEmitter asserting "thinking" (it never reached the result event
+       that resets to "ready"), orphaning the TC001 heartbeat. */
+    const wasBusy = removed.isBusy();
     /* Await destroy() before splicing out — otherwise the subprocess SIGTERM
        handshake races against onClose-like cleanup and we can leak children
        as PPID=1 orphans (same failure mode that onClose's await pattern
        fixed for the bulk path). */
     await removed.destroy();
-    void this.plugin.persistence.deleteTab(tabId);
+    /* Incognito tabs have nothing on disk — skip the delete entirely.
+       Order matters for the rest: drop the index entry FIRST, then remove
+       the files, and await both. A crash between the two leaves an orphaned
+       conversation file (harmless — listConversations tolerates it) instead
+       of a dangling index entry that restores as a phantom blank tab. The
+       tab is already spliced out above, so saveIndex writes the index
+       without it. */
+    if (!removed.state.incognito) {
+      await this.saveIndex();
+      await this.plugin.persistence.deleteTab(tabId);
+    }
+    /* Clear the orphaned "thinking" heartbeat back to "ready" — but only when
+       no surviving tab is itself busy, so closing one streaming tab doesn't
+       blank the device while another is still working. */
+    if (wasBusy && !this.tabs.some(t => t.isBusy())) {
+      StateEmitter.setState("ready");
+    }
     if (this.tabs.length === 0) {
       this.createTab();
     } else if (this.activeTabId === tabId) {
@@ -279,8 +342,28 @@ export class ClaudeChatView extends ItemView {
       id: t.state.id,
       busy: t.isBusy(),
       hasPendingApproval: t.hasPendingApprovals(),
+      isIncognito: !!t.state.incognito,
     }));
     this.tabBar.render(badges, this.activeTabId);
+  }
+
+  /* Reconcile disk when a still-empty tab toggles incognito. Turning ON deletes
+     any file written while it was a normal empty tab (createTab wrote an index
+     entry; a debounced body write may also be in flight). Turning OFF resumes
+     normal persistence. saveIndex() re-derives the filtered index either way. */
+  private async onIncognitoToggle(tabId: string, incognito: boolean) {
+    const tab = this.tabs.find(t => t.state.id === tabId);
+    this.renderTabBar();
+    if (incognito) {
+      /* Same ordering as closeTab: rewrite the index (which now filters
+         this tab out) BEFORE removing its files, so a crash between the
+         two can't leave a dangling index entry. */
+      await this.saveIndex();
+      await this.plugin.persistence.deleteTab(tabId);
+    } else {
+      if (tab) this.plugin.persistence.scheduleSaveTab(tab.state);
+      await this.saveIndex();
+    }
   }
 
   private clearActiveTab() {
@@ -289,7 +372,13 @@ export class ClaudeChatView extends ItemView {
   }
 
   private showMcpManager() {
-    new MCPManagerModal(this.app, this.plugin.settings.claudePath).open();
+    new MCPManagerModal(this.app, this.plugin, () => {
+      /* When the modal closes, the active tab's cost-surface pill may be
+         stale (servers toggled on/off). Trigger a refresh so the count
+         reflects the current per-vault enabled set without a tab restart. */
+      const active = this.tabs.find(t => t.state.id === this.activeTabId);
+      if (active) void active.refreshCostSurface();
+    }).open();
   }
 
   private showSnippetPicker() {

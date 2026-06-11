@@ -1,5 +1,5 @@
-import { App, Component, MarkdownRenderer, Notice, setIcon } from "obsidian";
-import type { ChatMessage, ToolCall } from "./state";
+import { App, Component, MarkdownRenderer, Notice, setIcon, TFolder } from "obsidian";
+import type { Attachment, ChatMessage, NestedSubagentEvent, ToolCall } from "./state";
 import { editOpsFromInput, renderDiff, renderWritePreview } from "./DiffRenderer";
 
 export type MessageActionCallbacks = {
@@ -21,6 +21,9 @@ export type MessageActionCallbacks = {
      engages. This is the standard chat-app pattern and avoids the rAF /
      scrollHeight-mismatch races we had with the previous approach. */
 export class MessageListRenderer {
+  /* At or above this many attached notes, the pill row collapses behind a
+     single "N notes" summary pill the user can click to expand. */
+  private static readonly NOTE_COLLAPSE_THRESHOLD = 4;
   private app: App;
   private component: Component;
   private container: HTMLElement;
@@ -32,11 +35,22 @@ export class MessageListRenderer {
      DOM and both append. Serializing per-id removes the window structurally
      rather than patching symptoms downstream (footer dedup, etc.). */
   private renderChains = new Map<string, Promise<void>>();
+  /* Generation token bumped on every reset(). Clearing renderChains alone
+     cannot cancel an already-scheduled .then continuation, so a doUpsert queued
+     behind an in-flight one still runs after reset() and would re-create a
+     cleared bubble. Each upsert captures the generation it was queued under;
+     doUpsert bails if it no longer matches, so post-reset stragglers are inert. */
+  private generation = 0;
   /* Sticky per-message override for the thinking-block toggle. Set when the
      user clicks the header. Survives the empty()+rebuild cycle that happens
      on every streaming delta, so a user-collapsed block doesn't auto-reopen
      on the next token. Absent = use the streaming default. */
   private thinkingOpenOverride = new Map<string, boolean>();
+  /* Sticky per-tool override for the subagent timeline toggle, keyed by Task
+     tool id. Same rationale as thinkingOpenOverride: the subagent summary is
+     rebuilt on every nested-event delta, so a user-expanded (or collapsed)
+     timeline must survive the rebuild. Absent = use the default (collapsed). */
+  private subagentEventsOpenOverride = new Map<string, boolean>();
   private stickToBottom = true;
   private resizeObserver: ResizeObserver | null = null;
   private intersectionObserver: IntersectionObserver | null = null;
@@ -101,6 +115,18 @@ export class MessageListRenderer {
     this.liveEls.clear();
     this.toolEls.clear();
     this.thinkingOpenOverride.clear();
+    this.subagentEventsOpenOverride.clear();
+    /* Clear render chains too: a doUpsert queued behind an in-flight
+       MarkdownRenderer.render await would otherwise re-run after reset, miss
+       the now-empty liveEls, and re-append a fresh bubble — resurrecting a
+       message /clear was meant to remove. Dropping the chain map detaches the
+       stale promise so a late render can't re-enter the cleared container. */
+    this.renderChains.clear();
+    /* Bump the generation so any doUpsert already scheduled behind an in-flight
+       MarkdownRenderer.render await bails on resume instead of re-appending a
+       bubble to the freshly-emptied container. Clearing the map above cannot
+       cancel that pending microtask; this token can. */
+    this.generation++;
     this.stickToBottom = true;
     /* Container was emptied above; re-insert the tracked tail element so the
        status pill survives /clear and new-chat resets. */
@@ -156,7 +182,10 @@ export class MessageListRenderer {
        another upsert clearing the same content element. GC the map entry once
        the chain settles so long-lived sessions don't leak. */
     const prev = this.renderChains.get(msg.id) ?? Promise.resolve();
-    const next = prev.then(() => this.doUpsert(msg));
+    /* Snapshot the generation now, before the chain resolves: if reset() runs
+       while this upsert is queued, doUpsert sees the mismatch and bails. */
+    const gen = this.generation;
+    const next = prev.then(() => this.doUpsert(msg, gen));
     this.renderChains.set(msg.id, next);
     next.finally(() => {
       if (this.renderChains.get(msg.id) === next) this.renderChains.delete(msg.id);
@@ -164,13 +193,42 @@ export class MessageListRenderer {
     await next;
   }
 
-  private async doUpsert(msg: ChatMessage) {
+  /* Tear down all DOM and bookkeeping for a single message. Used when a
+     preamble pass is being folded into the following pass (interleaved
+     thinking can produce two adjacent assistant bubbles where the first is
+     a strict-prefix duplicate of the second). Also sweeps any tool elements
+     nested inside the bubble so their entries in toolEls don't dangle. */
+  removeMessage(id: string) {
+    const entry = this.liveEls.get(id);
+    if (!entry) return;
+    for (const [toolId, toolEl] of Array.from(this.toolEls)) {
+      if (entry.root.contains(toolEl)) {
+        this.toolEls.delete(toolId);
+        this.subagentEventsOpenOverride.delete(toolId);
+      }
+    }
+    entry.root.remove();
+    this.liveEls.delete(id);
+    this.thinkingOpenOverride.delete(id);
+    this.renderChains.delete(id);
+  }
+
+  private async doUpsert(msg: ChatMessage, gen: number) {
+    /* Bail before createBubble if a reset() ran while this upsert was queued.
+       Without this the missing liveEls entry would route us through createBubble
+       and re-append a bubble to the cleared container — a zombie message. */
+    if (gen !== this.generation) return;
     let entry = this.liveEls.get(msg.id);
     if (!entry) {
       entry = this.createBubble(msg);
       this.liveEls.set(msg.id, entry);
     }
     await this.renderContent(entry.content, msg);
+    /* renderContent awaits MarkdownRenderer; removeMessage() (preamble fold)
+       can run during that await, detaching entry.root and clearing liveEls. If
+       so, bail — otherwise we write to a detached bubble and re-register this
+       message's tools in toolEls pointing at orphaned DOM. */
+    if (this.liveEls.get(msg.id) !== entry) return;
     if (msg.toolCalls) {
       for (const tool of msg.toolCalls) {
         this.upsertTool(entry.root, tool);
@@ -197,9 +255,13 @@ export class MessageListRenderer {
       this.toolEls.set(tool.id, toolEl);
 
       /* Click the header to toggle. Default is collapsed — content is shown
-         only on demand so giant Read/Skill results don't dominate the chat. */
+         only on demand so giant Read/Skill results don't dominate the chat.
+         Record the user's intent via `is-user-toggled` so the running-tool
+         auto-expand guard below leaves their choice alone across the per-delta
+         rebuild — without it a user-collapsed running row snaps back open. */
       header.addEventListener("click", () => {
         toolEl!.toggleClass("is-expanded", !toolEl!.hasClass("is-expanded"));
+        toolEl!.addClass("is-user-toggled");
       });
     }
     const subjectEl = toolEl.querySelector(".claudian-tool-subject") as HTMLElement;
@@ -218,7 +280,18 @@ export class MessageListRenderer {
 
     /* Auto-expand on first sight while running (so the user sees what's about
        to execute) and on error (so they don't have to click to find what
-       failed). Collapse on successful completion. */
+       failed). Collapse on successful completion. Exception: Task/Agent spawns
+       render their own summary (description + live timeline) above the content,
+       so auto-expanding their raw prompt JSON just adds noise — leave it
+       collapsed and let the summary carry the live state. */
+    const isSpawn = tool.name === "Task" || tool.name === "Agent";
+    /* A terminal transition (error or completion) is a fresh system-driven
+       state change, so clear the user's running-tool toggle intent and let the
+       error/complete rules below decide expansion. While still running the
+       flag is preserved so a user-collapsed row stays collapsed. */
+    if (tool.isError || tool.status === "completed") {
+      toolEl.removeClass("is-user-toggled");
+    }
     if (tool.isError) {
       toolEl.addClass("is-expanded");
     } else if (tool.status === "completed") {
@@ -227,7 +300,7 @@ export class MessageListRenderer {
          state. Since toggling a not-yet-expanded element just adds the class,
          absence of `is-expanded` here means we should leave it absent. */
       /* no-op: keep current state */
-    } else if (tool.status === "running" && !toolEl.hasClass("is-user-toggled")) {
+    } else if (tool.status === "running" && !isSpawn && !toolEl.hasClass("is-user-toggled")) {
       toolEl.addClass("is-expanded");
     }
 
@@ -241,13 +314,15 @@ export class MessageListRenderer {
       this.renderTodoList(toolEl, tool);
     }
 
-    /* Task tool (subagent invocation) — render the subagent type + the short
-       description above the collapsed prompt so the user can see at a glance
-       what was delegated, without having to expand. */
-    const isTask = tool.name === "Task";
+    /* Task / Agent tool (subagent invocation) — render the subagent type +
+       the short description above the collapsed prompt so the user can see
+       at a glance what was delegated, without having to expand. The tool
+       name varies by CLI version: Claude Code 2.1.141 emitted "Task";
+       2.1.143+ emits "Agent". Match both. */
+    const isSubagentSpawn = tool.name === "Task" || tool.name === "Agent";
     const existingSubagent = toolEl.querySelector(".claudian-subagent-summary");
     if (existingSubagent) existingSubagent.remove();
-    if (isTask) {
+    if (isSubagentSpawn) {
       this.renderSubagentSummary(toolEl, tool);
     }
 
@@ -348,6 +423,9 @@ export class MessageListRenderer {
     const wrapper = this.container.createDiv({
       cls: `claudian-message-wrapper claudian-message-wrapper-${msg.role}`,
     });
+    if (msg.role === "user" && msg.attachedNotePaths && msg.attachedNotePaths.length > 0) {
+      this.renderAttachedNoteFlags(wrapper, msg.attachedNotePaths);
+    }
     if (msg.role === "user" && msg.selectionContext) {
       this.renderSelectionFlag(wrapper, msg.selectionContext);
     }
@@ -373,6 +451,72 @@ export class MessageListRenderer {
       : `lines ${ctx.startLine}–${ctx.endLine}`;
     flag.createSpan({ cls: "claudian-selection-flag-text", text: `Selected from ${fileName} · ${range}` });
     flag.setAttr("title", `${ctx.filePath} · ${range}`);
+  }
+
+  /* Note pills rendered above the user's bubble, one per file/folder that was
+     pinned in the file-pill bar when the message was sent. Echoes the
+     composer's pill (file-text icon, brand tint) so the connection reads as
+     "the note I attached rode along with this turn". The bubble itself stays
+     clean — only the user's typed text shows inside it. Clicking a pill opens
+     the note.
+
+     Once the count reaches NOTE_COLLAPSE_THRESHOLD the row collapses behind a
+     single "📎 N notes" summary pill so the header stays compact; clicking it
+     toggles the full list. Below the threshold every note shows as its own
+     pill. */
+  private renderAttachedNoteFlags(parent: HTMLElement, paths: string[]) {
+    const row = parent.createDiv({ cls: "claudian-attached-note-flags" });
+
+    if (paths.length < MessageListRenderer.NOTE_COLLAPSE_THRESHOLD) {
+      for (const path of paths) this.renderNotePill(row, path);
+      return;
+    }
+
+    /* Collapsed: a single summary pill that toggles the expanded list below. */
+    const summary = row.createDiv({ cls: "claudian-attached-note-summary" });
+    const iconEl = summary.createSpan({ cls: "claudian-attached-note-flag-icon" });
+    setIcon(iconEl, "paperclip");
+    summary.createSpan({ cls: "claudian-attached-note-flag-text", text: `${paths.length} notes` });
+    const chevron = summary.createSpan({ cls: "claudian-attached-note-chevron" });
+    setIcon(chevron, "chevron-down");
+
+    const expanded = row.createDiv({ cls: "claudian-attached-note-expanded" });
+    for (const path of paths) this.renderNotePill(expanded, path);
+
+    const setTitle = (open: boolean) =>
+      summary.setAttr("title", `${paths.length} notes attached as context · click to ${open ? "collapse" : "expand"}`);
+    setTitle(false);
+    summary.addEventListener("click", e => {
+      e.stopPropagation();
+      const next = !row.hasClass("is-expanded");
+      row.toggleClass("is-expanded", next);
+      setTitle(next);
+      if (next) this.scrollToBottom();
+    });
+  }
+
+  /* One attached-note pill — file/folder icon + basename, clicking a file
+     opens it in a new tab. Shared by the inline (below-threshold) and the
+     expanded (collapsed-summary) layouts. */
+  private renderNotePill(container: HTMLElement, path: string) {
+    const flag = container.createDiv({ cls: "claudian-attached-note-flag" });
+    const iconEl = flag.createSpan({ cls: "claudian-attached-note-flag-icon" });
+    const node = this.app.vault.getAbstractFileByPath(path);
+    if (node instanceof TFolder) {
+      flag.addClass("is-folder");
+      setIcon(iconEl, "folder");
+    } else {
+      const ext = path.split(".").pop() ?? "";
+      setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
+    }
+    const fileName = path.split("/").pop() ?? path;
+    flag.createSpan({ cls: "claudian-attached-note-flag-text", text: fileName });
+    flag.setAttr("title", `Attached as context: ${path}`);
+    flag.addEventListener("click", e => {
+      e.stopPropagation();
+      if (node instanceof TFolder) return;
+      void this.app.workspace.openLinkText(path, "", "tab");
+    });
   }
 
   /* Per-message action toolbar — hidden until the message is hovered. Has a
@@ -422,22 +566,42 @@ export class MessageListRenderer {
        the bubble hugs the image nicely. */
     const liftAttachmentsAboveBubble = hasAttachments && hasUserText;
 
+    const renderAttachmentInto = (parent: HTMLElement, att: Attachment) => {
+      const kind = att.kind ?? "image";
+      if (kind === "image") {
+        if (att.data) {
+          const img = parent.createEl("img", { cls: "claudian-message-attachment" });
+          img.src = `data:${att.mediaType};base64,${att.data}`;
+          img.alt = att.filename ?? "Pasted image";
+          return;
+        }
+        /* Image attachment with no data — defensive path. Render as a chip
+           with the image icon so the user still sees "an image was here"
+           rather than misleading "file" iconography. */
+        const chip = parent.createDiv({ cls: "claudian-message-attachment claudian-message-attachment-file" });
+        const iconEl = chip.createSpan({ cls: "claudian-message-attachment-icon" });
+        setIcon(iconEl, "image");
+        const label = att.filename ?? "Image (data missing)";
+        chip.createSpan({ cls: "claudian-message-attachment-label", text: label, attr: { title: label } });
+        return;
+      }
+      /* pdf / text — render as a compact file chip. Same visual treatment for
+         both; only the icon differs so the user can scan-distinguish. */
+      const chip = parent.createDiv({ cls: "claudian-message-attachment claudian-message-attachment-file" });
+      const iconEl = chip.createSpan({ cls: "claudian-message-attachment-icon" });
+      setIcon(iconEl, kind === "pdf" ? "file-text" : "file");
+      const label = att.filename ?? (kind === "pdf" ? "document.pdf" : "file");
+      chip.createSpan({ cls: "claudian-message-attachment-label", text: label, attr: { title: label } });
+    };
+
     if (hasAttachments && !liftAttachmentsAboveBubble) {
       const attRow = el.createDiv({ cls: "claudian-message-attachments" });
-      for (const att of msg.attachments!) {
-        const img = attRow.createEl("img", { cls: "claudian-message-attachment" });
-        img.src = `data:${att.mediaType};base64,${att.data}`;
-        img.alt = "Pasted image";
-      }
+      for (const att of msg.attachments!) renderAttachmentInto(attRow, att);
     }
     if (liftAttachmentsAboveBubble && wrapper) {
       const bubbleRoot = el.parentElement;
       const attRow = createDiv({ cls: "claudian-message-attachments claudian-message-attachments-above" });
-      for (const att of msg.attachments!) {
-        const img = attRow.createEl("img", { cls: "claudian-message-attachment" });
-        img.src = `data:${att.mediaType};base64,${att.data}`;
-        img.alt = "Pasted image";
-      }
+      for (const att of msg.attachments!) renderAttachmentInto(attRow, att);
       if (bubbleRoot) wrapper.insertBefore(attRow, bubbleRoot);
       else wrapper.appendChild(attRow);
     }
@@ -652,25 +816,176 @@ export class MessageListRenderer {
 
   /* Render the Task tool's subagent_type + description prominently in a
      summary block above the collapsed prompt. The header's title text also
-     gets retitled to "Task → <subagent_type>" so the row scans clearly. */
+     gets retitled to "Task → <subagent_type>" so the row scans clearly.
+     When SubagentSessionTracker has populated nestedEvents, this also
+     renders a nested timeline of what the subagent did (text/thinking/tool
+     calls) plus a status line with elapsed duration. */
   private renderSubagentSummary(toolEl: HTMLElement, tool: ToolCall) {
     const input = tool.input as { subagent_type?: string; description?: string; prompt?: string };
     const subagentType = input.subagent_type ?? "agent";
     const description = input.description ?? "";
 
-    /* Retitle the header's tool name to make the subagent visible at a glance. */
+    /* Retitle the header's tool name to make the subagent visible at a glance.
+       Use the actual tool name as prefix so the row reads correctly across
+       CLI versions ("Task → general-purpose" vs "Agent → general-purpose"). */
     const nameEl = toolEl.querySelector(".claudian-tool-name") as HTMLElement | null;
-    if (nameEl) nameEl.setText(`Task → ${subagentType}`);
+    if (nameEl) nameEl.setText(`${tool.name} → ${subagentType}`);
 
-    if (!description) return;
+    const eventCount = (tool.nestedEvents?.length ?? 0) + (tool.nestedTruncatedCount ?? 0);
+    const hasEvents = eventCount > 0;
+    const hasNestedSurface = !!description || tool.nestedStatus !== undefined || hasEvents;
+    if (!hasNestedSurface) return;
+
     const container = createDiv({ cls: "claudian-subagent-summary" });
-    container.createDiv({ cls: "claudian-subagent-description", text: description });
+    if (description) {
+      container.createDiv({ cls: "claudian-subagent-description", text: description });
+    }
+
+    /* Default the timeline collapsed so a busy subagent doesn't flood the
+       chat with its internal steps. The toggle row + current-activity preview
+       keep the live state legible at a glance; expand for the full timeline.
+       A user's explicit toggle (stored per tool id) overrides the default and
+       survives the per-delta rebuild. */
+    const override = this.subagentEventsOpenOverride.get(tool.id);
+    const isOpen = hasEvents && (override !== undefined ? override : false);
+    container.toggleClass("is-events-open", isOpen);
+
+    /* Toggle row: chevron (only when there's a timeline to expand) + status
+       label + step count + a running pulse. Clicking it flips the timeline. */
+    if (tool.nestedStatus || hasEvents) {
+      const toggle = container.createDiv({
+        cls: `claudian-subagent-toggle is-${tool.nestedStatus ?? "running"}`,
+      });
+      if (hasEvents) {
+        const chevron = toggle.createSpan({ cls: "claudian-subagent-chevron" });
+        setIcon(chevron, "chevron-down");
+      }
+      toggle.createSpan({
+        cls: "claudian-subagent-toggle-label",
+        text: this.subagentStatusLabel(tool) || "Running",
+      });
+      if (hasEvents) {
+        toggle.createSpan({
+          cls: "claudian-subagent-step-count",
+          text: `${eventCount} step${eventCount === 1 ? "" : "s"}`,
+        });
+      }
+      if (tool.nestedStatus === "running" || tool.nestedStatus === "spawning") {
+        toggle.createSpan({ cls: "claudian-subagent-pulse" });
+      }
+      if (hasEvents) {
+        toggle.addEventListener("click", () => {
+          const next = !container.hasClass("is-events-open");
+          container.toggleClass("is-events-open", next);
+          this.subagentEventsOpenOverride.set(tool.id, next);
+          if (next) this.scrollToBottom();
+        });
+      }
+    }
+
+    /* Collapsed view: a single live line showing the subagent's latest step,
+       so the user still sees "what is it doing now" without the wall of text.
+       Only while the subagent is live — once it finishes, the status label +
+       step count carry the summary and a "current step" line would mislead. */
+    const isLive = tool.nestedStatus !== "completed" && tool.nestedStatus !== "failed";
+    if (hasEvents && !isOpen && isLive) {
+      const current = this.latestActivity(tool);
+      if (current) {
+        container.createDiv({ cls: "claudian-subagent-current", text: current });
+      }
+    }
+
+    /* Full nested events timeline. Always built when events exist; CSS hides
+       the wrapper unless the summary carries `is-events-open`. */
+    if (hasEvents) {
+      const eventsWrap = container.createDiv({ cls: "claudian-subagent-events-wrap" });
+      const events = eventsWrap.createDiv({ cls: "claudian-subagent-events" });
+      if ((tool.nestedTruncatedCount ?? 0) > 0) {
+        events.createDiv({
+          cls: "claudian-subagent-events-truncated",
+          text: `+${tool.nestedTruncatedCount} earlier events dropped`,
+        });
+      }
+      for (const evt of tool.nestedEvents ?? []) {
+        this.renderNestedEvent(events, evt);
+      }
+    }
+
     const header = toolEl.querySelector(".claudian-tool-header");
     if (header && header.nextSibling) {
       toolEl.insertBefore(container, header.nextSibling);
     } else {
       toolEl.appendChild(container);
     }
+  }
+
+  private subagentStatusLabel(tool: ToolCall): string {
+    const dur = tool.nestedDurationMs;
+    const durStr = dur !== undefined ? ` · ${this.formatDuration(dur)}` : "";
+    switch (tool.nestedStatus) {
+      case "spawning": return "Spawning subagent…";
+      case "running":  return `Running${durStr}`;
+      case "completed": return `Completed${durStr}`;
+      case "failed":   return `Failed${durStr}`;
+      default: return "";
+    }
+  }
+
+  private renderNestedEvent(parent: HTMLElement, evt: NestedSubagentEvent) {
+    const row = parent.createDiv({ cls: "claudian-subagent-event" });
+    if (evt.kind === "text") {
+      row.createDiv({ cls: "claudian-subagent-event-text", text: evt.text });
+    } else if (evt.kind === "thinking") {
+      row.createDiv({ cls: "claudian-subagent-event-thinking", text: evt.text });
+    } else if (evt.kind === "tool_use") {
+      const toolRow = row.createDiv({ cls: "claudian-subagent-event-tool" });
+      toolRow.createSpan({ cls: "claudian-subagent-event-tool-name", text: evt.name });
+      const subject = this.nestedToolSubject(evt);
+      if (subject) toolRow.createSpan({ text: ` ${subject}` });
+      toolRow.createSpan({
+        cls: "claudian-subagent-event-tool-status",
+        text: ` [${evt.status}${evt.isError ? " · err" : ""}]`,
+      });
+    }
+  }
+
+  /* Best-effort subject string for a nested tool row. Mirrors subjectForTool's
+     intent — pick a short identifier (file_path / pattern / command) — but
+     stays scoped to the nested rendering so a future change in subjectForTool
+     doesn't accidentally reflow the timeline. */
+  private nestedToolSubject(evt: Extract<NestedSubagentEvent, { kind: "tool_use" }>): string | null {
+    const input = evt.input as { file_path?: string; path?: string; command?: string; pattern?: string; subagent_type?: string };
+    if (typeof input.file_path === "string") return input.file_path;
+    if (typeof input.path === "string") return input.path;
+    if (typeof input.command === "string") return input.command.length > 80 ? input.command.slice(0, 80) + "…" : input.command;
+    if (typeof input.pattern === "string") return input.pattern;
+    if (typeof input.subagent_type === "string") return input.subagent_type;
+    return null;
+  }
+
+  /* One-line summary of the subagent's most recent step, shown while the
+     timeline is collapsed. Mirrors the timeline's own formatting (tool name +
+     subject, or the first line of a text/thinking delta) but kept to a single
+     truncated line so the collapsed summary stays compact. */
+  private latestActivity(tool: ToolCall): string | null {
+    const events = tool.nestedEvents;
+    if (!events || events.length === 0) return null;
+    const last = events[events.length - 1];
+    const oneLine = (s: string, n = 72) => {
+      const flat = s.replace(/\s+/g, " ").trim();
+      return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
+    };
+    if (last.kind === "text" || last.kind === "thinking") {
+      const text = oneLine(last.text);
+      return text || null;
+    }
+    if (last.kind === "tool_use") {
+      const subject = this.nestedToolSubject(last);
+      const base = subject ? `${last.name} ${subject}` : last.name;
+      const tail = last.status === "running" ? "…" : "";
+      return oneLine(base) + tail;
+    }
+    return null;
   }
 
   /* Explicit scroll trigger from upsertMessage. ResizeObserver handles
