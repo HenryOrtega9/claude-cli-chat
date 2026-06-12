@@ -24,9 +24,10 @@
   Logs:
     tail -f /tmp/watch-bridge.log /tmp/watch-bridge.err
 
-  Config overrides go in EnvironmentVariables (WATCH_BRIDGE_PORT,
-  WATCH_BRIDGE_BIND, WATCH_BRIDGE_VAULT, WATCH_BRIDGE_CLAUDE,
-  WATCH_BRIDGE_REPLY_BUDGET_S). Defaults are correct for this machine.
+  WATCH_BRIDGE_VAULT is required: set it below to the directory the claude
+  session should run in (e.g. your Obsidian vault). Other overrides
+  (WATCH_BRIDGE_PORT, WATCH_BRIDGE_BIND, WATCH_BRIDGE_CLAUDE,
+  WATCH_BRIDGE_REPLY_BUDGET_S) are optional.
 -->
 <plist version="1.0">
 <dict>
@@ -38,6 +39,12 @@
         <string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string>
         <string>/Users/henryortega/Developer/claude-cli-chat/scripts/watch-bridge/bridge.py</string>
     </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WATCH_BRIDGE_VAULT</key>
+        <string>/PATH/TO/YOUR/VAULT</string>
+    </dict>
 
     <key>RunAtLoad</key>
     <true/>

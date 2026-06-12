@@ -46,10 +46,17 @@ API (all routes require `Authorization: Bearer <token>`):
 Config (env):
   WATCH_BRIDGE_PORT            default 8787
   WATCH_BRIDGE_BIND            default: auto-resolve Tailscale IPv4 (retries 60s)
-  WATCH_BRIDGE_VAULT           default: Henry's Second Brain vault path
+  WATCH_BRIDGE_VAULT           REQUIRED: directory the claude session runs in
   WATCH_BRIDGE_CLAUDE          default: `claude` resolved from an enriched PATH
   WATCH_BRIDGE_REPLY_BUDGET_S  default 90
   Token file: ~/.config/watch-bridge/token (chmod 600)
+
+Trust model: the child claude runs with --dangerously-skip-permissions, so
+every tool call it makes executes without interactive approval. The bearer
+token is therefore the ONLY thing standing between a tailnet peer and
+unprompted command execution on this machine. Guard the token file like an
+SSH key, keep the tailnet ACLs tight, and never bind beyond the Tailscale
+interface.
 
 State changes mirror to /tmp/claude_state (same token format as the plugin's
 StateEmitter) so the TC001 animator reflects watch activity for free.
@@ -76,11 +83,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ---------------------------------------------------------------- config
 
 HOME = os.path.expanduser("~")
-DEFAULT_VAULT = (
-    HOME
-    + "/Library/Mobile Documents/iCloud~md~obsidian/Documents/"
-    + "Henry Ortega's Second Brain"
-)
 TOKEN_PATH = HOME + "/.config/watch-bridge/token"
 SIGNAL_PATH = "/tmp/watch-bridge/stop_signal.json"
 STATE_TOKEN_PATH = "/tmp/claude_state"
@@ -89,7 +91,7 @@ TAILSCALE_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 PORT = int(os.environ.get("WATCH_BRIDGE_PORT", "8787"))
 BIND = os.environ.get("WATCH_BRIDGE_BIND", "")
-VAULT = os.environ.get("WATCH_BRIDGE_VAULT", DEFAULT_VAULT)
+VAULT = os.environ.get("WATCH_BRIDGE_VAULT", "")
 REPLY_BUDGET_S = float(os.environ.get("WATCH_BRIDGE_REPLY_BUDGET_S", "90"))
 IDLE_FALLBACK_S = 15.0
 JSONL_AUTO_RESET_BYTES = 4 * 1024 * 1024
@@ -1462,6 +1464,10 @@ def main():
     token = read_token()
     claude = resolve_claude()
     bind = resolve_bind()
+    if not VAULT:
+        log("FATAL: WATCH_BRIDGE_VAULT is not set; point it at the directory "
+            "the claude session should run in")
+        sys.exit(1)
     if not os.path.isdir(VAULT):
         log(f"FATAL: vault not found: {VAULT}")
         sys.exit(1)

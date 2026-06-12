@@ -5,16 +5,19 @@ Reads ~/.claude/projects/<vault-hash>/*.jsonl, filters to plugin sessions,
 sums per-message usage, prices at API list rates, projects monthly burn.
 
 Usage:
-  python3 scripts/forecast_credit_pool.py
-  python3 scripts/forecast_credit_pool.py --entrypoint cli         # any entrypoint
-  python3 scripts/forecast_credit_pool.py --vault-hash <hash>      # custom path
+  python3 scripts/forecast_credit_pool.py --vault "/path/to/My Vault"
+  python3 scripts/forecast_credit_pool.py --vault-hash <hash>      # explicit slug
+  python3 scripts/forecast_credit_pool.py --vault ... --entrypoint cli
 """
-import argparse, json, os, glob
+import argparse, json, os, re, glob
 from collections import defaultdict
 from datetime import datetime
 
-DEFAULT_VAULT_HASH = "-Users-henryortega-Library-Mobile-Documents-iCloud-md-obsidian-Documents-Henry-Ortega-s-Second-Brain"
 DEFAULT_ENTRYPOINT = "claude-cli-chat-plugin"
+
+def project_slug(path):
+    """Claude Code project-dir slug: every non-alphanumeric char becomes '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(os.path.expanduser(path)))
 
 # May 2026 published API rates per million tokens (USD).
 # Update if Anthropic publishes a different Agent SDK schedule.
@@ -33,13 +36,17 @@ def price_for(model):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vault-hash", default=DEFAULT_VAULT_HASH)
+    ap.add_argument("--vault", help="vault path; the project slug is derived from it")
+    ap.add_argument("--vault-hash", help="explicit project-dir slug under ~/.claude/projects/")
     ap.add_argument("--entrypoint", default=DEFAULT_ENTRYPOINT,
                     help="filter by entrypoint field (use 'all' to skip filter)")
     ap.add_argument("--pool", type=float, default=100.0, help="credit pool $ (default $100)")
     args = ap.parse_args()
 
-    vault = os.path.expanduser(f"~/.claude/projects/{args.vault_hash}")
+    vault_hash = args.vault_hash or (project_slug(args.vault) if args.vault else None)
+    if not vault_hash:
+        ap.error("pass --vault <path> or --vault-hash <slug>")
+    vault = os.path.expanduser(f"~/.claude/projects/{vault_hash}")
     if not os.path.isdir(vault):
         raise SystemExit(f"No such directory: {vault}")
 
