@@ -29,9 +29,11 @@ API (all routes require `Authorization: Bearer <token>`):
   POST /reset  -> kill + respawn the claude child (fresh session)
   GET  /health -> {state, session_id, session_file, child_pid, uptime_s}
   GET  /sessions -> {sessions: [{id, kind, name, cwd, attach, pid,
-                 last_activity, preview}]}. Every live claude process on this
-                 Mac mapped to its JSONL transcript, EXCEPT the bridge's own
-                 child (the watch's main chat already shows it). attach:
+                 last_activity, preview}]}. Only explicitly activated Remote
+                 Control sessions (`claude remote-control --spawn=session`),
+                 each mapped to its JSONL transcript. Plain terminal claude
+                 sessions, the plugin's `claude --print` chat subprocesses, and
+                 the bridge's own child are all excluded. attach:
                  "tmux:<target>" (injectable via send-keys, e.g. vault-cc) or
                  null (view-only).
   GET  /sessions/<id>/messages?limit=N -> {session, messages: [{uuid, role,
@@ -802,11 +804,13 @@ def extract_messages(path, limit=30):
 
 
 class SessionDirectory:
-    """Discovers live `claude` processes on this Mac and maps each one to its
-    session JSONL, so the watch can list and read any active conversation
-    (vault-cc remote-control sessions included). Input routing: the bridge's
-    own PTY child is attachable natively; a claude running inside a tmux pane
-    is attachable via `tmux send-keys`; anything else is view-only."""
+    """Discovers activated Remote Control `claude` sessions on this Mac
+    (`claude remote-control --spawn=session`) and maps each to its session
+    JSONL, so the watch can list and read them. Plain terminal sessions and
+    the plugin's own `claude --print` chat subprocesses are deliberately NOT
+    listed — the Sessions tab is for Remote Control only. Input routing: a
+    remote-control claude running inside a tmux pane is attachable via `tmux
+    send-keys`; otherwise it is view-only."""
 
     CACHE_S = 5.0
 
@@ -914,15 +918,30 @@ class SessionDirectory:
                 # The bridge's own session is the watch app's main Chat tab;
                 # listing it in /sessions would just duplicate that history.
                 continue
+            # Only surface explicitly activated Remote Control sessions, i.e.
+            # claude-cli-chat's `claude remote-control --spawn=session`. Plain
+            # terminal `claude` sessions and the plugin's own `claude --print`
+            # chat subprocesses are intentionally excluded — the watch's
+            # Sessions tab is for Remote Control, not every claude on the Mac.
+            # Filtering here (before the expensive lsof/lstart probes below)
+            # also keeps refresh() cheap when many claude processes are open.
+            if "remote-control" not in command:
+                continue
             cwd = self._cwd_of(pid)
             if not cwd:
                 continue
             start = self._start_epoch(pid)
             file = self._session_file_for(cwd, start, exclude=own_file)
             target = tmux_target(pid)
-            kind = "remote-control" if "remote-control" in command else "terminal"
+            kind = "remote-control"
+            # Prefer the session's configured name. The plugin spawns the
+            # subcommand form (`--name <label>`); the legacy `--remote-control
+            # <label>` flag form is still honored. Either way fall back to the
+            # cwd basename when no explicit name was given (the common case,
+            # where the proxy defaults the label to the hostname).
             name = os.path.basename(cwd)
-            m = re.search(r"--remote-control\s+(.+)$", command)
+            m = re.search(r"--name\s+(.+)$", command) \
+                or re.search(r"--remote-control\s+(.+)$", command)
             if m:
                 name = m.group(1).strip().strip("'\"")
             sessions.append({
