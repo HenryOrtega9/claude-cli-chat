@@ -31,7 +31,9 @@ API (all routes require `Authorization: Bearer <token>`):
   GET  /sessions -> {sessions: [{id, kind, name, cwd, attach, pid,
                  last_activity, preview}]}. Only explicitly activated Remote
                  Control sessions (`claude remote-control --spawn=session`),
-                 each mapped to its JSONL transcript. Plain terminal claude
+                 each mapped to its JSONL transcript via the authoritative
+                 ~/.claude/sessions/<pid>.json index (birthtime heuristic only
+                 as a fallback for sessions that predate it). Plain terminal claude
                  sessions, the plugin's `claude --print` chat subprocesses, and
                  the bridge's own child are all excluded. attach:
                  "tmux:<target>" (injectable via send-keys, e.g. vault-cc) or
@@ -813,6 +815,11 @@ class SessionDirectory:
     send-keys`; otherwise it is view-only."""
 
     CACHE_S = 5.0
+    # Fallback-mapping guard: a session writes its transcript within seconds of
+    # spawning, so a JSONL born much later than the process belongs to a
+    # different session in the same cwd. Used only when no ~/.claude/sessions
+    # index exists for the pid.
+    SPAWN_WINDOW_S = 180.0
 
     def __init__(self, session, turns):
         self.session = session
@@ -870,12 +877,34 @@ class SessionDirectory:
         except ValueError:
             return None
 
+    def _session_index(self, pid):
+        """Authoritative pid -> session metadata from
+        ~/.claude/sessions/<pid>.json, which claude (>= 2.1.178) writes for
+        every live session: {pid, sessionId, cwd, kind, entrypoint, status}.
+        The sessionId is the transcript's basename, so this resolves a process
+        to its EXACT JSONL with no birthtime guessing. Returns the parsed dict
+        only when it actually describes this pid (guards a stale file left by a
+        reused pid); None when no index exists (older sessions predate it)."""
+        try:
+            with open(f"{HOME}/.claude/sessions/{pid}.json") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if data.get("pid") == pid else None
+
     def _session_file_for(self, cwd, start_epoch, exclude=None):
-        """Newest JSONL in the project slug born after the process started.
-        Same heuristic the plugin uses; ambiguous only when two sessions start
-        in the same cwd within seconds of each other."""
+        """Fallback mapping for sessions with no ~/.claude/sessions/<pid>.json
+        index (claude < 2.1.178). Newest JSONL in the project slug born after
+        the process started; the same heuristic the plugin uses. Reliable only
+        when a session is mapped soon after spawn — for a long-lived session
+        sharing its cwd with others it can pick a newer, unrelated transcript,
+        which is why the index is preferred whenever it exists."""
         proj = project_dir_for(cwd)
         floor = (start_epoch or 0) - 5
+        # Upper bound: reject files born well after the process started — they
+        # belong to a later session in the same cwd. Skipped when the start
+        # time is unknown (no bound we can trust).
+        ceil = (start_epoch + self.SPAWN_WINDOW_S) if start_epoch else None
         best = None
         try:
             for name in os.listdir(proj):
@@ -887,6 +916,8 @@ class SessionDirectory:
                 st = os.stat(full)
                 birth = getattr(st, "st_birthtime", st.st_mtime)
                 if birth < floor:
+                    continue
+                if ceil is not None and birth > ceil:
                     continue
                 if best is None or birth > best[1]:
                     best = (full, birth)
@@ -927,11 +958,25 @@ class SessionDirectory:
             # also keeps refresh() cheap when many claude processes are open.
             if "remote-control" not in command:
                 continue
-            cwd = self._cwd_of(pid)
-            if not cwd:
-                continue
-            start = self._start_epoch(pid)
-            file = self._session_file_for(cwd, start, exclude=own_file)
+            # Map the process to its transcript. Prefer the authoritative
+            # ~/.claude/sessions/<pid>.json index (exact sessionId + cwd); it is
+            # the ONLY reliable mapping for a long-lived session that shares its
+            # cwd with other claude sessions. The birthtime heuristic is a
+            # fallback for older sessions that predate the index — and it
+            # mis-maps in exactly that shared-cwd case (it would pick whichever
+            # JSONL was born most recently, e.g. an unrelated plugin chat).
+            idx = self._session_index(pid)
+            if idx and idx.get("sessionId") and idx.get("cwd"):
+                cwd = idx["cwd"]
+                file = os.path.join(project_dir_for(cwd), idx["sessionId"] + ".jsonl")
+                if not os.path.exists(file):
+                    file = None  # transcript not written yet; resolves next refresh
+            else:
+                cwd = self._cwd_of(pid)
+                if not cwd:
+                    continue
+                start = self._start_epoch(pid)
+                file = self._session_file_for(cwd, start, exclude=own_file)
             target = tmux_target(pid)
             kind = "remote-control"
             # Prefer the session's configured name. The plugin spawns the
