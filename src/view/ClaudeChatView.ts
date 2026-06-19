@@ -12,13 +12,36 @@ import { makeTabState, type TabState } from "./state";
 
 export const VIEW_TYPE_CLAUDE_CHAT = "claude-cli-chat-view";
 
-/* Vault-relative path for the multi-window lock file. Each window writes its
-   PID here on open and removes it on close. A second window opening sees the
-   lock, verifies the PID is still alive, and renders a "already open" notice
-   instead of restoring tabs (otherwise both windows would race on the same
-   persisted tab files and each other's subprocesses). */
+/* Vault-relative path for the multi-window lock file. Each view writes a
+   unique instance token (`<pid>:<uuid>`) here on open and removes it on close.
+   A second window opening sees the lock, verifies the holder PID is still
+   alive, and renders a "already open" notice instead of restoring tabs
+   (otherwise both windows would race on the same persisted tab files and each
+   other's subprocesses). The token (rather than a bare PID) lets us tell two
+   leaves in the SAME renderer process apart, so one leaf's onClose can't
+   delete a lock another leaf legitimately holds. */
 const WINDOW_LOCK_DIR = ".claude-cli-chat";
 const WINDOW_LOCK_PATH = `${WINDOW_LOCK_DIR}/window.lock`;
+
+/* Process-local guard. Obsidian can hold two leaves of this custom view in one
+   renderer process (split pane, or a restored workspace layout that contained
+   two Claude leaves). Both run onOpen in the same process, so the on-disk
+   lock's PID would match itself and provide no protection. Only the first
+   ClaudeChatView instance in a process restores tabs and holds the lock; the
+   rest render the placeholder. */
+let activeChatViewInstance: ClaudeChatView | null = null;
+
+/* 128-bit random id via crypto.randomUUID where available (Obsidian's runtime
+   ships with it), falling back to Math.random so the plugin still starts if the
+   API is missing. Mirrors state.ts's makeId, kept local to avoid widening that
+   module's export surface for a single internal caller. */
+function makeInstanceId(): string {
+  const cryptoObj = (globalThis as { crypto?: Crypto }).crypto;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+  return `${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
 
 export class ClaudeChatView extends ItemView {
   plugin: ClaudeChatPlugin;
@@ -29,6 +52,10 @@ export class ClaudeChatView extends ItemView {
   /* True when this view detected another live window already holding the
      vault lock. We render a placeholder and skip tab restore in that case. */
   private holdingLock = false;
+  /* Unique per-view lock payload: `<pid>:<uuid>`. Written into the lock file
+     so we can distinguish this exact view from any other holder — including a
+     second leaf in the same renderer process, where the PID alone collides. */
+  private readonly instanceToken = `${process.pid}:${makeInstanceId()}`;
 
   constructor(leaf: WorkspaceLeaf, plugin: ClaudeChatPlugin) {
     super(leaf);
@@ -52,6 +79,16 @@ export class ClaudeChatView extends ItemView {
       this.renderAlreadyOpenPlaceholder(root as HTMLElement, lockHolder);
       return;
     }
+    /* Foreign-process check passed; now guard against a SECOND leaf of this
+       view in OUR process (split pane, or a restored layout with two Claude
+       leaves). The on-disk lock can't catch that case — both leaves share the
+       PID — so a process-local singleton ensures only the first instance
+       restores tabs and acquires the lock. The rest render the placeholder. */
+    if (activeChatViewInstance && activeChatViewInstance !== this) {
+      this.renderAlreadyOpenPlaceholder(root as HTMLElement, process.pid);
+      return;
+    }
+    activeChatViewInstance = this;
     await this.acquireWindowLock();
 
     renderHeader(root as HTMLElement, {
@@ -82,11 +119,20 @@ export class ClaudeChatView extends ItemView {
     try {
       if (!(await adapter.exists(WINDOW_LOCK_PATH))) return null;
       const raw = (await adapter.read(WINDOW_LOCK_PATH)).trim();
+      /* Lock payload is `<pid>:<uuid>`. Parse the PID off the front; older
+         locks may be a bare PID, which parseInt still reads correctly. */
       const pid = parseInt(raw, 10);
       if (!Number.isFinite(pid) || pid <= 0) return null;
-      /* PID equality with our own process means we're reopening the view in
-         the same window (tab close/reopen) — treat as no foreign holder. */
-      if (pid === process.pid) return null;
+      /* A lock we wrote ourselves (exact token match) means this same view is
+         reopening (tab close/reopen) — treat as no foreign holder. */
+      if (raw === this.instanceToken) return null;
+      if (pid === process.pid) {
+        /* Same PID but a DIFFERENT token: a second leaf in our own process
+           wrote it. The singleton gate already blocks that path, but treat it
+           as held here too so the on-disk lock can't be silently overwritten
+           if the gate is ever bypassed. */
+        return pid;
+      }
       try {
         /* signal 0 doesn't deliver a signal; it tests whether the target is
            still alive and accessible. Throws ESRCH if the process is gone. */
@@ -107,7 +153,7 @@ export class ClaudeChatView extends ItemView {
       if (!(await adapter.exists(WINDOW_LOCK_DIR))) {
         await adapter.mkdir(WINDOW_LOCK_DIR);
       }
-      await adapter.write(WINDOW_LOCK_PATH, String(process.pid));
+      await adapter.write(WINDOW_LOCK_PATH, this.instanceToken);
       this.holdingLock = true;
     } catch (err) {
       console.warn(`[claude-cli-chat] failed to acquire window lock:`, err);
@@ -121,11 +167,12 @@ export class ClaudeChatView extends ItemView {
     try {
       if (await adapter.exists(WINDOW_LOCK_PATH)) {
         const raw = (await adapter.read(WINDOW_LOCK_PATH)).trim();
-        const pid = parseInt(raw, 10);
-        /* Only remove the lock if it's still ours — otherwise we'd be
-           clobbering a lock another window legitimately took after we
-           dropped ours (e.g. during onClose of this view). */
-        if (pid === process.pid) {
+        /* Only remove the lock if the stored token is EXACTLY ours —
+           otherwise we'd be clobbering a lock another holder legitimately
+           took after we dropped ours (a window in another process, or a
+           second leaf in this process). A bare PID check would match a
+           same-process sibling's lock and delete it. */
+        if (raw === this.instanceToken) {
           await adapter.remove(WINDOW_LOCK_PATH);
         }
       }
@@ -203,8 +250,14 @@ export class ClaudeChatView extends ItemView {
        in the middle of shutting down, leaking them as PPID=1 orphans. */
     await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs = [];
+    /* Surrender the process-local slot first, but only if WE own it. A
+       placeholder leaf (blocked by the singleton at onOpen) never owned it, so
+       this guard stops its close from nulling out the live owner's slot and
+       letting another same-process leaf restore. */
+    if (activeChatViewInstance === this) activeChatViewInstance = null;
     /* Release the multi-window lock so another window opened later (or the
-       same window reopened) can start cleanly. */
+       same window reopened) can start cleanly. releaseWindowLock is a no-op
+       for placeholder leaves (holdingLock stays false). */
     await this.releaseWindowLock();
   }
 

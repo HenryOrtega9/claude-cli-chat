@@ -88,8 +88,11 @@ function decodeXmlEntities(s: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    /* Guard the code point: String.fromCodePoint throws RangeError above
+       U+10FFFF, which would abort extraction of the whole file. Degrade a
+       single out-of-range ref to U+FFFD instead. */
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => { const n = parseInt(h, 16); return n <= 0x10FFFF ? String.fromCodePoint(n) : "�"; })
+    .replace(/&#(\d+);/g, (_, d) => { const n = parseInt(d, 10); return n <= 0x10FFFF ? String.fromCodePoint(n) : "�"; })
     .replace(/&amp;/g, "&");
 }
 

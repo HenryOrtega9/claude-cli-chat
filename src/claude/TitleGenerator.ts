@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { autodetectClaudePath } from "../settings";
 
 /* Spawns a one-off `claude --print` call with a small fast model (Haiku by
@@ -149,8 +150,14 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
     let stdout = "";
     /* Hard cap so a malformed reply can't bloat memory. */
     const MAX_OUTPUT = 1024;
-    child.stdout.on("data", chunk => {
-      if (stdout.length < MAX_OUTPUT) stdout += chunk.toString("utf8");
+    /* Decode at string boundaries: a multi-byte UTF-8 code point (any
+       non-ASCII title char) can straddle two stdout chunks, and decoding each
+       Buffer independently would turn each half into U+FFFD. StringDecoder
+       holds a straddling sequence's leading bytes until the next chunk
+       completes it. */
+    const decoder = new StringDecoder("utf8");
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdout.length < MAX_OUTPUT) stdout += decoder.write(chunk);
     });
     let stderrBuf = "";
     child.stderr.on("data", chunk => { stderrBuf += chunk.toString("utf8"); });
@@ -180,6 +187,8 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
         resolve(null);
         return;
       }
+      /* Flush any final code point the decoder is still holding. */
+      if (stdout.length < MAX_OUTPUT) stdout += decoder.end();
       const cleaned = cleanTitle(stdout);
       console.log(`[claude-cli-chat] title-gen done in ${elapsed}ms`, { title: cleaned });
       resolve(cleaned);

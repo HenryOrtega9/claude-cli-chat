@@ -301,7 +301,7 @@ class ClaudeSession:
         child-exit detection. Output is never parsed for reply content."""
         while True:
             if gen != self._gen:
-                return
+                break  # stale reader: fall through to unconditional cleanup
             try:
                 rlist, _, _ = select.select([fd], [], [], 0.1)
             except (OSError, ValueError):
@@ -322,18 +322,27 @@ class ClaudeSession:
                     break
             except ChildProcessError:
                 break
+        # Only the shared-state mutation + log are gen-guarded; a stale reader
+        # must not clear self.alive (the new child is the live one).
         if gen == self._gen:
             self.alive = False
             log(f"claude child pid={pid} exited")
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        # reap if we broke out of the loop on EOF before waitpid saw the exit
+        # Always close THIS reader's own fd and reap THIS reader's own child,
+        # regardless of generation: a slow-dying child reaches EOF here after a
+        # respawn has already bumped self._gen, so a gen-gated close/reap would
+        # leak the old PTY master fd and leave a zombie.
         try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
+            os.close(fd)
+        except OSError:
             pass
+        for _ in range(50):  # ~5s: PTY EOF can precede the child being reapable
+            try:
+                done, _ = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.1)
 
     def _handle_output(self, chunk, fd):
         self.stdout_tail = (self.stdout_tail + strip_ansi(chunk))[-65536:]
@@ -430,6 +439,15 @@ class ClaudeSession:
         # message is sent into the session.
         return self.alive and time.time() - self.spawn_epoch > SETTLE_S
 
+    def current_gen(self):
+        """Snapshot the current spawn generation under the lock. Callers that
+        schedule a DEFERRED write (e.g. the /command submit-nudge timer) capture
+        this and pass it to nudge_submit() so a respawn in the meantime turns
+        the write into a no-op instead of injecting bytes into a different
+        child's startup TUI."""
+        with self.lock:
+            return self._gen
+
     def send(self, text):
         """Bracketed paste so dictated newlines don't submit early, settle,
         then CR to submit."""
@@ -437,24 +455,41 @@ class ClaudeSession:
             raise RuntimeError("session not ready")
         if self.first_send_epoch is None:
             self.first_send_epoch = time.time()
-        fd = self.fd
+        # Snapshot fd+generation together under the lock (respawn() swaps
+        # self.fd under this same lock). Re-check the generation before the
+        # submit CR so a respawn during the 0.2s settle can't land the CR in a
+        # freshly spawned child and inject a stray submit into its startup TUI.
+        with self.lock:
+            fd, gen = self.fd, self._gen
         os.write(fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
         time.sleep(0.2)
+        with self.lock:
+            if self._gen != gen:
+                return  # respawned mid-send; don't submit into the new child
         os.write(fd, b"\r")
 
-    def nudge_submit(self):
+    def nudge_submit(self, expected_gen=None):
         """Extra CR a moment after a send: a TUI mid-redraw can eat the
         submit CR, leaving the text sitting in the composer (where the NEXT
         send would concatenate onto it). If the original CR landed this is an
-        empty-composer no-op; if it was eaten, this submits the command."""
+        empty-composer no-op; if it was eaten, this submits the command.
+
+        expected_gen guards a DEFERRED nudge (the /command timer fires 0.8s
+        later, outside any turn lock): if a respawn swapped the child in the
+        meantime, skip the write so the CR can't inject into the new child."""
+        with self.lock:
+            fd, gen = self.fd, self._gen
+        if expected_gen is not None and gen != expected_gen:
+            return
         try:
-            os.write(self.fd, b"\r")
+            os.write(fd, b"\r")
         except OSError:
             pass
 
     def respawn(self):
         with self.lock:
             pid = self.pid
+            old_fd = self.fd  # capture so cleanup doesn't race the stale reader
             if self.alive and pid > 0:
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -470,6 +505,19 @@ class ClaudeSession:
                 pass
             time.sleep(0.2)
         self.spawn()
+        # Defense-in-depth: free the old child's fd + reap it even if its reader
+        # thread is wedged. spawn() returns a fresh fd (different int), so guard
+        # against double-closing the new fd before touching the old one.
+        if old_fd >= 0 and old_fd != self.fd:
+            try:
+                os.close(old_fd)
+            except OSError:
+                pass
+        if pid > 0:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
 
 # ---------------------------------------------------------------- transcript tailer
@@ -1348,7 +1396,7 @@ class StickyCommands:
                     self.session.send(cmd)
                     log(f"replayed sticky command: {cmd}")
                     time.sleep(0.8)
-                    self.session.nudge_submit()
+                    self.session.nudge_submit(gen)
                     time.sleep(1.5)
                 except (OSError, RuntimeError) as e:
                     log(f"sticky replay failed for {cmd}: {e}")
@@ -1476,7 +1524,12 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     session.send(command)
                 except (OSError, RuntimeError) as e:
                     return self._send(503, {"error": f"send_failed: {e}"})
-                timer = threading.Timer(0.8, session.nudge_submit)
+                # The submit nudge fires 0.8s later, outside any turn lock, so a
+                # respawn (auto-reset / watchdog / /reset) can swap the child in
+                # between. Pin it to the generation we just sent into so a
+                # deferred CR can't inject a stray submit into a fresh child.
+                sent_gen = session.current_gen()
+                timer = threading.Timer(0.8, lambda: session.nudge_submit(sent_gen))
                 timer.daemon = True
                 timer.start()
                 sticky.remember(command)

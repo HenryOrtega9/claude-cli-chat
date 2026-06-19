@@ -64,6 +64,12 @@ export class StatusIndicator {
   private watchdogTimer: number | null = null;
   private mode: "idle" | "thinking" | "retrying" = "idle";
 
+  /* Inactivity ceiling for the thinking spinner. Each inbound CLI event kicks
+     this via heartbeat(), so it measures silence-since-last-event, not total
+     turn time — a turn with long-but-progressing tool calls keeps resetting
+     it. Only genuine silence (a wedged/dead CLI emitting nothing) trips it. */
+  private static readonly WATCHDOG_MS = 120_000;
+
   constructor(parent: HTMLElement) {
     this.root = parent.createDiv({ cls: "claudian-status-indicator" });
     /* Spark (thinking) and dot (retrying) coexist in DOM; CSS toggles which
@@ -95,15 +101,49 @@ export class StatusIndicator {
     /* Cycle every 3s so the user sees the spinner is alive without it
        being distracting. */
     this.wordTimer = window.setInterval(() => this.cycleWord(), 3000);
-    /* Watchdog: if no state transition happens within 90s, auto-hide with a
-       hover hint so a wedged CLI doesn't leave the user staring at a
-       perpetual "Pondering…" pill. Cleared by hide()/setRetrying() via
-       clearTimers, so the only path that fires this is a genuine stall. */
+    this.armWatchdog();
+  }
+
+  /* Reset the inactivity watchdog on any sign of life from the CLI, without
+     disturbing the visible spinner (no word re-roll, no label change). The
+     event router calls this for every inbound CLI event so a turn with long
+     but healthy tool calls — e.g. several sequential Perplexity lookups that
+     each take 30s+ — keeps the pill alive instead of tripping the watchdog
+     mid-turn. No-op unless a thinking spinner is currently showing. */
+  heartbeat() {
+    if (this.mode !== "thinking") return;
+    this.armWatchdog();
+  }
+
+  /* (Re)arm the inactivity watchdog: if no CLI event arrives within
+     WATCHDOG_MS, auto-hide with a hover hint so a genuinely wedged CLI
+     doesn't leave the user staring at a perpetual "Pondering…" pill. Each
+     heartbeat pushes the deadline out, so this fires only on true silence —
+     never on a long-but-progressing turn. Cleared by hide()/setRetrying()
+     via clearTimers. */
+  private armWatchdog() {
+    if (this.watchdogTimer !== null) window.clearTimeout(this.watchdogTimer);
     this.watchdogTimer = window.setTimeout(() => {
       this.watchdogTimer = null;
-      this.root.setAttribute("title", "(status timed out — no update in 90s)");
+      this.root.setAttribute("title", "(status timed out — no CLI activity in 120s)");
       this.hide();
-    }, 90_000);
+    }, StatusIndicator.WATCHDOG_MS);
+  }
+
+  /* Suspend the inactivity watchdog without touching the visible spinner.
+     Used when a turn is legitimately blocked on something the CLI emits no
+     events for — chiefly a pending tool approval, where the CLI sits idle
+     waiting for the user to click Allow/Deny. Without this the 120s silence
+     ceiling would hide the pill mid-approval even though nothing is wedged,
+     contradicting the watchdog's "only genuine silence trips it" contract.
+     The word cycle keeps running; setThinking() re-arms the watchdog when the
+     turn resumes. No-op unless a thinking spinner is currently showing. */
+  suspendWatchdog() {
+    if (this.mode !== "thinking") return;
+    if (this.watchdogTimer !== null) {
+      window.clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
   }
 
   setRetrying(attempt: number, maxRetries: number, retryDelayMs: number) {

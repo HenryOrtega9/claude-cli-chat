@@ -1010,6 +1010,42 @@ mark.claudian-search-mark.is-active {
   font-size: 13px;
 }
 
+/* ---- Markdown tables -------------------------------------- */
+/* MarkdownRenderer emits real <table> elements but nothing in the chat
+   pane styles them, so they collapse to bare text. Mirror the editor /
+   reading-view look: full gridlines, a header band, and zebra rows, all
+   driven by theme variables so it tracks light/dark. */
+.claudian-message-content table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  width: auto;
+  max-width: 100%;
+  font-size: 13px;
+  line-height: 1.4;
+  display: block;
+  overflow-x: auto;
+}
+.claudian-message-content th,
+.claudian-message-content td {
+  border: 1px solid var(--background-modifier-border);
+  padding: 6px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+.claudian-message-content thead th {
+  /* Header is its own band: a stronger overlay than the zebra below plus a
+     thicker bottom border, so it always reads as the anchor row regardless
+     of which body row the zebra happens to tint. */
+  background: color-mix(in srgb, var(--text-normal) 10%, var(--background-primary));
+  border-bottom: 2px solid var(--background-modifier-border);
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-message-content tbody tr:nth-child(even) {
+  /* Kept deliberately faint so it never competes with the header band. */
+  background: color-mix(in srgb, var(--text-normal) 3.5%, transparent);
+}
+
 /* ---- Tool calls ------------------------------------------- */
 .claudian-tool-call {
   margin: 2px 0;

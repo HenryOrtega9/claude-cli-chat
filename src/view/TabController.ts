@@ -815,26 +815,11 @@ export class TabController {
       this.remoteSession = null;
     }
     await this.teardownSession("cancel");
-    /* Mark any tools that were still running as errored — the subprocess just
-       died, so none of them will receive a tool_result. Without this they
-       linger at status=running indefinitely (and for Task/Agent tools the
-       Agents pill's running counter stays stuck). nestedStatus is only
-       meaningful for Task/Agent, so it's flipped for those alone. */
-    for (const m of this.state.messages) {
-      if (!m.toolCalls) continue;
-      let touched = false;
-      for (const t of m.toolCalls) {
-        if (t.status !== "running") continue;
-        t.status = "errored";
-        t.isError = true;
-        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
-        touched = true;
-      }
-      /* Re-render so the DOM tool row drops its running spinner. Mutating the
-         ToolCall object alone leaves the bubble visually stuck on "running". */
-      if (touched) void this.renderer.upsertMessage(m);
-    }
-    this.refreshRunningAgentCount();
+    /* The subprocess just died, so any still-running tool will never receive a
+       tool_result — stop its subagent tracker and flip its row to errored (else
+       it spins forever and the Agents pill's running counter sticks). Shared
+       with the handleError / onExit abort paths. */
+    this.reconcileAbortedTurn();
     this.statusIndicator.hide();
     /* Cancel leaves the last emitted device state as a held one (thinking /
        needs_permission), whose 5s heartbeat would otherwise re-assert that app
@@ -1212,6 +1197,14 @@ export class TabController {
   }
 
   private async onEvent(event: StreamEvent) {
+    /* Any inbound CLI event proves the subprocess is alive and progressing,
+       so kick the status watchdog. Without this, a turn whose wall-clock is
+       dominated by long-but-healthy tool calls (e.g. several sequential
+       Perplexity / research lookups, each 30s+) crosses the inactivity
+       ceiling with no setThinking() call and the spinner self-hides while the
+       CLI is still working. heartbeat() is a no-op unless a thinking spinner
+       is currently showing. */
+    this.statusIndicator.heartbeat();
     switch (event.type) {
       case "system": {
         const sys = event as SystemInitEvent | SystemApiRetryEvent | { type: "system"; subtype: string };
@@ -1710,6 +1703,11 @@ export class TabController {
     };
     this.state.pendingApprovals.set(event.request_id, approval);
     this.approvalArea.show(approval);
+    /* The CLI now blocks waiting for the user's Allow/Deny and emits no events
+       meanwhile, so the inactivity watchdog would hide the thinking pill mid-
+       approval even though nothing is wedged. Suspend it; the allow branch of
+       handleApproval re-arms it via setThinking() when the turn resumes. */
+    this.statusIndicator.suspendWatchdog();
     StateEmitter.setState("needs_permission");
   }
 
@@ -1858,6 +1856,36 @@ export class TabController {
     }
   }
 
+  /* Crash-path reconciliation shared by every turn-abort route (handleError,
+     onExit, cancelStream). When a turn dies mid-stream the subprocess won't
+     deliver any outstanding tool_result, so still-running tools linger at
+     status=running (spinning forever) and any matched subagent's tracker keeps
+     a JsonlTailer polling disk until the next teardownSession. Stop ALL
+     subagent trackers, flip running tool rows to errored, re-render them, and
+     refresh the Agents pill count. Idempotent: empty maps / no running tools
+     => no-op, so paths that already tore the session down (and any double
+     handleError → onExit sequence) cost nothing. */
+  private reconcileAbortedTurn(): void {
+    for (const tracker of this.subagentTrackers.values()) {
+      void tracker.stop();
+    }
+    this.subagentTrackers.clear();
+    this.subagentSpawnTimes.clear();
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      let touched = false;
+      for (const t of m.toolCalls) {
+        if (t.status !== "running") continue;
+        t.status = "errored";
+        t.isError = true;
+        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
+        touched = true;
+      }
+      if (touched) void this.renderer.upsertMessage(m);
+    }
+    this.refreshRunningAgentCount();
+  }
+
   private async handleError(event: ErrorEvent) {
     /* Dedup: onError (spawn failure) followed by onExit (non-zero exit code)
        used to push two error bubbles for the same underlying failure. The
@@ -1881,6 +1909,19 @@ export class TabController {
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
+    /* A mid-stream error (e.g. a synthesized parse_error from one bad stdout
+       line) aborts the turn but the subprocess may keep running and never fire
+       'exit', so onExit's reconciliation never gets a chance. Run it here so
+       outstanding subagent trackers stop and running tool rows don't spin for
+       the life of the tab. Runs on the first (non-deduped) error call, which is
+       the case that matters. */
+    this.reconcileAbortedTurn();
+    /* A failed turn otherwise leaves the last emitted device state as a held
+       one (thinking / needs_permission), whose 5s heartbeat would keep POSTing
+       to the TC001 forever. clear()/cancelStream()/handleResult already reset;
+       mirror them so an errored-out turn the user walks away from doesn't leak
+       the interval. */
+    StateEmitter.setState("ready");
     await this.renderer.upsertMessage(errorMsg);
   }
 
@@ -1901,7 +1942,10 @@ export class TabController {
          flip the display back to thinking. handleResult will fire complete
          when the turn finally settles. Deny doesn't fire a recovery
          because the result event will arrive almost immediately with the
-         denial outcome. */
+         denial outcome. setThinking() also re-arms the inactivity watchdog
+         that handleControlRequest suspended for the approval wait, and
+         restores the pill if that wait outlasted the ceiling and hid it. */
+      this.statusIndicator.setThinking();
       StateEmitter.setState("thinking");
     } else {
       this.session.deny(requestId, decision.reason);
@@ -1959,34 +2003,18 @@ export class TabController {
     /* Crash-path reconciliation, mirroring what cancelStream and
        handleResult both do but the unexpected-exit path missed: the
        subprocess is gone, so no still-running tool will ever receive its
-       tool_result. Stop ALL subagent trackers (each holds a JsonlTailer +
-       a session-file claim that would otherwise keep polling disk until
-       the next teardownSession, possibly many turns away), flip running
-       tool rows to errored so they stop spinning, and refresh the Agents
-       pill so its running count doesn't stick. Idempotent on the teardown-
-       driven exits (cancel/restart/clear), where the maps are already
-       empty and no tools are left running. */
-    for (const tracker of this.subagentTrackers.values()) {
-      void tracker.stop();
-    }
-    this.subagentTrackers.clear();
-    this.subagentSpawnTimes.clear();
-    for (const m of this.state.messages) {
-      if (!m.toolCalls) continue;
-      let touched = false;
-      for (const t of m.toolCalls) {
-        if (t.status !== "running") continue;
-        t.status = "errored";
-        t.isError = true;
-        if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
-        touched = true;
-      }
-      if (touched) void this.renderer.upsertMessage(m);
-    }
-    this.refreshRunningAgentCount();
+       tool_result. Stops ALL subagent trackers, flips running tool rows to
+       errored, and refreshes the Agents pill. Idempotent on the teardown-
+       driven exits (cancel/restart/clear), where the maps are already empty
+       and no tools are left running. */
+    this.reconcileAbortedTurn();
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
+    /* A crashed turn leaves the last held device state (thinking /
+       needs_permission) running its 5s heartbeat; drop to ready like the other
+       turn-end paths so it doesn't keep POSTing to the TC001. */
+    StateEmitter.setState("ready");
     this.clearStreamingPointer();
     this.onStateChangeCb();
   }

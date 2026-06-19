@@ -108,6 +108,12 @@ export class TabSession {
   private errorListeners: ErrorListener[] = [];
   private stderrListeners: StderrListener[] = [];
   private pendingApprovals = new Map<string, ControlRequestEvent>();
+  /* Set the instant dispose() begins tearing the child down. Lets a concurrent
+     spawn() in the same tick (e.g. ensureSession after a wedged restart that
+     only resolves on the 2s SIGKILL timeout) see the session as terminal and
+     replace it, rather than reusing a still-"running" child that is already
+     being killed and binding a second set of listeners onto it. */
+  private disposed = false;
   /* Errors that fire before any onError() listener is registered get queued
      here. This matters for synchronous spawn failures (ENOENT on the claude
      binary): Node fires the `error` event in a nextTick before the caller
@@ -271,16 +277,48 @@ export class TabSession {
     /* updatedInput is required by the SDK schema — default to the original
        input from the request if the caller didn't pass an override. */
     const input = updatedInput ?? req?.request.input ?? {};
-    this.writer.sendApproval(requestId, input);
+    /* The subprocess can exit on its own (crash / OOM / external kill) while an
+       approval card is still on screen; a late Allow click then writes to a
+       closed stdin, which InputWriter.send throws on. Unlike sendUserText
+       (whose caller surfaces the failure) there is no recovery here — the turn
+       is already dead — so swallow it to a logged no-op instead of letting it
+       escape as an uncaught exception in the DOM click handler. */
+    try {
+      this.writer.sendApproval(requestId, input);
+    } catch (err) {
+      console.error(`[claude-cli-chat] approve failed (subprocess gone?):`, err);
+    }
   }
 
   deny(requestId: string, reason?: string) {
     this.pendingApprovals.delete(requestId);
-    this.writer.sendDenial(requestId, reason);
+    /* See approve(): a late Deny click after the subprocess died must not throw
+       out of the click handler. */
+    try {
+      this.writer.sendDenial(requestId, reason);
+    } catch (err) {
+      console.error(`[claude-cli-chat] deny failed (subprocess gone?):`, err);
+    }
   }
 
   getPendingApprovals(): ControlRequestEvent[] {
     return Array.from(this.pendingApprovals.values());
+  }
+
+  /* True once the child is dead, dying, or being disposed. Broader than a
+     status check: on the SIGKILL-timeout path of dispose() `status` is still
+     "running" but the child has been killed and its 'exit' event hasn't landed
+     yet, so the session must not be reused. Keeps `child` private — callers
+     ask this instead of poking exitCode/signalCode directly. */
+  isTerminal(): boolean {
+    return (
+      this.status === "exited" ||
+      this.status === "error" ||
+      this.disposed ||
+      this.child.exitCode !== null ||
+      this.child.signalCode !== null ||
+      this.child.killed
+    );
   }
 
   onEvent(cb: EventListener) { this.eventListeners.push(cb); }
@@ -306,6 +344,10 @@ export class TabSession {
        will ever fire, so falling through would block the full 2s timeout
        for nothing on every disposal of a failed tab. */
     if (this.status === "exited" || this.status === "error") return;
+    /* Mark terminal up front: from here the child is being torn down, so a
+       spawn() racing this disposal (see the `disposed` field comment) must
+       replace the session rather than reuse it. */
+    this.disposed = true;
     this.writer.closeStdin();
     return new Promise(resolve => {
       /* `status` flips to "exited" asynchronously inside the 'exit' handler, so
@@ -323,6 +365,11 @@ export class TabSession {
       const timeout = setTimeout(() => {
         this.child.removeListener("exit", onExit);
         try { this.child.kill("SIGKILL"); } catch { /* ignore */ }
+        /* SIGKILL delivery and the resulting 'exit' (which runs the manager's
+           reaper) are async, so the child is still briefly alive and mapped
+           when we resolve. Present as terminal now so a spawn() in the same
+           tick replaces this corpse instead of returning it. */
+        this.status = "exited";
         resolve();
       }, 2000);
       this.child.once("exit", onExit);
@@ -374,11 +421,16 @@ export class SubprocessManager {
     /* A spawn-level failure (ENOENT on a wrong/missing claudePath, EACCES,
        etc.) leaves the session in status "error" and Node fires only the
        child 'error' event, never 'exit' — so the onExit reaper below never
-       runs and the dead session lingers in `sessions`. Treat "error" as
-       terminal alongside "exited" so the next attempt replaces it. The
-       `this.sessions.set` below overwrites the stale entry; the failed
-       child never started, so no manual delete or dispose is needed. */
-    if (existing && existing.status !== "exited" && existing.status !== "error") return existing;
+       runs and the dead session lingers in `sessions`. isTerminal() treats
+       "error" as terminal alongside "exited" so the next attempt replaces it.
+       The `this.sessions.set` below overwrites the stale entry; the failed
+       child never started, so no manual delete or dispose is needed.
+
+       isTerminal() also covers a session being disposed right now (e.g. a
+       wedged restart whose dispose() only resolves on the 2s SIGKILL timeout
+       with status still "running"): reusing that dying child here would bind a
+       second set of listeners onto it and double every subsequent event. */
+    if (existing && !existing.isTerminal()) return existing;
     const session = new TabSession(tabId, opts);
     session.onExit(() => {
       const current = this.sessions.get(tabId);

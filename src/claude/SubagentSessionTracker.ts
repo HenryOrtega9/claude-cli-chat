@@ -208,10 +208,12 @@ export class SubagentSessionTracker {
       return "inconclusive";
     }
     const lines = buf.split("\n");
-    /* Whether the buffer ended on a newline boundary — if not, the final
-       line is either a partial concurrent write or a record cut by our read
-       cap, and is not safe to treat as complete. */
-    const lastLineComplete = buf.endsWith("\n");
+    /* The matched record is taken from safeLines; when lines.length > 1 that
+       slice is guaranteed newline-terminated, so the matched record is complete
+       regardless of whether the buffer's final (partial) line ended on a
+       newline. When lines.length === 1 the single line may be the unterminated
+       tail, so it is not safe to treat as complete. */
+    const matchedRecordComplete = lines.length > 1;
     const safeLines = lines.length > 1 ? lines.slice(0, -1) : lines;
     for (const line of safeLines) {
       const t = line.trim();
@@ -222,7 +224,7 @@ export class SubagentSessionTracker {
       const msg = record.message as { content?: unknown } | undefined;
       const text = extractFirstText(msg?.content);
       if (text === null) continue;
-      return this.comparePrompt(text, lastLineComplete && size <= readSize);
+      return this.comparePrompt(text, matchedRecordComplete && size <= readSize);
     }
     /* No complete user record found. If the buffer was fully read and ended
        cleanly, there genuinely is no user record yet (or only non-user

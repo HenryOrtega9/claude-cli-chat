@@ -1,4 +1,5 @@
 import { watch, statSync, createReadStream, type FSWatcher } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import type { StreamEvent } from "./Events";
 
 type EventListener = (e: StreamEvent) => void;
@@ -15,6 +16,14 @@ export class JsonlTailer {
   private watcher: FSWatcher | null = null;
   private bytesRead = 0;
   private buffer = "";
+  /* Persistent UTF-8 decoder shared across readRange() calls. Each readAppended()
+     reads a raw byte range whose end can land mid-multibyte-character (the CLI's
+     appends aren't atomic). A per-stream decoder would flush the incomplete leading
+     bytes as U+FFFD and decode the trailing continuation bytes as a second U+FFFD,
+     destroying the character. Keeping one decoder holds the partial sequence and
+     completes it with the next read's leading bytes. Must be reset in lockstep with
+     `buffer` (see readAppended's truncation branch). */
+  private decoder = new StringDecoder("utf8");
   private listeners: EventListener[] = [];
   private errorListeners: ErrorListener[] = [];
   private path: string;
@@ -171,6 +180,9 @@ export class JsonlTailer {
     if (size < this.bytesRead) {
       this.bytesRead = 0;
       this.buffer = "";
+      /* Drop any partial multibyte sequence held from the pre-rotation file so the
+         rotated file decodes cleanly from byte 0. */
+      this.decoder = new StringDecoder("utf8");
       /* Re-reading from byte 0 replays records we've already emitted. Their
          uuids are still in the dedupe set, so without clearing it every replayed
          record is silently dropped and the rotated session goes dark. */
@@ -195,10 +207,14 @@ export class JsonlTailer {
      a failed read can't leak the underlying fd. */
   private readRange(start: number, end: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const stream = createReadStream(this.path, { start, end: end - 1, encoding: "utf8" });
+      /* No encoding: chunks arrive as raw Buffers so the persistent decoder (not a
+         throwaway per-stream one) owns multibyte reassembly across read boundaries. */
+      const stream = createReadStream(this.path, { start, end: end - 1 });
       let settled = false;
       stream.on("data", (chunk: string | Buffer) => {
-        this.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        /* With no encoding set the stream always yields Buffer at runtime; the
+           Node typings keep the string union, so coerce for the decoder. */
+        this.buffer += this.decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         let nl = this.buffer.indexOf("\n");
         while (nl !== -1) {
           const line = this.buffer.slice(0, nl);
