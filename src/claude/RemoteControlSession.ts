@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { autodetectClaudePath } from "../settings";
 
@@ -240,6 +240,12 @@ export class RemoteControlSession {
     this.stopSessionFilePoll();
     this.clearUrlTimeout();
     if (this.status === "exited") return;
+    /* "error" means the proxy never spawned (e.g. python3 missing) — no
+       'exit' event will ever fire, so waiting on it would burn the full
+       1.5s timeout per dead session (multiplied on plugin unload's
+       killAll). Same guard for a child that already exited before the
+       status flip landed. */
+    if (this.status === "error" || this.child.exitCode !== null || this.child.signalCode !== null) return;
     return new Promise(resolve => {
       const timeout = setTimeout(() => {
         try { this.child.kill("SIGKILL"); } catch { /* ignore */ }
@@ -366,22 +372,29 @@ export class RemoteControlSession {
       if (!existsSync(dir)) return;
       try {
         const files = readdirSync(dir).filter(f => f.endsWith(".jsonl"));
-        let newest: { path: string; mtime: number } | null = null;
-        let newestUnclaimed: { path: string; mtime: number } | null = null;
+        let newest: { path: string; created: number } | null = null;
+        let newestUnclaimed: { path: string; created: number } | null = null;
         for (const file of files) {
           const fullPath = join(dir, file);
           try {
             const st = statSync(fullPath);
-            const mtime = st.mtimeMs;
-            /* Tighter window: file must have been created/modified within
-               300ms of our spawn time. Going wider risks claiming a sibling
-               session's file. */
-            if (mtime < this.spawnTime - SPAWN_WINDOW_MS) continue;
-            if (mtime > this.spawnTime + 30000) continue;
-            if (!newest || mtime > newest.mtime) newest = { path: fullPath, mtime };
+            /* Window on BIRTHTIME, not mtime: a pre-existing session file
+               that another local tab is actively appending to has
+               mtime ≈ now on every tick, so an mtime window would adopt
+               that tab's conversation and permanently mirror the wrong
+               chat. Creation time pins the check to files that actually
+               appeared post-spawn (macOS/APFS birthtime is real). */
+            const created = st.birthtimeMs;
+            if (created < this.spawnTime - SPAWN_WINDOW_MS) continue;
+            if (created > this.spawnTime + 30000) continue;
+            /* Title-gen subprocesses run in the same cwd and leave fresh
+               one-line ai-title JSONLs inside our window; adopting one
+               leaves the remote tab dark forever. */
+            if (isAiTitleResidue(fullPath)) continue;
+            if (!newest || created > newest.created) newest = { path: fullPath, created };
             const claimed = this.claimedSessionFiles?.isClaimed(fullPath) ?? false;
-            if (!claimed && (!newestUnclaimed || mtime > newestUnclaimed.mtime)) {
-              newestUnclaimed = { path: fullPath, mtime };
+            if (!claimed && (!newestUnclaimed || created > newestUnclaimed.created)) {
+              newestUnclaimed = { path: fullPath, created };
             }
           } catch { /* ignore */ }
         }
@@ -414,6 +427,27 @@ export class RemoteControlSession {
       clearInterval(this.sessionFilePoll);
       this.sessionFilePoll = null;
     }
+  }
+}
+
+/* Sniffs the head of a candidate JSONL for an `ai-title` record. Title-gen
+   and incognito spawns leave one-line residue files (wire-format gotcha #6)
+   whose only record is the title; a real RC session file starts with real
+   records. Bounded read (4KB) so an already-large file costs nothing. */
+function isAiTitleResidue(path: string): boolean {
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const buf = Buffer.alloc(4096);
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      if (n <= 0) return false;
+      const firstLine = buf.toString("utf8", 0, n).split("\n", 1)[0];
+      return firstLine.includes('"ai-title"');
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
   }
 }
 

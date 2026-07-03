@@ -131,6 +131,13 @@ export default class ClaudeChatPlugin extends Plugin {
 
   async onunload() {
     StateEmitter.dispose();
+    /* Obsidian ignores the promise onunload returns, so on app quit the
+       awaits below may never resume. Persist the debounced tail
+       synchronously first — Cmd+Q within the 500ms debounce window would
+       otherwise drop the last edits — then run the async flush, which still
+       completes on the plugin disable/reload path where the process
+       lives on. */
+    this.persistence?.flushSync();
     await this.persistence?.flush();
     await this.subprocessManager.killAll();
     /* killAll's RC dispose gives the PTY proxy only ~1.5s between SIGTERM

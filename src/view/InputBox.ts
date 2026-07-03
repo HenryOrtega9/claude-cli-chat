@@ -421,10 +421,14 @@ export class InputBox {
         console.error("[claude-cli-chat] No File.path and no webUtils.getPathForFile available for picked folder; first file:", first);
         return;
       }
-      /* webkitRelativePath is "<folderName>/<...children>"; strip that tail
-         from the absolute path to get the folder itself. The trailing /
-         is implicit between abs's prefix and rel; len(rel)+1 covers it. */
-      const folderPath = abs.slice(0, Math.max(0, abs.length - rel.length - 1));
+      /* webkitRelativePath is "<folderName>/<...children>" — it INCLUDES the
+         chosen folder's own name as its first segment. Strip only the
+         children part (everything after that first segment) from the absolute
+         path; stripping the full rel would yield the folder's PARENT and
+         silently trust one directory too wide. */
+      const slash = rel.indexOf("/");
+      const childTail = slash === -1 ? rel : rel.slice(slash + 1);
+      const folderPath = abs.slice(0, Math.max(0, abs.length - childTail.length - 1));
       if (!folderPath) {
         new Notice("Couldn't resolve the folder's absolute path.");
         return;
@@ -1348,21 +1352,22 @@ export class InputBox {
     popup.style.top = "";
 
     /* outsideHandler closes the popup when the user clicks anywhere else
-       on the page — EXCEPT on a toolbar pill, which has its own click
-       handler that runs after this one. Letting the pill click bubble
-       through without closing here keeps the toggle behavior correct:
-         - Click the SAME pill again → its toggle handler sees openPopup
+       on the page — EXCEPT on a toolbar pill or the attach + button, which
+       have their own click handlers that run after this one. Letting those
+       clicks bubble through without closing here keeps the toggle behavior
+       correct:
+         - Click the SAME trigger again → its toggle handler sees openPopup
            still set and closes it (true toggle).
-         - Click a DIFFERENT pill → its toggle handler closes this popup
+         - Click a DIFFERENT trigger → its toggle handler closes this popup
            and opens the new one in one frame.
        Without the skip, the mousedown here would close the popup BEFORE
-       the pill's click handler runs, and the click handler would then
+       the trigger's click handler runs, and the click handler would then
        see openPopup as null and pop the same popup right back open. */
     const outsideHandler = (e: MouseEvent) => {
       const target = e.target as Node;
       if (popup.contains(target)) return;
       const el = e.target as HTMLElement;
-      if (el && typeof el.closest === "function" && el.closest(".claudian-toolbar-pill")) return;
+      if (el && typeof el.closest === "function" && el.closest(".claudian-toolbar-pill, .claudian-attach-button")) return;
       this.closePopup();
     };
     const keyHandler = (e: KeyboardEvent) => {
@@ -1600,13 +1605,18 @@ export class InputBox {
        lands first regardless). */
     const hasText = Array.from(items).some(it => it.kind === "string" && it.type === "text/plain");
     if (!hasText) e.preventDefault();
+    /* Materialize every File synchronously BEFORE the first await: once the
+       paste handler yields, the clipboard's data store is disabled and
+       getAsFile() returns null for the remaining items — pasting multiple
+       images would silently keep only the first. */
+    const files = imageItems
+      .map(it => it.getAsFile())
+      .filter((f): f is File => f !== null);
     /* Snapshot the array identity so a submit() that lands mid-decode (which
        rebinds this.attachments to a fresh array for the next message) doesn't
        cause the decoded image to ride on the next turn. */
     const target = this.attachments;
-    for (const item of imageItems) {
-      const file = item.getAsFile();
-      if (!file) continue;
+    for (const file of files) {
       /* Avoid FileReader: in some Obsidian/Electron renderer configurations
          the FileReader instance is missing readAsDataURL, which silently
          broke image paste. Blob.arrayBuffer() works universally. */

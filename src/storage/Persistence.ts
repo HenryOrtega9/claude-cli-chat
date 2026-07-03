@@ -1,4 +1,5 @@
-import type { App } from "obsidian";
+import { FileSystemAdapter, type App } from "obsidian";
+import { mkdirSync, renameSync, writeFileSync } from "fs";
 import type { ChatMessage, TabState, ToolCall } from "../view/state";
 import { writeJsonAtomic } from "../mcp/MCPConfig";
 
@@ -144,7 +145,12 @@ export class Persistence {
     const json = JSON.stringify(index);
     if (json === this.lastIndexJson) return;
     this.lastIndexJson = json;
-    const write = (async () => {
+    /* Chain onto the previous dispatch: index writes with different payloads
+       must land in dispatch order. Unchained, a slow older write's rename can
+       finish AFTER a newer one (fire-and-forget title-gen save vs an awaited
+       tab-close save), leaving tabs.json stale — e.g. referencing a deleted
+       conversation — while the dedupe cache suppresses any rewrite. */
+    const write = this.lastIndexWrite.then(async () => {
       try {
         await this.ensureDirs();
         await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
@@ -152,7 +158,7 @@ export class Persistence {
         this.lastIndexJson = null;
         throw err;
       }
-    })();
+    });
     /* Track the dispatch so flush() can await it on unload. Swallow the
        rejection on the tracked copy only — callers awaiting saveIndex still
        see the error. */
@@ -218,8 +224,9 @@ export class Persistence {
     }
   }
 
-  private async doSaveTab(state: TabState): Promise<void> {
-    await this.ensureDirs();
+  /* TabState → on-disk shapes. Shared by the async save path and the
+     synchronous quit-time flush so the two can never drift. */
+  private toStored(state: TabState): { stored: StoredTab; meta: TabMeta } {
     const stored: StoredTab = {
       id: state.id,
       sessionId: state.sessionId,
@@ -245,6 +252,17 @@ export class Persistence {
       pinnedFilePaths: state.pinnedFilePaths,
       stickyPinnedFilePaths: state.stickyPinnedFilePaths,
     };
+    const meta: TabMeta = {
+      title: stored.title,
+      updatedAt: stored.updatedAt,
+      messageCount: stored.messages.length,
+    };
+    return { stored, meta };
+  }
+
+  private async doSaveTab(state: TabState): Promise<void> {
+    await this.ensureDirs();
+    const { stored, meta } = this.toStored(state);
     const adapter = this.app.vault.adapter;
     /* Sidecar meta file lets listConversations skip the full body read.
        Written atomically too so a crash mid-rotation never leaves the
@@ -254,13 +272,57 @@ export class Persistence {
        leaves the History dropdown at worst one save optimistic, whereas
        body-first left it stale indefinitely (the fallback body read only
        runs when the meta file is entirely absent). */
-    const meta: TabMeta = {
-      title: stored.title,
-      updatedAt: stored.updatedAt,
-      messageCount: stored.messages.length,
-    };
     await writeJsonAtomic(adapter, this.metaPath(state.id), meta);
     await writeJsonAtomic(adapter, this.convPath(state.id), stored);
+  }
+
+  /* Synchronous best-effort flush for app quit. Obsidian ignores the promise
+     returned by onunload, so on Cmd+Q the async flush() can be torn down
+     mid-write and the last 500ms of debounced edits silently lost. This
+     writes any still-pending debounced tab states plus the latest index
+     payload with sync fs calls (tmp + rename, so files stay whole) before
+     teardown proceeds. Desktop-only: degrades to a no-op off
+     FileSystemAdapter. */
+  flushSync(): void {
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof FileSystemAdapter)) return;
+    const base = adapter.getBasePath();
+    const writeSync = (relPath: string, payload: string) => {
+      const abs = `${base}/${relPath}`;
+      const tmp = `${abs}.${Date.now().toString(36)}.tmp`;
+      writeFileSync(tmp, payload, "utf8");
+      renameSync(tmp, abs);
+    };
+    const pending = Array.from(this.pendingWrites.values());
+    this.pendingWrites.clear();
+    if (pending.length > 0) {
+      try {
+        mkdirSync(`${base}/${this.convDir}`, { recursive: true });
+      } catch (err) {
+        console.warn("[claude-cli-chat] sync flush mkdir failed", err);
+        return;
+      }
+    }
+    for (const { handle, state } of pending) {
+      clearTimeout(handle);
+      try {
+        const { stored, meta } = this.toStored(this.snapshotState(state));
+        writeSync(this.metaPath(state.id), JSON.stringify(meta, null, 2));
+        writeSync(this.convPath(state.id), JSON.stringify(stored, null, 2));
+      } catch (err) {
+        console.warn(`[claude-cli-chat] sync flush failed for tab ${state.id}`, err);
+      }
+    }
+    /* Re-assert the newest index payload — if its async write was still in
+       flight when quit began, this guarantees it lands. Identical content to
+       what the async path writes, so the dedupe cache stays valid. */
+    if (this.lastIndexJson !== null) {
+      try {
+        writeSync(this.indexPath, this.lastIndexJson);
+      } catch (err) {
+        console.warn("[claude-cli-chat] sync flush failed for tab index", err);
+      }
+    }
   }
 
   async deleteTab(id: string): Promise<void> {

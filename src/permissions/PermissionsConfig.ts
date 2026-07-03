@@ -18,11 +18,14 @@ export type SettingsJsonFile = {
 
 export const SETTINGS_JSON_PATH = ".claude/settings.json";
 
-/* Curated read-only / low-risk Bash patterns covering ~80% of routine
-   prompts in vault-driven sessions. Each entry uses Claude Code's allow-
-   pattern syntax: `ToolName(prefix:*)` matches commands starting with
-   `prefix `; `ToolName(literal)` matches that exact command; `ToolName`
-   alone is a blanket approve for that tool. */
+/* Curated auto-approve set covering ~80% of routine prompts in vault-driven
+   sessions: blanket approval for the built-in file-edit tools (Edit, Write,
+   MultiEdit, NotebookEdit) plus read-only/low-risk Bash patterns. NOT a
+   read-only set — any UI copy describing it must say file edits are
+   included. Each entry uses Claude Code's allow-pattern syntax:
+   `ToolName(prefix:*)` matches commands starting with `prefix `;
+   `ToolName(literal)` matches that exact command; `ToolName` alone is a
+   blanket approve for that tool. */
 export const RECOMMENDED_ALLOW_PATTERNS: string[] = [
   // File writes / edits (covers Write, Edit line-deletions, batch + notebook)
   "Edit",

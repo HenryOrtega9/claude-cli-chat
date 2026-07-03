@@ -41,6 +41,12 @@ export class JsonlTailer {
   /* Single pending re-attach timer. Tracked so stop() can cancel it and so a
      rename+close burst can't schedule two concurrent re-attaches. */
   private reattachTimer: ReturnType<typeof setTimeout> | null = null;
+  /* Bounded budget for retrying a watch() that THREW (vs. the normal
+     rename/close re-attach, which is event-driven and self-limiting). Reset
+     whenever an attach succeeds. 40 × 250ms = 10s of tolerance for transient
+     rename/EMFILE windows before giving up for good. */
+  private reattachAttempts = 0;
+  private static readonly REATTACH_MAX_ATTEMPTS = 40;
 
   constructor(path: string) {
     this.path = path;
@@ -81,7 +87,13 @@ export class JsonlTailer {
     }
 
     if (this.stopped) return;
-    await this.readInitial();
+    /* Route the initial replay through readChain so stop()'s drain covers it —
+       started bare, a long replay would keep emitting into a torn-down tab
+       after stop() resolved. Rejections still surface to start()'s caller;
+       the chain keeps its own swallowed copy. */
+    const initial = this.readChain.then(() => this.readInitial());
+    this.readChain = initial.then(() => undefined, () => undefined);
+    await initial;
     if (this.stopped) return;
     this.attachWatcher();
     /* Close the gap between readInitial()'s stat and watch() registration:
@@ -110,6 +122,7 @@ export class JsonlTailer {
         this.scheduleRead();
       });
       this.watcher = w;
+      this.reattachAttempts = 0;
       w.on("close", () => {
         if (this.stopped) return;
         /* Closing the previous watcher to install a new one (top of this
@@ -126,23 +139,36 @@ export class JsonlTailer {
         for (const cb of this.errorListeners) {
           try { cb(err); } catch { /* ignore */ }
         }
+        /* An FSWatcher that emitted 'error' is dead. Replace it instead of
+           leaving the tail permanently silent — both consumers swallow tailer
+           errors, so without a retry the tab just stops updating. */
+        if (this.watcher === w) {
+          try { w.close(); } catch { /* ignore */ }
+          this.scheduleReattach(250);
+        }
       });
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
       for (const cb of this.errorListeners) {
         try { cb(e); } catch { /* ignore */ }
       }
+      /* watch() can throw transiently (file mid-rename/unlink+recreate,
+         EMFILE). Retry with a bounded budget rather than giving up forever;
+         a successful attach resets the counter. */
+      if (++this.reattachAttempts <= JsonlTailer.REATTACH_MAX_ATTEMPTS) {
+        this.scheduleReattach(250);
+      }
     }
   }
 
   /* Schedule a single deferred re-attach. Idempotent while one is pending so a
      rename+close burst doesn't fan out into multiple concurrent watchers. */
-  private scheduleReattach(): void {
+  private scheduleReattach(delayMs = 50): void {
     if (this.stopped || this.reattachTimer !== null) return;
     this.reattachTimer = setTimeout(() => {
       this.reattachTimer = null;
       this.attachWatcher();
-    }, 50);
+    }, delayMs);
   }
 
   /* Chain readAppended() so concurrent watcher events don't interleave reads. */
@@ -238,6 +264,10 @@ export class JsonlTailer {
   }
 
   private handleLine(rawLine: string) {
+    /* stop() promises "no more events after stop() resolves" — an in-flight
+       readRange keeps streaming chunks after the watcher closes, so the
+       emission gate has to live here. */
+    if (this.stopped) return;
     const line = rawLine.trim();
     if (!line) return;
     let record: Record<string, unknown>;

@@ -250,8 +250,12 @@ export function resolveModelId(key: ModelKey): string {
 let cachedClaudePath: string | null = null;
 let cachedUserName: string | null = null;
 
-export function autodetectClaudePath(): string {
-  if (cachedClaudePath !== null) return cachedClaudePath;
+export function autodetectClaudePath(force = false): string {
+  /* A failed detection caches "" so passive callers (placeholder text on
+     every display() paint) stay cheap, but the Autodetect button passes
+     force=true — otherwise installing the CLI after the first settings
+     open would never be noticed until a full plugin reload. */
+  if (cachedClaudePath !== null && !force) return cachedClaudePath;
   const candidates = [
     `${process.env.HOME}/.local/bin/claude`,
     "/usr/local/bin/claude",
@@ -307,7 +311,11 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
   constructor(app: App, plugin: ClaudeChatPlugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this.permissionsStore = new PermissionsConfigStore(app);
+    /* Share the plugin-wide store — its serialized write chain is what keeps
+       concurrent allowlist edits from here and the attach popup's
+       trusted-folder toggles from clobbering each other's settings.json
+       writes. A private instance would have its own chain and race. */
+    this.permissionsStore = plugin.permissionsStore;
   }
 
   display(): void {
@@ -384,7 +392,12 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
         btn
           .setButtonText("Autodetect")
           .onClick(async () => {
-            const detected = autodetectClaudePath();
+            const detected = autodetectClaudePath(true);
+            if (!detected) {
+              /* Don't clobber a manually typed path with "". */
+              new Notice("Couldn't find the claude binary. Is the CLI installed?");
+              return;
+            }
             this.plugin.settings.claudePath = detected;
             await this.plugin.saveSettings();
             this.display();
@@ -621,9 +634,9 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
        would actually be added based on current state. */
     const missingRecommended = RECOMMENDED_ALLOW_PATTERNS.filter(p => !patterns.includes(p));
     new Setting(containerEl)
-      .setName("Recommended safe patterns")
+      .setName("Recommended patterns")
       .setDesc(
-        `${RECOMMENDED_ALLOW_PATTERNS.length} curated read-only/low-risk Bash patterns (cat, grep, find, ls, git status, etc.). ` +
+        `${RECOMMENDED_ALLOW_PATTERNS.length} curated patterns: blanket approval for file edits (Edit, Write, MultiEdit, NotebookEdit) plus read-only Bash (cat, grep, find, ls, git status, etc.). ` +
         (missingRecommended.length === 0
           ? "All already in your allowlist."
           : `${missingRecommended.length} not yet added.`)

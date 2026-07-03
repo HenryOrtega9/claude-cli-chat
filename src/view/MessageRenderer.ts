@@ -285,21 +285,28 @@ export class MessageListRenderer {
        so auto-expanding their raw prompt JSON just adds noise — leave it
        collapsed and let the summary carry the live state. */
     const isSpawn = tool.name === "Task" || tool.name === "Agent";
+    /* Expansion rules must fire on state TRANSITIONS, not on steady state:
+       upsertTool re-runs for the whole message every time any sibling tool or
+       subagent updates, so an unconditional "collapse when completed" would
+       snap a row shut every re-render while the user is trying to read it.
+       Track the last-seen state on the element and only let the system
+       override the user's toggle at the moment the state actually changes. */
+    const stateKey = tool.isError ? "error" : tool.status;
+    const stateChanged = toolEl.getAttribute("data-state") !== stateKey;
+    toolEl.setAttribute("data-state", stateKey);
     /* A terminal transition (error or completion) is a fresh system-driven
        state change, so clear the user's running-tool toggle intent and let the
-       error/complete rules below decide expansion. While still running the
-       flag is preserved so a user-collapsed row stays collapsed. */
-    if (tool.isError || tool.status === "completed") {
+       error/complete rules below decide expansion. On later upserts of the
+       same terminal state the user's toggle is theirs to keep. */
+    if (stateChanged && (tool.isError || tool.status === "completed")) {
       toolEl.removeClass("is-user-toggled");
     }
     if (tool.isError) {
-      toolEl.addClass("is-expanded");
+      if (stateChanged) toolEl.addClass("is-expanded");
     } else if (tool.status === "completed") {
-      /* Only collapse if the user hasn't explicitly toggled — we leave their
-         choice in place by checking if the element is already in a stable
-         state. Since toggling a not-yet-expanded element just adds the class,
-         absence of `is-expanded` here means we should leave it absent. */
-      /* no-op: keep current state */
+      /* Collapse back to compact form when the tool finishes so the chat
+         doesn't get swamped — but only on the transition itself. */
+      if (stateChanged) toolEl.removeClass("is-expanded");
     } else if (tool.status === "running" && !isSpawn && !toolEl.hasClass("is-user-toggled")) {
       toolEl.addClass("is-expanded");
     }
@@ -342,11 +349,6 @@ export class MessageListRenderer {
         cls: tool.isError ? "claudian-tool-result-row claudian-tool-result-error" : "claudian-tool-result-row",
       });
       resultEl.createSpan({ cls: "claudian-tool-result-text", text: tool.result });
-      /* When a successful result lands, collapse back to compact form so the
-         chat doesn't get swamped. Errors stay expanded. */
-      if (!tool.isError && tool.status === "completed") {
-        toolEl.removeClass("is-expanded");
-      }
     }
   }
 

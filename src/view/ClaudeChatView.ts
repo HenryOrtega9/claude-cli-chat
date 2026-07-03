@@ -272,6 +272,10 @@ export class ClaudeChatView extends ItemView {
       this,
       state ?? makeTabState({ incognito: opts.incognito }),
       () => {
+        /* Late async continuations (title-gen, renderer chains) can fire this
+           after closeTab destroyed the controller and deleted its files —
+           writing here would resurrect them. */
+        if (controller.isDestroyed()) return;
         this.renderTabBar();
         /* Incognito tabs never touch the vault. saveIndex() self-filters them,
            so it stays safe to call unconditionally. */
@@ -315,13 +319,30 @@ export class ClaudeChatView extends ItemView {
       new Notice("Couldn't find message to fork from.");
       return;
     }
-    const truncated = source.state.messages.slice(0, idx + 1);
+    /* Deep-clone the carried history: slice() alone aliases the live message
+       and toolCall objects, so a source turn still streaming would keep
+       mutating the fork's state (and what it persists) after the branch.
+       Clear streaming flags and settle any still-running tools — no stream
+       feeds the fork, so those would otherwise shimmer/spin forever. */
+    const truncated = structuredClone(source.state.messages.slice(0, idx + 1));
+    for (const m of truncated) {
+      delete m.streaming;
+      delete m.thinkingStreaming;
+      for (const t of m.toolCalls ?? []) {
+        if (t.status === "pending" || t.status === "approved" || t.status === "running") {
+          t.status = "completed";
+        }
+      }
+    }
     const forkState: TabState = {
       ...makeTabState(),
       title: `Fork: ${source.state.title}`,
       messages: truncated,
       /* Carry over the model/effort/mode/snippet so the fork starts in the
-         same context as where it branched. */
+         same context as where it branched. Incognito MUST carry too — a
+         plain fork of an incognito tab would persist the whole private
+         conversation to disk and respawn without --no-session-persistence. */
+      incognito: source.state.incognito,
       model: source.state.model,
       effort: source.state.effort,
       permissionMode: source.state.permissionMode,
@@ -383,7 +404,12 @@ export class ClaudeChatView extends ItemView {
     if (this.tabs.length === 0) {
       this.createTab();
     } else if (this.activeTabId === tabId) {
-      this.selectTab(this.tabs[Math.max(0, idx - 1)].state.id);
+      /* `idx` was captured before the await above; another close finishing
+         during destroy() can shrink the array, so clamp before indexing —
+         a raw tabs[idx-1] here could dereference undefined and strand the
+         pane with no active tab. */
+      const fallback = this.tabs[Math.min(Math.max(0, idx - 1), this.tabs.length - 1)];
+      if (fallback) this.selectTab(fallback.state.id);
     } else {
       this.renderTabBar();
     }

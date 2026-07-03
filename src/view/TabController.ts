@@ -10,7 +10,7 @@ import { ActiveFileIndicator } from "./ActiveFileIndicator";
 import { SelectionTracker, type ActiveSelection } from "./SelectionTracker";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
-import { resolveModelId, trustedFolderAllowPatterns, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
+import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
 import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
 import { RemoteControlSession, sessionFilePathFor, projectDirFor } from "../claude/RemoteControlSession";
 import { rm } from "node:fs/promises";
@@ -324,7 +324,14 @@ export class TabController {
 
   show() { this.root.style.display = ""; }
   hide() { this.root.style.display = "none"; }
+  /* True once destroy() has started. Late async continuations (title-gen
+     resolving, a submit suspended on a restart teardown) check this so they
+     don't resurrect a deleted conversation on disk or spawn a subprocess for
+     a dead tab. */
+  private destroyed = false;
+  isDestroyed(): boolean { return this.destroyed; }
   async destroy(): Promise<void> {
+    this.destroyed = true;
     /* Unregister BEFORE disposing so the manager's onExit callback doesn't
        race against our own teardown. teardownSession() awaits SIGTERM and
        the eventual process-exit. */
@@ -867,9 +874,17 @@ export class TabController {
       ? (sm as ModelKey)
       : this.plugin.settings.defaultModel;
     const se = this.state.effort;
-    const effortKey: EffortLevel = se !== undefined && (EFFORT_ORDER as readonly string[]).includes(se)
+    let effortKey: EffortLevel = se !== undefined && (EFFORT_ORDER as readonly string[]).includes(se)
       ? (se as EffortLevel)
       : this.plugin.settings.defaultEffort;
+    /* Clamp effort against the resolved model. The pill UI demotes xhigh on
+       model switch, but the settings tab's default-effort dropdown and env
+       snippets can pair xhigh with a non-1M model, and that combo would
+       otherwise reach the CLI as an `--effort` it rejects. Mirror
+       InputBox.selectModel's demotion target (high). */
+    if (!effortLevelsForModel(modelKey).includes(effortKey)) {
+      effortKey = "high";
+    }
     const spm = this.state.permissionMode;
     const modeKey: PermissionMode = spm !== undefined && (PERMISSION_MODE_ORDER as readonly string[]).includes(spm)
       ? (spm as PermissionMode)
@@ -912,13 +927,25 @@ export class TabController {
     /* The incognito decision is now baked into the live subprocess — lock the
        pill so it can't change for the rest of this tab's life. */
     this.inputBox.setIncognitoLocked(true);
-    this.session.onEvent(e => this.onEvent(e));
-    this.session.onExit((code, signal) => this.onExit(code, signal));
-    this.session.onError(err => this.onErrorRaw(err));
+    /* Identity-guard every listener: teardownSession nulls this.session
+       BEFORE disposing, so events/exits from a session this tab has moved
+       past must not reach the live handlers. Without the guard, the old idle
+       process's SIGTERM exit lands while a restarted turn is already busy and
+       renders as a spurious "Claude exited" crash bubble. Exception: the
+       Esc-cancel exit must still route through — onExit owns rendering the
+       cancel note and resetting userCancelInitiated. */
+    const s = this.session;
+    s.onEvent(e => { if (this.session === s) void this.onEvent(e); });
+    s.onExit((code, signal) => {
+      if (this.session !== s && !this.userCancelInitiated) return;
+      this.onExit(code, signal);
+    });
+    s.onError(err => { if (this.session === s) this.onErrorRaw(err); });
     /* Buffer the most recent stderr so we can include it in the error bubble
        when the subprocess dies mid-stream. The CLI usually logs the actual
        crash reason there (panic trace, model-route failure, etc.). */
-    this.session.onStderr(chunk => {
+    s.onStderr(chunk => {
+      if (this.session !== s) return;
       this.lastStderr = (this.lastStderr + chunk).slice(-2000);
     });
     return this.session;
@@ -942,8 +969,13 @@ export class TabController {
        spawning. Without this, a quick submit during the ~2s SIGTERM window
        would get the stale (still-running) session back from spawn() on the old
        model, with listeners re-bound. A swallowed rejection keeps this
-       non-throwing for the unawaited path. */
-    this.pendingRestartTeardown = this.teardownSession("restart").catch(() => {});
+       non-throwing for the unawaited path. Reconcile after the teardown: the
+       old session's exit no longer reaches onExit (identity guard), so a
+       mid-turn restart must flip its still-running tool rows here or they
+       spin forever. Idempotent when the turn was idle. */
+    this.pendingRestartTeardown = this.teardownSession("restart")
+      .then(() => this.reconcileAbortedTurn())
+      .catch(() => {});
     this.lastStderr = "";
   }
 
@@ -1135,6 +1167,20 @@ export class TabController {
     void this.maybeGenerateTitle();
 
     const session = await this.ensureSession();
+    /* The tab can be closed while ensureSession awaits a restart teardown —
+       the session just spawned then belongs to a dead tab. Kill it instead of
+       leaking a full turn (and its persistence writes) into a deleted
+       conversation. */
+    if (this.destroyed) {
+      void session.dispose();
+      return;
+    }
+    /* ensureSession may have awaited a restart teardown whose epilogue clears
+       busy (teardownSession's non-switch tail runs AFTER we set busy above).
+       Re-assert so the live turn keeps Send disabled, Esc-cancel armed, and
+       the tab badge accurate. */
+    this.state.busy = true;
+    this.inputBox.setBusy(true);
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] submit -> session.status=${session.status}`);
     /* Claude Code stream-json mode does NOT emit `system/init` until it has
@@ -1845,9 +1891,13 @@ export class TabController {
     });
     if (generated) {
       /* The title-gen subprocess is independent and outlives teardownSession()/clear(),
-         which neither kill it. If the conversation we titled was cleared or replaced
-         during the multi-second await, the first user message is gone (or has a new id),
-         so a stale title would retitle and persist a fresh tab with the prior topic. */
+         which neither kill it. If the tab was closed during the multi-second
+         await, onStateChangeCb would rewrite the conversation file closeTab
+         just deleted, resurrecting it as a History-modal orphan. Likewise if
+         the conversation was cleared or replaced, the first user message is
+         gone (or has a new id), and a stale title would retitle a fresh tab
+         with the prior topic. */
+      if (this.destroyed) return;
       if (this.state.messages.find(m => m.role === "user")?.id !== firstUser.id) return;
       this.state.title = generated;
       this.state.updatedAt = Date.now();
@@ -1931,8 +1981,10 @@ export class TabController {
     /* Order matters: bail if there's no session BEFORE removing the
        pendingApprovals entry. Otherwise a user-click during a teardown
        race silently drops the approval, the card is already gone via
-       dismiss(), and the user has no way to redrive it. */
-    if (!this.session) return;
+       dismiss(), and the user has no way to redrive it. isTerminal covers
+       the dead-but-not-nulled session (unexpected exit): approving into it
+       would swallow the write and flip the pill to a phantom "thinking". */
+    if (!this.session || this.session.isTerminal()) return;
     this.state.pendingApprovals.delete(requestId);
     if (decision.allowed) {
       /* Pass the original input from the request — the SDK requires
@@ -2008,6 +2060,13 @@ export class TabController {
        driven exits (cancel/restart/clear), where the maps are already empty
        and no tools are left running. */
     this.reconcileAbortedTurn();
+    /* The process is gone, so nothing can ever answer an outstanding
+       approval. Clear the entries and dismiss the cards — otherwise the card
+       outlives the crash, a late Allow writes into the dead session's stdin
+       (silently swallowed), and the status pill + TC001 strand on a phantom
+       "thinking" with no turn running. */
+    this.state.pendingApprovals.clear();
+    this.approvalArea.dismissAll();
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();

@@ -54,7 +54,10 @@ async function extractPptxText(buffer: ArrayBuffer): Promise<string> {
        open-tag branch swallow everything up to the NEXT closing tag and
        dropping real runs. Same guard on every OOXML regex in this file. */
     const runs: string[] = [];
-    const re = /<a:t(?:[^>]*[^/>])?>([\s\S]*?)<\/a:t>/g;
+    /* \b keeps this from also matching <a:tbl>, <a:tr>, <a:tc> etc. and
+       capturing raw table XML as "text" — same tag-name guard as the xlsx
+       regexes below. */
+    const re = /<a:t\b(?:[^>]*[^/>])?>([\s\S]*?)<\/a:t>/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(xml)) !== null) {
       const txt = decodeXmlEntities(m[1]);

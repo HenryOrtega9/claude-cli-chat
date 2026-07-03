@@ -192,12 +192,26 @@ export class TabSession {
       for (const cb of this.errorListeners) cb(err);
     });
 
+    /* 'exit' can fire while stdout still holds undelivered data — the CLI's
+       final burst (an error/result line explaining a crash) would be silently
+       dropped if we detached the parser there. 'close' waits for stdio to
+       drain, so detach and dispatch there. Status still flips on 'exit' so
+       reuse/dispose guards stay prompt. Fallback: if something inherited our
+       pipes and holds them open, 'close' can stall — force the dispatch 2s
+       after 'exit' so a tab never hangs waiting on it. */
+    let exitDispatched = false;
+    const dispatchExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (exitDispatched) return;
+      exitDispatched = true;
+      this.parser.detach();
+      for (const cb of this.exitListeners) cb(code, signal);
+    };
     this.child.on("exit", (code, signal) => {
       console.log(`[claude-cli-chat] exit code=${code} signal=${signal}`);
       this.status = "exited";
-      this.parser.detach();
-      for (const cb of this.exitListeners) cb(code, signal);
+      setTimeout(() => dispatchExit(code, signal), 2000);
     });
+    this.child.on("close", (code, signal) => dispatchExit(code, signal));
   }
 
   private buildArgs(opts: SpawnOptions): string[] {

@@ -79,18 +79,26 @@ export async function writeJsonAtomic(
   const tmp = `${path}.${token}.tmp`;
   const payload = JSON.stringify(data, null, 2);
   await adapter.write(tmp, payload);
-  /* adapter.rename atomically replaces the destination on POSIX. On Windows
-     adapters that disallow overwrite, the existing file is removed first
-     to avoid EEXIST. Wrapped in a try so we always clean up the tmp file. */
+  /* adapter.rename atomically replaces the destination on POSIX. On adapters
+     that disallow overwrite, retry with the existing file moved ASIDE (not
+     deleted) — if the retry also fails, the old data is still recoverable at
+     the .bak and the new payload still lives in the tmp. The previous
+     delete-then-retry fallback could destroy BOTH copies on a double rename
+     failure (e.g. transient iCloud locks). */
   try {
     await adapter.rename(tmp, path);
   } catch (err) {
+    const bak = `${path}.${token}.bak`;
     try {
-      if (await adapter.exists(path)) await adapter.remove(path);
+      if (await adapter.exists(path)) await adapter.rename(path, bak);
       await adapter.rename(tmp, path);
+      try { if (await adapter.exists(bak)) await adapter.remove(bak); } catch { /* ignore */ }
     } catch (err2) {
-      /* Best-effort cleanup of the stale tmp so it doesn't accumulate. */
-      try { if (await adapter.exists(tmp)) await adapter.remove(tmp); } catch { /* ignore */ }
+      /* Roll the original back into place if we moved it and the retry died.
+         Keep the tmp — it holds the only copy of the new payload. */
+      try {
+        if (!(await adapter.exists(path)) && (await adapter.exists(bak))) await adapter.rename(bak, path);
+      } catch { /* ignore — .bak remains on disk for manual recovery */ }
       throw err2;
     }
   }
