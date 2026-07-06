@@ -1,7 +1,7 @@
 import { Notice, TFile, TFolder, type App, type Component, type EventRef } from "obsidian";
 import { MessageListRenderer } from "./MessageRenderer";
 import { ApprovalArea, type ApprovalDecision } from "./ApprovalModal";
-import { InputBox, type SubmitPayload, type Suggestion } from "./InputBox";
+import { InputBox, extractObsidianUrlPaths, type SubmitPayload, type Suggestion } from "./InputBox";
 import { renderWelcome, setWelcomeVisible } from "./Welcome";
 import { RemotePairingCard } from "./RemotePairingCard";
 import { StatusIndicator } from "./StatusIndicator";
@@ -256,6 +256,54 @@ export class TabController {
     if (this.state.messages.length > 0 || this.state.sessionId !== null) {
       this.inputBox.setIncognitoLocked(true);
     }
+
+    /* Whole-tab drop zone. The InputBox wrapper handles drops on itself;
+       this catches drops anywhere else in the chat (title bar, message
+       list, welcome screen) so "drag a note into the chat window" works
+       without needing to hit the input box. Only engages for Obsidian
+       vault drags and OS file drags — plain text drags keep their default
+       behavior. The InputBox's own handler runs first (deeper target) and
+       preventDefaults what it consumes, so `defaultPrevented` is the
+       no-double-handling guard. */
+    const rootDragHasPayload = (e: DragEvent) =>
+      this.isVaultDragActive() ||
+      (!!e.dataTransfer && Array.from(e.dataTransfer.types ?? []).includes("Files"));
+    this.root.addEventListener("dragover", e => {
+      if (e.defaultPrevented) return;
+      if (rootDragHasPayload(e)) {
+        e.preventDefault();
+        this.root.addClass("is-drop-target");
+      }
+    });
+    this.root.addEventListener("dragleave", e => {
+      const related = e.relatedTarget as Node | null;
+      if (!related || !this.root.contains(related)) {
+        this.root.removeClass("is-drop-target");
+      }
+    });
+    this.root.addEventListener("drop", e => {
+      this.root.removeClass("is-drop-target");
+      if (e.defaultPrevented) return;
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const hasOsFiles = Array.from(dt.types ?? []).includes("Files");
+      if (!this.isVaultDragActive() && !hasOsFiles) return;
+      /* Swallow the drop so Electron doesn't navigate to a dropped file://
+         URL and Obsidian's leaf handler doesn't try to open the note over
+         the chat view. */
+      e.preventDefault();
+      if (this.tryConsumeVaultDrag()) return;
+      const files = Array.from(dt.files ?? []);
+      if (files.length > 0) {
+        this.inputBox.ingestDroppedFiles(files);
+        return;
+      }
+      /* Drag sources that populate neither dragManager file fields nor
+         dt.files still put obsidian://open URLs on text/plain. */
+      for (const p of extractObsidianUrlPaths(dt.getData("text/plain"))) {
+        this.tryPinVaultPath(p);
+      }
+    });
     /* Initial paint for the agents pill — visible whenever the catalog has
        at least one entry. Re-painted in handlePluginSlashCommand after the
        catalog refreshes. */
@@ -365,7 +413,23 @@ export class TabController {
 
     /* Tear down whatever is currently active. */
     if (this.mode === "local") {
+      const wasBusy = this.state.busy;
       await this.teardownSession("switch");
+      /* "switch" deliberately skips teardownSession's busy reset so the next
+         mode owns the flag — but a turn that was streaming when the user
+         flipped the toggle just got killed, and nothing on the remote side
+         will ever emit its result event. Without this epilogue the tab badge
+         stays streaming, the thinking pill spins until its watchdog, and the
+         composer comes back disabled after switching home. Mirror the
+         cancel path's abort handling. */
+      if (wasBusy) {
+        this.reconcileAbortedTurn();
+        this.state.busy = false;
+        this.inputBox.setBusy(false);
+        this.statusIndicator.hide();
+        this.approvalArea.dismissAll();
+        StateEmitter.setState("ready");
+      }
     } else {
       if (this.remoteSession) {
         this.plugin.subprocessManager.unregisterRemote(this.state.id);
@@ -822,6 +886,12 @@ export class TabController {
       this.remoteSession = null;
     }
     await this.teardownSession("cancel");
+    /* teardownSession no-ops behind its re-entrancy guard when another
+       teardown (e.g. a model-change restart) is already in flight, leaving
+       its busy-reset tail unrun. Reset unconditionally so Esc always
+       re-enables the composer; idempotent when the teardown did run. */
+    this.state.busy = false;
+    this.inputBox.setBusy(false);
     /* The subprocess just died, so any still-running tool will never receive a
        tool_result — stop its subagent tracker and flip its row to errored (else
        it spins forever and the Agents pill's running counter sticks). Shared
@@ -1173,6 +1243,19 @@ export class TabController {
        conversation. */
     if (this.destroyed) {
       void session.dispose();
+      return;
+    }
+    /* Esc pressed while ensureSession was awaiting a restart teardown: the
+       cancel's own teardownSession no-op'd behind the re-entrancy guard, so
+       nothing stopped this turn from proceeding — the user's Stop would be
+       silently overridden and the message sent anyway. Honor the cancel:
+       leave the bubble in place but never send. */
+    if (this.userCancelInitiated) {
+      this.state.busy = false;
+      this.inputBox.setBusy(false);
+      this.statusIndicator.hide();
+      StateEmitter.setState("ready");
+      this.onStateChangeCb();
       return;
     }
     /* ensureSession may have awaited a restart teardown whose epilogue clears
@@ -2185,19 +2268,25 @@ export class TabController {
     return false;
   }
 
-  /* Reads Obsidian's internal drag state. The file-explorer drag populates
-     `app.dragManager.draggable` with the dragged TFile/TFolder (or a
-     `files` array for multi-select) but typically leaves the HTML5
-     dataTransfer empty, so this is the only reliable way to detect that
-     a vault drag is in flight from inside our dragover/drop handlers. The
+  /* Reads Obsidian's internal drag state and resolves it to vault paths.
+     File-explorer drags populate `app.dragManager.draggable` with the
+     dragged TFile/TFolder (or a `files` array for multi-select) but
+     typically leave the HTML5 dataTransfer empty, so this is the only
+     reliable way to detect that a vault drag is in flight from inside our
+     dragover/drop handlers. Link drags (a [[wikilink]] dragged out of an
+     editor, a search result, a backlink, a bookmark, a tab header) carry
+     no TFile at all — just `linktext` + `sourcePath` — so those resolve
+     through the metadata cache like Obsidian's own link resolution. The
      `dragManager` field is internal (not in the public Obsidian d.ts), so
      we narrow through `unknown` rather than reaching for `any`. */
-  private readDragManagerItems(): Array<TFile | TFolder> {
+  private readDragManagerPaths(): string[] {
     const dm = (this.app as unknown as {
       dragManager?: {
         draggable?: {
           file?: unknown;
           files?: unknown[];
+          linktext?: unknown;
+          sourcePath?: unknown;
           source?: unknown;
           type?: unknown;
         };
@@ -2205,32 +2294,40 @@ export class TabController {
     }).dragManager;
     const draggable = dm?.draggable;
     if (!draggable) return [];
-    const collected: Array<TFile | TFolder> = [];
+    const paths: string[] = [];
     if (draggable.file instanceof TFile || draggable.file instanceof TFolder) {
-      collected.push(draggable.file);
+      paths.push(draggable.file.path);
     }
     if (Array.isArray(draggable.files)) {
       for (const f of draggable.files) {
-        if (f instanceof TFile || f instanceof TFolder) collected.push(f);
+        if (f instanceof TFile || f instanceof TFolder) paths.push(f.path);
       }
     }
-    return collected;
+    if (paths.length === 0 && draggable.type === "link" && typeof draggable.linktext === "string") {
+      /* linktext may carry a heading/block subpath ("Note#Section") — strip
+         it; pins are whole-file. */
+      const bare = draggable.linktext.split("#")[0].trim();
+      const source = typeof draggable.sourcePath === "string" ? draggable.sourcePath : "";
+      const dest = this.app.metadataCache.getFirstLinkpathDest(bare, source);
+      if (dest) paths.push(dest.path);
+    }
+    return paths;
   }
 
   private isVaultDragActive(): boolean {
-    return this.readDragManagerItems().length > 0;
+    return this.readDragManagerPaths().length > 0;
   }
 
   /* Consumes the active Obsidian drag (if any) by pinning every dragged
-     TFile/TFolder. Returns true when at least one item was pinned so the
-     InputBox knows to skip its text/plain fallback. Files and folders both
-     route through the same pin call — ActiveFileIndicator picks the icon
-     and color per item via its own vault lookup. */
+     item. Returns true when at least one item was pinned so the InputBox
+     knows to skip its text/plain fallback. Files and folders both route
+     through the same pin call — ActiveFileIndicator picks the icon and
+     color per item via its own vault lookup. */
   private tryConsumeVaultDrag(): boolean {
-    const items = this.readDragManagerItems();
-    if (items.length === 0) return false;
-    for (const item of items) {
-      this.activeFileIndicator.addPinnedPath(item.path);
+    const paths = this.readDragManagerPaths();
+    if (paths.length === 0) return false;
+    for (const path of paths) {
+      this.activeFileIndicator.addPinnedPath(path);
     }
     return true;
   }

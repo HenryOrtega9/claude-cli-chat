@@ -207,7 +207,11 @@ export class MessageListRenderer {
         this.subagentEventsOpenOverride.delete(toolId);
       }
     }
-    entry.root.remove();
+    /* entry.root is the inner .claudian-message; createBubble nests it in a
+       .claudian-message-wrapper. Remove the wrapper, or every merge leaves
+       an empty wrapper div behind that the flex column's gap renders as a
+       phantom blank row. */
+    (entry.root.closest(".claudian-message-wrapper") ?? entry.root).remove();
     this.liveEls.delete(id);
     this.thinkingOpenOverride.delete(id);
     this.renderChains.delete(id);
@@ -738,6 +742,7 @@ export class MessageListRenderer {
       case "WebFetch": return "globe";
       case "WebSearch": return "globe";
       case "Task": return "users";
+      case "Agent": return "users";
       case "TodoWrite": return "list-checks";
       case "Skill": return "zap";
       default: return "wrench";
@@ -783,7 +788,7 @@ export class MessageListRenderer {
     };
     if (tool.name === "Skill" && typeof input.skill === "string") return truncate(input.skill);
     if (tool.name === "Bash" && typeof input.command === "string") return truncate(input.command.replace(/\s+/g, " ").trim());
-    if (tool.name === "Task" && typeof input.subagent_type === "string") return truncate(input.subagent_type);
+    if ((tool.name === "Task" || tool.name === "Agent") && typeof input.subagent_type === "string") return truncate(input.subagent_type);
     if (tool.name === "TodoWrite" && Array.isArray((input as { todos?: unknown[] }).todos)) {
       const n = ((input as { todos?: unknown[] }).todos ?? []).length;
       return `${n} item${n === 1 ? "" : "s"}`;
@@ -801,9 +806,10 @@ export class MessageListRenderer {
   private previewInput(tool: ToolCall): string | null {
     const input = tool.input ?? {};
     if (tool.name === "Bash" && typeof input.command === "string") return `$ ${input.command}`;
-    /* Task tool: the visible summary already shows description + subagent, so
-       use the prompt as the expandable preview body. */
-    if (tool.name === "Task" && typeof input.prompt === "string") return input.prompt;
+    /* Task/Agent tool ("Task" ≤ CLI 2.1.141, "Agent" 2.1.143+): the visible
+       summary already shows description + subagent, so use the prompt as the
+       expandable preview body. */
+    if ((tool.name === "Task" || tool.name === "Agent") && typeof input.prompt === "string") return input.prompt;
     if (typeof input.path === "string") return input.path;
     if (typeof input.file_path === "string") return input.file_path;
     if (typeof input.pattern === "string") return input.pattern;

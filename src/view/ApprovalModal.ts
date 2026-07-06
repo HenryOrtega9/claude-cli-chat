@@ -294,6 +294,8 @@ export class ApprovalArea {
       case "Write": return "file-plus";
       case "Edit": return "file-edit";
       case "Read": return "file-text";
+      case "Task": return "users";
+      case "Agent": return "users";
       default: return "wrench";
     }
   }

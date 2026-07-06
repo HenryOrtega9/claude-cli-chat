@@ -305,12 +305,22 @@ export class Persistence {
     }
     for (const { handle, state } of pending) {
       clearTimeout(handle);
+      const snapshot = this.snapshotState(state);
       try {
-        const { stored, meta } = this.toStored(this.snapshotState(state));
+        const { stored, meta } = this.toStored(snapshot);
         writeSync(this.metaPath(state.id), JSON.stringify(meta, null, 2));
         writeSync(this.convPath(state.id), JSON.stringify(stored, null, 2));
       } catch (err) {
         console.warn(`[claude-cli-chat] sync flush failed for tab ${state.id}`, err);
+      }
+      /* A doSaveTab that was already in flight when this flush began holds
+         an OLDER snapshot; on the plugin-reload path (event loop keeps
+         running) its tmp-then-rename would land AFTER the sync write above
+         and regress the file. Chain this newest snapshot behind it so the
+         last write wins. On hard quit the chained save never runs and the
+         sync write stands. */
+      if (this.inflightSaves.has(state.id)) {
+        void this.saveTab(snapshot);
       }
     }
     /* Re-assert the newest index payload — if its async write was still in

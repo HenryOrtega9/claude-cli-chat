@@ -87,6 +87,48 @@ function guessMimeFromName(name: string): string {
    per-turn budget. */
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
+/* Obsidian's dragManager sets text/plain (and text/uri-list) to an
+   `obsidian://open?vault=<enc>&file=<enc>` URL when a note is dragged —
+   from the file explorer, search results, backlinks, bookmarks, or a tab
+   header. Multi-select drags join one URL per line. Extract the vault-
+   relative `file` param from one such line, or null if the line isn't an
+   obsidian://open URL. Decoding is done per-param with decodeURIComponent
+   (matching Obsidian's encodeURIComponent) rather than URLSearchParams,
+   which would corrupt literal `+` characters in note names into spaces. */
+function parseObsidianOpenUrl(line: string): string | null {
+  if (!line.startsWith("obsidian://open?")) return null;
+  const query = line.slice("obsidian://open?".length);
+  for (const pair of query.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq === -1 || pair.slice(0, eq) !== "file") continue;
+    try {
+      const decoded = decodeURIComponent(pair.slice(eq + 1));
+      return decoded || null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/* Extracts vault paths from an obsidian://open URL payload. Returns one
+   path per line ONLY when every non-empty line is an obsidian://open URL
+   (the shape dragFile/dragFiles produce) — a mixed payload is treated as
+   free text and gets []. The `file` param may omit the `.md` extension,
+   so callers must resolve through getFirstLinkpathDest, not just a direct
+   path lookup. */
+export function extractObsidianUrlPaths(text: string): string[] {
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return [];
+  const paths: string[] = [];
+  for (const line of lines) {
+    const p = parseObsidianOpenUrl(line);
+    if (p === null) return [];
+    paths.push(p);
+  }
+  return paths;
+}
+
 /* Pulls a candidate vault path out of an arbitrary drag payload. Handles
    the formats Obsidian's drag source produces:
    - bare path (file explorer):   `MBA/Note.md`
@@ -1617,6 +1659,13 @@ export class InputBox {
        cause the decoded image to ride on the next turn. */
     const target = this.attachments;
     for (const file of files) {
+      /* Same cap addFiles enforces for the picker/drop paths. Without it a
+         huge pasted image base64-inflates into one stream-json stdin line
+         and the turn fails at the CLI/API layer with an opaque error. */
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        new Notice(`Pasted image is too large (max 10MB)`);
+        continue;
+      }
       /* Avoid FileReader: in some Obsidian/Electron renderer configurations
          the FileReader instance is missing readAsDataURL, which silently
          broke image paste. Blob.arrayBuffer() works universally. */
@@ -1657,6 +1706,20 @@ export class InputBox {
     if (this.callbacks.onTryConsumeVaultDrag?.()) return;
     const text = dt.getData("text/plain");
     if (!text) return;
+    /* Obsidian drags whose payload never reaches dragManager.draggable's
+       file/files fields (note links dragged from an editor, search results,
+       backlinks, bookmarks, tab headers) still put obsidian://open URLs on
+       text/plain — one per line for multi-select. Pin every one that
+       resolves; swallow the drop if any did so a raw URL never lands in the
+       textarea. */
+    const urlPaths = extractObsidianUrlPaths(text);
+    if (urlPaths.length > 0) {
+      let pinnedAny = false;
+      for (const p of urlPaths) {
+        if (this.callbacks.onTryPinVaultPath?.(p)) pinnedAny = true;
+      }
+      if (pinnedAny) return;
+    }
     /* Obsidian's file explorer puts the vault-relative path on text/plain
        when you drag a note or folder. Strip wikilink wrappers and alias
        suffixes so [[Foo|Bar]] resolves the same as a bare Foo path. If the
@@ -1674,6 +1737,13 @@ export class InputBox {
 
   private openFilePicker() {
     this.hiddenFileInput.click();
+  }
+
+  /* Public entry for OS-file drops landing OUTSIDE the input wrapper (the
+     TabController's whole-tab drop zone). Routes through the same addFiles
+     pipeline as the + button and wrapper drops. */
+  ingestDroppedFiles(files: File[]) {
+    if (files.length > 0) void this.addFiles(files);
   }
 
   /* Shared ingest path for both the + button and Finder drops. Decides per

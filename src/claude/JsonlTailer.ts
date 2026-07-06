@@ -193,8 +193,30 @@ export class JsonlTailer {
     let size = 0;
     try { size = statSync(this.path).size; } catch { return; }
     if (size === 0) return;
-    await this.readRange(0, size);
-    this.bytesRead = size;
+    if (await this.readRangeOrReset(0, size)) this.bytesRead = size;
+  }
+
+  /* Wraps readRange with mid-stream failure recovery. When the stream
+     errors after some chunks were already delivered, those bytes are stuck
+     in this.buffer (and the persistent decoder holds their partial
+     multibyte state) while bytesRead was never advanced — so a plain retry
+     re-reads the same range and concatenates the bytes with themselves,
+     tearing the record so its JSON.parse fails and the line is silently
+     dropped. Recover the same way the truncation branch does: reset
+     buffer + decoder + bytesRead to zero and let the next tick replay from
+     the start. The uuid dedupe set is left intact so the replay re-emits
+     nothing already delivered. Returns true when the read completed
+     cleanly (caller may then advance bytesRead). */
+  private async readRangeOrReset(start: number, end: number): Promise<boolean> {
+    try {
+      await this.readRange(start, end);
+      return true;
+    } catch {
+      this.buffer = "";
+      this.decoder = new StringDecoder("utf8");
+      this.bytesRead = 0;
+      return false;
+    }
   }
 
   private async readAppended(): Promise<void> {
@@ -215,13 +237,11 @@ export class JsonlTailer {
       this.seenUuids.clear();
       this.seenUuidsOrder.length = 0;
       if (size === 0) return;
-      await this.readRange(0, size);
-      this.bytesRead = size;
+      if (await this.readRangeOrReset(0, size)) this.bytesRead = size;
       return;
     }
     if (size === this.bytesRead) return;
-    await this.readRange(this.bytesRead, size);
-    this.bytesRead = size;
+    if (await this.readRangeOrReset(this.bytesRead, size)) this.bytesRead = size;
   }
 
   /* Read [start, end) and emit each COMPLETE line. A trailing partial line (the

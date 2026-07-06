@@ -141,6 +141,11 @@ export class RemoteControlSession {
   /* 60s budget for the CLI to print its pairing URL. If it never appears,
      surface an error and dispose. Cleared when the URL is captured. */
   private urlTimeout: ReturnType<typeof setTimeout> | null = null;
+  /* True only when the child's 'error' event fired (spawn failure — no
+     process to kill, no 'exit' event ever). Status "error" alone can't
+     distinguish that from the URL-discovery timeout, where the child is
+     alive and MUST still be SIGTERMed by dispose(). */
+  private spawnFailed = false;
   /* Session id parsed from the CLI's stdout (welcome banner), if it prints
      one. Used to disambiguate the session file under parallel spawns. */
   private discoveredSessionId: string | null = null;
@@ -190,6 +195,7 @@ export class RemoteControlSession {
 
     this.child.on("error", err => {
       console.error(`[claude-cli-chat] RC error:`, err);
+      this.spawnFailed = true;
       this.setStatus("error");
       /* A spawn failure emits 'error' and never 'exit', so the exit-path
          teardown never runs here. Mirror it: stop the session-file poll and
@@ -240,12 +246,14 @@ export class RemoteControlSession {
     this.stopSessionFilePoll();
     this.clearUrlTimeout();
     if (this.status === "exited") return;
-    /* "error" means the proxy never spawned (e.g. python3 missing) — no
+    /* spawnFailed means the proxy never spawned (e.g. python3 missing) — no
        'exit' event will ever fire, so waiting on it would burn the full
        1.5s timeout per dead session (multiplied on plugin unload's
        killAll). Same guard for a child that already exited before the
-       status flip landed. */
-    if (this.status === "error" || this.child.exitCode !== null || this.child.signalCode !== null) return;
+       status flip landed. Status "error" alone is NOT sufficient here:
+       the URL-discovery timeout sets it while the child is still alive,
+       and that child must be killed or it leaks a live remote session. */
+    if (this.spawnFailed || this.child.exitCode !== null || this.child.signalCode !== null) return;
     return new Promise(resolve => {
       const timeout = setTimeout(() => {
         try { this.child.kill("SIGKILL"); } catch { /* ignore */ }

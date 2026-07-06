@@ -88,7 +88,15 @@ export class PermissionsConfigStore {
          next save so we don't silently drop a bad shape forever. */
       if (cfg.permissions === null || cfg.permissions === undefined) {
         /* leave as undefined; callers default it */
-      } else if (typeof cfg.permissions === "object") {
+      } else if (Array.isArray(cfg.permissions) || typeof cfg.permissions !== "object") {
+        /* An array satisfies typeof === "object", but setting `allow` on it
+           creates an expando property that JSON.stringify silently drops —
+           addAllow/addAllowMany would report success while writing back
+           `"permissions": []` forever. A string/number would make the
+           mutators' property assignment throw under strict mode. Treat any
+           non-plain-object shape as absent so mutators rebuild it. */
+        cfg.permissions = undefined;
+      } else {
         const allow = (cfg.permissions as PermissionsBlock).allow;
         if (!Array.isArray(allow)) {
           (cfg.permissions as PermissionsBlock).allow = [];
