@@ -217,6 +217,29 @@ export default class ClaudeChatPlugin extends Plugin {
        then resolves to undefined at spawn / shows no selection in the dropdown.
        Snap any stale value back to its default. */
     if (!(this.settings.defaultModel in MODEL_IDS)) this.settings.defaultModel = DEFAULT_SETTINGS.defaultModel;
+    /* Re-wrap the tool cache in a fresh object: on a first run Object.assign
+       hands us the DEFAULT_SETTINGS.mcpToolCache reference itself, and
+       updateMcpToolCache mutates in place — without the copy we'd be
+       writing into the shared default. */
+    this.settings.mcpToolCache = { ...(this.settings.mcpToolCache ?? {}) };
+    /* Same class of risk as mcpToolCache above: Object.assign copies
+       whatever's in data.json regardless of value, so a hand-edited or
+       corrupted file with e.g. "envSnippets": null overwrites the default
+       [] with null. Every consumer (the snippet picker, ensureSession's
+       lookup by id) calls array methods on this with no independent guard,
+       so an un-normalized null would throw a TypeError deep in an unrelated
+       code path instead of just degrading to "no snippets". */
+    /* Always re-wrap into a fresh array, same as mcpToolCache above (and
+       for the same reason): on a totally fresh install, Object.assign
+       backfills DEFAULT_SETTINGS.envSnippets by REFERENCE (loadData() has
+       no key to override it with), and the settings UI mutates this array
+       in place (push/splice when adding or removing a snippet) — without
+       this copy, the very first push would corrupt the shared default for
+       the rest of this plugin's process lifetime. Validate the type first
+       since a corrupted/hand-edited data.json (e.g. "envSnippets": null)
+       would otherwise survive Object.assign intact and throw a TypeError
+       in the snippet picker or ensureSession's lookup by id. */
+    this.settings.envSnippets = Array.isArray(this.settings.envSnippets) ? [...this.settings.envSnippets] : [];
     if (!EFFORT_ORDER.includes(this.settings.defaultEffort)) this.settings.defaultEffort = DEFAULT_SETTINGS.defaultEffort;
     if (!PERMISSION_MODE_ORDER.includes(this.settings.permissionMode)) this.settings.permissionMode = DEFAULT_SETTINGS.permissionMode;
     /* First-install user name autodetect. Empty userName means we've never
@@ -245,6 +268,48 @@ export default class ClaudeChatPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  /* Merge a fresh init event's per-server tool lists into the persisted
+     cache so the cost-surface pill can show real tool counts before the
+     first message of a session. Merge (not replace): an init only reports
+     servers enabled for THAT tab, and replacing would drop cached entries
+     for servers the user disabled there but still has enabled elsewhere.
+     Saves only when something actually changed to avoid disk churn on
+     every spawn. */
+  async updateMcpToolCache(grouped: Record<string, string[]>): Promise<void> {
+    let changed = false;
+    for (const [server, tools] of Object.entries(grouped)) {
+      const prev = this.settings.mcpToolCache[server];
+      if (!prev || prev.length !== tools.length || prev.some((t, i) => t !== tools[i])) {
+        this.settings.mcpToolCache[server] = tools;
+        changed = true;
+      }
+    }
+    if (changed) await this.saveSettings();
+  }
+
+  /* Drop cache entries for servers absent from an AUTHORITATIVE, successful
+     `claude mcp list` result (sanitized ids). Deliberately NOT run from
+     updateMcpToolCache's merge above — that merge is intentionally
+     non-destructive so a server disabled in one tab doesn't lose its
+     cached tools that another tab still relies on. Pruning only belongs
+     here, gated on positive confirmation the server is truly gone, so a
+     transient `getMcpServers()` failure (which the caller already treats
+     as "no list yet" and falls back to this same cache for) can never be
+     mistaken for removal and wipe an entry that's still valid. Otherwise a
+     server removed entirely (e.g. `claude mcp remove`, outside the plugin)
+     leaves a stale entry that can resurface as enabled with its old tool
+     list the next time a transient list failure hits the fallback path. */
+  async pruneMcpToolCache(validSids: ReadonlySet<string>): Promise<void> {
+    let changed = false;
+    for (const sid of Object.keys(this.settings.mcpToolCache)) {
+      if (!validSids.has(sid)) {
+        delete this.settings.mcpToolCache[sid];
+        changed = true;
+      }
+    }
+    if (changed) await this.saveSettings();
   }
 
   /* Programmatic one-shot prompt for other plugins (e.g. obsidian-docx-claude).

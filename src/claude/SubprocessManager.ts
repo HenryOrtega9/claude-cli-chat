@@ -95,6 +95,32 @@ type StderrListener = (chunk: string) => void;
      3. .sendUserText() writes NDJSON to stdin
      4. .approve() / .deny() reply to a pending control_request
      5. process exit fires .exit listeners; .dispose() can force-kill */
+
+const EVENT_LOG_PREVIEW_CHARS = 500;
+
+/* Bounded, string-only projection of a StreamEvent for the debug log below.
+   Every event (assistant content blocks, tool results, echoed user
+   attachments, and — since includePartialMessages defaults on — a
+   high-frequency stream of partial-message deltas) used to be logged via
+   the raw object reference. That's unbounded (a Read of a large file, a
+   long Grep match, or a pasted image/PDF's base64 all flow through here)
+   and Electron/Chromium's console retains references to logged objects for
+   the life of the console buffer, so a session with a few large payloads
+   accumulates real retained memory. Serializing to a capped string avoids
+   both the size and the retention: a truncated string holds no reference
+   back to the original (possibly much larger) object. */
+function previewEvent(event: StreamEvent): string {
+  let json: string;
+  try {
+    json = JSON.stringify(event);
+  } catch {
+    return `[unserializable event type=${event.type}]`;
+  }
+  return json.length > EVENT_LOG_PREVIEW_CHARS
+    ? `${json.slice(0, EVENT_LOG_PREVIEW_CHARS)}…(+${json.length - EVENT_LOG_PREVIEW_CHARS} chars)`
+    : json;
+}
+
 export class TabSession {
   readonly tabId: string;
   sessionId: string | null = null;
@@ -174,9 +200,17 @@ export class TabSession {
     /* Read-side stream errors (EIO/EPIPE after an abnormal child death)
        emit 'error' on the stream object itself — the child-level 'error'
        handler below only covers spawn failures. Unhandled, they become an
-       uncaught exception in the renderer. stdout's handler lives in
-       StreamJsonParser.attach; stdin write errors are absorbed by
-       InputWriter's per-write callbacks. */
+       uncaught exception that crashes the whole Obsidian process, not just
+       this tab. stdout's handler lives in StreamJsonParser.attach.
+
+       stdin is NOT covered by InputWriter's per-write callbacks alone: a
+       failed write both invokes the callback with the error AND
+       independently emits 'error' on the stream object — Node Writable
+       semantics, not specific to this codebase. Without a listener here,
+       a write landing in the gap after the child has died (crash/OOM/the
+       SIGKILL path in dispose()) but before stdin.writable flips false
+       throws uncaught. Mirrors RemoteControlSession.ts's identical fix. */
+    this.child.stdin.on("error", err => console.warn(`[claude-cli-chat] stdin error:`, err));
     this.child.stderr.on("error", err => console.warn(`[claude-cli-chat] stderr stream error:`, err));
 
     this.child.on("error", err => {
@@ -246,7 +280,7 @@ export class TabSession {
 
   private handleEvent(event: StreamEvent) {
     /* eslint-disable no-console */
-    console.log(`[claude-cli-chat] event type=${event.type}`, event);
+    console.log(`[claude-cli-chat] event type=${event.type}`, previewEvent(event));
     if (event.type === "system" && (event as { subtype?: string }).subtype === "init") {
       const init = event as { session_id?: string };
       if (init.session_id) this.sessionId = init.session_id;

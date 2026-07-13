@@ -1,6 +1,7 @@
 import { FileSystemAdapter, type App } from "obsidian";
 import { mkdirSync, renameSync, writeFileSync } from "fs";
-import type { ChatMessage, TabState, ToolCall } from "../view/state";
+import type { Attachment, ChatMessage, TabState, ToolCall } from "../view/state";
+import { truncateToolResult } from "../view/state";
 import { writeJsonAtomic } from "../mcp/MCPConfig";
 
 /* Persisted shape of a tab. Excludes runtime-only state (pendingApprovals,
@@ -29,6 +30,22 @@ type StoredTab = {
   stickyPinnedFilePaths?: string[];
 };
 
+/* Lightweight stand-in for a sent attachment — filename/kind/mediaType only,
+   never the base64 image/PDF payload or raw text content. Persisting the
+   full payload would re-introduce exactly the kind of unbounded per-message
+   growth this review is trying to eliminate elsewhere (a chat full of
+   pasted screenshots would balloon the tab's JSON file). MessageRenderer
+   already has a defensive "data missing" rendering path for attachments
+   (used when a live image attachment fails to carry data) — that same path
+   renders this stripped shape as a plain file/image chip, so the user at
+   least sees "an attachment was here" after a reload instead of it vanishing
+   with no trace. */
+type StoredAttachment = {
+  kind?: Attachment["kind"];
+  mediaType: string;
+  filename?: string;
+};
+
 type StoredMessage = {
   id: string;
   role: ChatMessage["role"];
@@ -39,6 +56,7 @@ type StoredMessage = {
   thinking?: string;
   selectionContext?: ChatMessage["selectionContext"];
   attachedNotePaths?: string[];
+  attachments?: StoredAttachment[];
 };
 
 type TabMeta = {
@@ -238,11 +256,22 @@ export class Persistence {
         role: m.role,
         content: m.content,
         timestamp: m.timestamp,
-        toolCalls: m.toolCalls,
+        /* Cap each tool's result before it hits disk — Claude already
+           received the full output live, so this is a pure storage-bloat
+           concern (see MAX_TOOL_RESULT_CHARS's own comment). A long
+           tool-heavy conversation would otherwise grow its persisted JSON
+           unboundedly and re-rewrite the whole (growing) file on every
+           debounced save. */
+        toolCalls: m.toolCalls?.map(tc => tc.result ? { ...tc, result: truncateToolResult(tc.result) } : tc),
         durationMs: m.durationMs,
         thinking: m.thinking,
         selectionContext: m.selectionContext,
         attachedNotePaths: m.attachedNotePaths,
+        attachments: m.attachments?.map(a => ({
+          kind: a.kind,
+          mediaType: a.mediaType,
+          filename: a.filename,
+        })),
       })),
       messageCount: state.messages.length,
       model: state.model,

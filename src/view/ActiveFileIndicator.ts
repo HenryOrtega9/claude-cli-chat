@@ -1,5 +1,6 @@
 import { setIcon, TFile, TFolder, type App, type EventRef } from "obsidian";
 import { VIEW_TYPE_CLAUDE_CHAT } from "./ClaudeChatView";
+import { isExtractableOffice, officeIconName } from "../util/officeExtract";
 
 /* Renders a row of file pills above the input box. The currently-active
    Obsidian file always shows; previously-pinned files persist as pills
@@ -292,11 +293,18 @@ export class ActiveFileIndicator {
     const iconEl = pill.createSpan({ cls: "claudian-file-pill-icon" });
     /* Vault lookup distinguishes folder pins from file pins. Folders get the
        folder icon + a `.is-folder` class that styles them in Claude blue
-       instead of the brand orange. */
+       instead of the brand orange. Office binaries (.docx/.xlsx/.pptx) get
+       their own `.is-office` color + a type-specific icon so they stand
+       out from a plain .md pin — they go through a separate, lossier
+       text-extraction path (see officeExtract.ts) that's worth flagging
+       visually. */
     const node = this.app.vault.getAbstractFileByPath(path);
     if (node instanceof TFolder) {
       pill.addClass("is-folder");
       setIcon(iconEl, "folder");
+    } else if (isExtractableOffice(path)) {
+      pill.addClass("is-office");
+      setIcon(iconEl, officeIconName(path));
     } else {
       const ext = path.split(".").pop() ?? "";
       setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
@@ -323,7 +331,8 @@ export class ActiveFileIndicator {
       + (sticky ? " is-sticky" : "")
       + (isActive ? " is-active-file" : "")
       + (fading ? " is-fading-pin" : "")
-      + (isFolder ? " is-folder" : "");
+      + (isFolder ? " is-folder" : "")
+      + (!isFolder && isExtractableOffice(path) ? " is-office" : "");
     /* Tooltip surfaces the next click's behavior since shift-click is a
        hidden interaction without a keyboard hint. Three states match the
        three branches in handlePillClick: unpinned, pinned-one-shot,

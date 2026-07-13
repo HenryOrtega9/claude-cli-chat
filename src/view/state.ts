@@ -47,6 +47,23 @@ export type NestedSubagentEvent =
    prepends a "+N earlier events" placeholder once this cap kicks in. */
 export const NESTED_EVENTS_CAP = 200;
 
+/* Upper bound applied to ToolCall.result for persistence and DOM
+   rendering ONLY — never at the point tool.result is first set from the
+   live event stream, since Claude already received the full, untruncated
+   result in that turn (this is a local storage/UI concern, not something
+   that reaches the model). Without a cap, a Bash `cat` of a large file or
+   a broad Grep match dumps an unbounded string straight into both the
+   persisted tab JSON (rewritten in full on every debounced save) and a
+   single unvirtualized DOM text node — mirrors the cap already applied to
+   nestedEvents above and to DiffRenderer/previewInput's preview text. */
+export const MAX_TOOL_RESULT_CHARS = 20_000;
+
+export function truncateToolResult(result: string): string {
+  if (result.length <= MAX_TOOL_RESULT_CHARS) return result;
+  const omitted = result.length - MAX_TOOL_RESULT_CHARS;
+  return `${result.slice(0, MAX_TOOL_RESULT_CHARS)}\n\n[... truncated, ${omitted} more characters omitted. Claude already received the full output.]`;
+}
+
 /* Attachments cover three shapes the composer can ship with a turn. Older
    persisted tabs lack `kind` entirely — treat missing kind as "image" so
    loading still works.

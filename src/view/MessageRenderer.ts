@@ -1,6 +1,8 @@
 import { App, Component, MarkdownRenderer, Notice, setIcon, TFolder } from "obsidian";
 import type { Attachment, ChatMessage, NestedSubagentEvent, ToolCall } from "./state";
+import { truncateToolResult } from "./state";
 import { editOpsFromInput, renderDiff, renderWritePreview } from "./DiffRenderer";
+import { isExtractableOffice, officeIconName } from "../util/officeExtract";
 
 export type MessageActionCallbacks = {
   onFork: (messageId: string) => void;
@@ -352,7 +354,7 @@ export class MessageListRenderer {
       const resultEl = contentEl.createDiv({
         cls: tool.isError ? "claudian-tool-result-row claudian-tool-result-error" : "claudian-tool-result-row",
       });
-      resultEl.createSpan({ cls: "claudian-tool-result-text", text: tool.result });
+      resultEl.createSpan({ cls: "claudian-tool-result-text", text: truncateToolResult(tool.result) });
     }
   }
 
@@ -511,6 +513,9 @@ export class MessageListRenderer {
     if (node instanceof TFolder) {
       flag.addClass("is-folder");
       setIcon(iconEl, "folder");
+    } else if (isExtractableOffice(path)) {
+      flag.addClass("is-office");
+      setIcon(iconEl, officeIconName(path));
     } else {
       const ext = path.split(".").pop() ?? "";
       setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");

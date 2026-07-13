@@ -378,6 +378,22 @@ export class TabController {
      a dead tab. */
   private destroyed = false;
   isDestroyed(): boolean { return this.destroyed; }
+
+  /* Sticky-pinned office files (.docx/.xlsx/.pptx) get fully re-extracted
+     and re-inlined into wireText on every submit unless we dedupe: unlike
+     @-ref pins (cheap references the CLI/model already has from turn 1),
+     office content is inlined plugin-side, so re-sending it every turn is
+     pure unbounded context growth. Tracks path -> the vault mtime at the
+     moment we last inlined it; a submit skips re-inlining a sticky office
+     pin whose mtime hasn't changed since. Cleared whenever a session spawns
+     without a `--resume` (a genuinely fresh CLI context that has never seen
+     this file), so it never causes an under-send. */
+  private sentOfficePaths = new Map<string, number>();
+
+  private officeFileMtime(path: string): number | undefined {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    return file instanceof TFile ? file.stat.mtime : undefined;
+  }
   async destroy(): Promise<void> {
     this.destroyed = true;
     /* Unregister BEFORE disposing so the manager's onExit callback doesn't
@@ -428,6 +444,16 @@ export class TabController {
         this.inputBox.setBusy(false);
         this.statusIndicator.hide();
         this.approvalArea.dismissAll();
+        /* dismissAll only removes the card from the DOM. Every OTHER abort
+           path (cancel/restart/clear/destroy) also clears the underlying
+           map; "switch" doesn't get that for free from teardownSession
+           (its reason gate deliberately excludes "switch" — see the reason
+           list a few methods down), so without this the entry lingers in
+           state.pendingApprovals forever. hasPendingApprovals() (which
+           drives the tab bar's "needs approval" badge) would then report a
+           phantom pending approval indefinitely, since the card that would
+           let the user act on it is already gone. */
+        this.state.pendingApprovals.clear();
         StateEmitter.setState("ready");
       }
     } else {
@@ -544,10 +570,11 @@ export class TabController {
      servers). Pin changes call this from the indicator callback directly.
 
      Tool lists come from the most recent init event's tool catalog,
-     stashed on state.mcpToolsByServer. Until the first init arrives
-     (brand-new tab, no messages yet), tools arrays are empty and the
-     pill shows server count without tool count. After init the pill
-     gains "(N tools)".
+     stashed on state.mcpToolsByServer. Until this tab's first init
+     arrives (brand-new tab, post-/clear before the next spawn), the
+     plugin-level mcpToolCache — last-known lists from any prior init,
+     persisted across reloads — fills in so the pill shows "(N tools)"
+     from the start instead of a bare server count.
 
      Errors swallowed because this is a UI hint, not load-bearing — the
      chat works regardless of whether the pill is accurate. */
@@ -557,25 +584,41 @@ export class TabController {
     try {
       const disabled = new Set(await new MCPConfigStore(this.app).getDisabledServerNames());
       const toolMap = this.state.mcpToolsByServer ?? {};
+      const cachedMap = this.plugin.settings.mcpToolCache;
       /* Authoritative server set from the CLI (cached). Tool counts come from
-         this tab's init event, keyed by the sanitized server name. A disabled
-         server is denied at spawn, so its tools never arrive — show it with an
-         empty list regardless. */
+         this tab's init event, falling back to the persisted cache, keyed by
+         the sanitized server name. A disabled server is denied at spawn, so
+         its tools never arrive — show it with an empty list regardless. */
       const list = await this.plugin.getMcpServers().catch(() => []);
       if (list.length > 0) {
         mcpServers = list.map(s => {
           const enabled = !disabled.has(s.name);
+          const sid = sanitizeMcpServerName(s.name);
           return {
             name: s.name,
             enabled,
-            tools: enabled ? (toolMap[sanitizeMcpServerName(s.name)] ?? []) : [],
+            tools: enabled ? (toolMap[sid] ?? cachedMap[sid] ?? []) : [],
           };
         });
+        /* This list is authoritative and non-empty — positive confirmation
+           of which servers currently exist. Prune the persisted cache of
+           anything else, so a server removed outside the plugin doesn't
+           leave a stale entry that could resurface on a future transient
+           list failure (see pruneMcpToolCache's own comment). */
+        void this.plugin.pruneMcpToolCache(new Set(list.map(s => sanitizeMcpServerName(s.name))));
       } else {
         /* No list yet (CLI slow/unavailable). Fall back to whatever the
-           runtime announced: enabled servers from the init tool map, plus the
+           runtime announced (this tab's init tool map), topped up with the
+           persisted cache for servers no init has reported yet, plus the
            disabled names so they stay visible and re-enableable. */
-        const fromRuntime = Object.keys(toolMap).map(sid => ({ name: sid, enabled: true, tools: toolMap[sid] }));
+        const runtimeAndCached = { ...cachedMap, ...toolMap };
+        /* disabled holds display names; the map keys are sanitized ids.
+           Compare in sanitized space so a cached entry for a now-disabled
+           server doesn't resurface as enabled. */
+        const disabledSids = new Set(Array.from(disabled).map(sanitizeMcpServerName));
+        const fromRuntime = Object.keys(runtimeAndCached)
+          .filter(sid => !disabledSids.has(sid))
+          .map(sid => ({ name: sid, enabled: true, tools: runtimeAndCached[sid] }));
         const fromDisabled = Array.from(disabled).map(name => ({ name, enabled: false, tools: [] as string[] }));
         mcpServers = [...fromRuntime, ...fromDisabled];
       }
@@ -585,30 +628,7 @@ export class TabController {
     this.inputBox.setCostSurface({
       pinCount,
       mcpServers,
-      onMcpToggle: (name, enabled) => void this.setMcpEnabled(name, enabled),
     });
-  }
-
-  /* Toggle a server's per-vault enabled state and refresh the pill. Disabling
-     records the server name so the next spawn passes an `mcp__<server>` deny
-     rule (scoped to this plugin's subprocesses — other Claude Code instances
-     are untouched). The change lands on the next subprocess respawn (/clear
-     or new tab); we surface that via a Notice and refresh the cached deny
-     patterns so the next spawn reads the new value. */
-  public async setMcpEnabled(name: string, enabled: boolean): Promise<void> {
-    try {
-      const changed = await new MCPConfigStore(this.app).setServerDisabled(name, !enabled);
-      if (changed) {
-        await this.plugin.refreshMcpDenyPatterns();
-        new Notice(
-          `${enabled ? "Enabled" : "Disabled"} MCP server "${name}" for this vault. Restart this chat (/clear) for the change to take effect.`,
-          6000
-        );
-      }
-    } catch (err) {
-      new Notice(`Failed to ${enabled ? "enable" : "disable"} MCP server: ${(err as Error).message}`, 6000);
-    }
-    void this.refreshCostSurface();
   }
 
   private startRemoteMode() {
@@ -982,6 +1002,12 @@ export class TabController {
        start a fresh session instead — context is lost, which is the accepted
        incognito trade-off, rather than attempting a doomed resume. */
     const resumeId = this.state.incognito ? undefined : (this.state.sessionId ?? undefined);
+    /* No resumeId means the CLI starts with a genuinely blank transcript —
+       any sticky office file we'd previously deduped against is no longer
+       actually in its context, so the dedup tracker must reset or the next
+       submit would wrongly skip re-sending it. A resumed session keeps the
+       tracker as-is since the CLI's own transcript still has that content. */
+    if (resumeId === undefined) this.sentOfficePaths.clear();
     const opts = spawnOptionsFromSettings(this.plugin.settings, cwd, resumeId, {
       model: resolveModelId(modelKey),
       effort: effortKey,
@@ -1156,13 +1182,34 @@ export class TabController {
       wireText = `${pinnedRefs} ${wireText}`;
     }
 
+    const stickySet = new Set(this.activeFileIndicator.getStickyPaths());
     const officeInlines: string[] = [];
     for (const p of officePaths) {
+      /* Sticky office pins persist across turns (unlike one-shot pins,
+         which are always fresh — see the auto-drop below). Skip
+         re-extracting/re-inlining one whose content we already sent this
+         session and whose file hasn't changed since: the model already
+         has it in the conversation history, so resending is pure bloat. */
+      if (stickySet.has(p)) {
+        const mtime = this.officeFileMtime(p);
+        if (mtime !== undefined && this.sentOfficePaths.get(p) === mtime) continue;
+      }
       try {
         const extracted = await extractOfficeText(this.app, p);
         officeInlines.push(`<file path="${p}">\n${extracted}\n</file>`);
+        if (stickySet.has(p)) {
+          const mtime = this.officeFileMtime(p);
+          if (mtime !== undefined) this.sentOfficePaths.set(p, mtime);
+        }
       } catch (err) {
-        new Notice(`Couldn't extract text from ${p}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        new Notice(`Couldn't extract text from ${p}: ${message}`);
+        /* Extraction failing must not silently drop the file from what
+           Claude sees — the user still pinned it and expects it in
+           context. Note the path and failure inline instead of an @-ref:
+           the Read tool rejects these binary extensions outright, so an
+           @-ref would just trade this error for a tool_use_error. */
+        officeInlines.push(`<file path="${p}">\n[Text extraction failed: ${message}]\n</file>`);
       }
     }
     if (officeInlines.length > 0) {
@@ -1219,14 +1266,27 @@ export class TabController {
     this.passStartedAt = Date.now();
     this.onStateChangeCb();
 
-    /* Auto-drop non-sticky pins. The file contents are already inlined
-       into THIS turn's wireText (built above), and once the API request
+    /* Auto-drop non-sticky pins THAT WERE PART OF THIS TURN. The file
+       contents are already inlined into THIS turn's wireText (built
+       above from the `pinnedPaths` snapshot), and once the API request
        lands they live forever in the conversation history. Re-shipping
        them on every follow-up turn is the cost we're trying to avoid.
-       Sticky pins survive; non-sticky pins fall off the pill bar.
-       setPinnedPaths is a no-op when sticky == pinned (nothing to drop). */
-    const stickyOnly = this.activeFileIndicator.getStickyPaths();
-    this.activeFileIndicator.setPinnedPaths(stickyOnly);
+       Sticky pins survive; non-sticky pins that were snapshotted fall off
+       the pill bar.
+
+       Between that snapshot and here, submit() awaited office extraction
+       and the message render — real yield points during which the user
+       can click a new pin. Dropping against the LIVE pinned set (as
+       opposed to the snapshot) would silently discard that pin: it was
+       never in wireText (built before the click), and this call would
+       then also strip it from the pill bar, losing it entirely with no
+       error. Instead, keep anything sticky OR not part of this turn's
+       sent snapshot, so a mid-submit pin survives to be sent next turn. */
+    const sentSnapshot = new Set(pinnedPaths);
+    const stickyPaths = new Set(this.activeFileIndicator.getStickyPaths());
+    const survivors = this.activeFileIndicator.getPinnedPaths()
+      .filter(p => stickyPaths.has(p) || !sentSnapshot.has(p));
+    this.activeFileIndicator.setPinnedPaths(survivors);
 
     /* Parallel-fire title generation: kick off the Haiku subprocess the
        moment we have the user's message, so it runs concurrently with the
@@ -1316,13 +1376,28 @@ export class TabController {
     const finalText = textInlines.length > 0
       ? `${textInlines.join("\n\n")}\n\n${wireText}`
       : wireText;
-    if (mediaBlocks.length === 0) {
-      session.sendUserText(finalText);
-      return;
+    /* sendUserText/sendUserContent throw synchronously when the child's
+       stdin has already been destroyed (e.g. a spawn failure whose ENOENT
+       'error' event landed during the ensureSession() await above, before
+       stdin.writable flips false). Every caller of submit() fires it as
+       `void this.submit(...)` with no .catch, so an uncaught throw here
+       becomes an unhandled rejection that aborts the function with busy
+       already (re)asserted true above — the composer stays disabled
+       forever with no error shown; Esc is the only way out. Route through
+       handleError so this degrades exactly like a mid-stream CLI error:
+       error bubble, busy cleared, status hidden, trackers reconciled. */
+    try {
+      if (mediaBlocks.length === 0) {
+        session.sendUserText(finalText);
+        return;
+      }
+      const blocks: ContentBlock[] = [...mediaBlocks];
+      if (finalText) blocks.push({ type: "text", text: finalText });
+      session.sendUserContent(blocks);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.handleError({ type: "error", message: `Failed to send message: ${message}` });
     }
-    const blocks: ContentBlock[] = [...mediaBlocks];
-    if (finalText) blocks.push({ type: "text", text: finalText });
-    session.sendUserContent(blocks);
   }
 
   private async onEvent(event: StreamEvent) {
@@ -1352,21 +1427,47 @@ export class TabController {
           if (init.slash_commands) this.state.availableSlashCommands = init.slash_commands;
           if (init.skills) this.state.availableSkills = init.skills;
           /* Group MCP-namespaced tools by server. The CLI names every MCP
-             tool as `mcp__<server>__<tool>` (double-underscore separator),
-             so parsing is mechanical. Other tools (Read, Bash, Edit, etc.)
-             are non-MCP and skipped. Result feeds the cost-surface pill
-             and its hover popup. */
+             tool as `mcp__<server>__<tool>` (double-underscore separator).
+             Other tools (Read, Bash, Edit, etc.) are non-MCP and skipped.
+             Result feeds the cost-surface pill and its hover popup. */
           if (Array.isArray(init.tools)) {
             const grouped: Record<string, string[]> = {};
+            /* A fixed-position split("__") only works if the sanitized
+               server name itself never contains "__" — but
+               sanitizeMcpServerName replaces each disallowed character
+               independently, so a display name with two adjacent special
+               characters (e.g. "My  Server" or "Foo & Bar") sanitizes to
+               something like "My__Server", which then mis-splits into the
+               wrong server key and a corrupted tool name. Match against
+               the known sanitized server-name set instead (longest first,
+               in case one is itself a prefix of another), falling back to
+               the old positional split only for a server this list
+               doesn't (yet) know about. */
+            const knownSids = (await this.plugin.getMcpServers().catch(() => []))
+              .map(s => sanitizeMcpServerName(s.name))
+              .sort((a, b) => b.length - a.length);
             for (const tool of init.tools) {
               if (!tool.startsWith("mcp__")) continue;
-              const parts = tool.split("__");
-              if (parts.length < 3) continue;
-              const server = parts[1];
-              const toolName = parts.slice(2).join("__");
+              const rest = tool.slice("mcp__".length);
+              const matchedSid = knownSids.find(sid => rest.startsWith(`${sid}__`));
+              let server: string;
+              let toolName: string;
+              if (matchedSid) {
+                server = matchedSid;
+                toolName = rest.slice(matchedSid.length + 2);
+              } else {
+                const parts = tool.split("__");
+                if (parts.length < 3) continue;
+                server = parts[1];
+                toolName = parts.slice(2).join("__");
+              }
               (grouped[server] ??= []).push(toolName);
             }
             this.state.mcpToolsByServer = grouped;
+            /* Write through to the plugin-level cache so future sessions
+               (new tab, post-/clear, plugin reload) can show tool counts
+               in the pill before their own init arrives. */
+            void this.plugin.updateMcpToolCache(grouped);
             /* Init carries the full tool list, so this is the canonical
                moment to refresh the pill with real tool counts. */
             void this.refreshCostSurface();
@@ -2497,6 +2598,16 @@ export class TabController {
      Skills get a sparkles icon, CLI commands a terminal icon. Plugin commands
      and CLI built-ins de-dup against the dynamic lists by name. */
   private querySlashCommands(query: string): Suggestion[] {
+    /* Refresh once per popup open (query === "" is the first keystroke —
+       just "/" typed, nothing narrowing it yet), not on every subsequent
+       character: skillCatalog is otherwise populated once at plugin load
+       and never re-scanned (main.ts's refreshSkillCatalog has no other
+       call site), so a skill/command added or edited on disk after Obsidian
+       started would show a stale or generic-placeholder description for the
+       rest of the session. Cheap enough here since it only fires when the
+       popup transitions from closed to open, unlike re-scanning on every
+       keystroke while the user narrows the query. */
+    if (query === "") this.plugin.refreshSkillCatalog();
     type Cmd = { cmd: string; desc: string; insert?: string; icon: string };
     const pluginCmds: Cmd[] = [
       { cmd: "/clear", desc: "Reset this tab — start a fresh Claude session", icon: "rotate-ccw" },

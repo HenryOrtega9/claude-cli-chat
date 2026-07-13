@@ -23,6 +23,11 @@
      share the same value. */
   --claudian-blue: #5b8def;
   --claudian-blue-rgb: 91, 141, 239;
+  /* Office-binary accent (.docx/.xlsx/.pptx pills/flags) — a third hue so
+     these read as distinct from both plain-file orange and folder blue,
+     since they go through a separate (lossier) text-extraction path. */
+  --claudian-purple: #a78bfa;
+  --claudian-purple-rgb: 167, 139, 250;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -666,6 +671,29 @@ mark.claudian-search-mark.is-active {
   border-color: var(--claudian-blue);
 }
 
+/* Office-binary pins (.docx/.xlsx/.pptx) — recolored in a third hue so they
+   stand out from both plain-file orange and folder blue. Mirrors the
+   .is-folder block above; only the color token changes. */
+.claudian-file-pill.is-office {
+  background: rgba(var(--claudian-purple-rgb), 0.12);
+  border-color: rgba(var(--claudian-purple-rgb), 0.4);
+  color: var(--claudian-purple);
+}
+.claudian-file-pill.is-office:hover {
+  background: rgba(var(--claudian-purple-rgb), 0.18);
+}
+.claudian-file-pill.is-office.is-pinned {
+  background: rgba(var(--claudian-purple-rgb), 0.18);
+  border-color: rgba(var(--claudian-purple-rgb), 0.5);
+  color: var(--claudian-purple);
+}
+.claudian-file-pill.is-office.is-pinned:hover {
+  background: rgba(var(--claudian-purple-rgb), 0.28);
+}
+.claudian-file-pill.is-office.is-pinned.is-sticky {
+  border-color: var(--claudian-purple);
+}
+
 /* ---- Per-message action toolbar -------------------------- */
 .claudian-message {
   position: relative;
@@ -881,6 +909,14 @@ mark.claudian-search-mark.is-active {
   border-color: rgba(var(--claudian-blue-rgb), 0.34);
   cursor: default;
 }
+.claudian-attached-note-flag.is-office {
+  background: rgba(var(--claudian-purple-rgb), 0.14);
+  border-color: rgba(var(--claudian-purple-rgb), 0.34);
+}
+.claudian-attached-note-flag.is-office:hover {
+  background: rgba(var(--claudian-purple-rgb), 0.22);
+  border-color: rgba(var(--claudian-purple-rgb), 0.5);
+}
 .claudian-attached-note-flag-icon {
   display: inline-flex;
   align-items: center;
@@ -901,6 +937,9 @@ mark.claudian-search-mark.is-active {
 }
 .claudian-attached-note-flag.is-folder .claudian-attached-note-flag-icon {
   color: var(--claudian-blue);
+}
+.claudian-attached-note-flag.is-office .claudian-attached-note-flag-icon {
+  color: var(--claudian-purple);
 }
 .claudian-attached-note-flag-text {
   overflow: hidden;

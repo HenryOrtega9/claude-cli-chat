@@ -1,5 +1,5 @@
 import { Modal, Notice, type App } from "obsidian";
-import { MCPConfigStore } from "../mcp/MCPConfig";
+import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
 import type { ParsedMcpServer } from "../mcp/McpServerList";
 import type ClaudeChatPlugin from "../main";
 
@@ -26,6 +26,13 @@ export class MCPManagerModal extends Modal {
   private servers: ParsedMcpServer[] | null = null;
   private listError: string | null = null;
   private disabled = new Set<string>();
+  /* sanitizeMcpServerName() is many-to-one (e.g. "Foo Bar" and "Foo.Bar"
+     both -> "Foo_Bar"), and the deny rule passed at spawn is built purely
+     from that sanitized id (mcp__<sanitized>). Two colliding server names
+     can't be fully disambiguated from inside this plugin — the CLI's own
+     tool ids use the identical sanitize scheme — so this only detects and
+     warns rather than attempting a fix. Set on every refresh(). */
+  private collidingNames: string[] | null = null;
   /* Fires once from onClose. ClaudeChatView uses it to refresh the active
      tab's cost-surface pill in case toggles changed the enabled set. */
   private onClosed: (() => void) | null = null;
@@ -68,6 +75,7 @@ export class MCPManagerModal extends Modal {
       if (this.closed) return;
       this.servers = servers;
       this.disabled = new Set(disabledNames);
+      this.collidingNames = this.detectCollisions(servers);
     } catch (err) {
       if (this.closed) return;
       this.listError = (err as Error).message || String(err);
@@ -76,6 +84,18 @@ export class MCPManagerModal extends Modal {
       this.loading = false;
       if (!this.closed) this.render();
     }
+  }
+
+  /* Returns the subset of display names whose sanitized id collides with
+     at least one other server's. Empty when there's nothing to warn about
+     (the overwhelmingly common case). */
+  private detectCollisions(servers: ParsedMcpServer[]): string[] {
+    const bySid = new Map<string, string[]>();
+    for (const s of servers) {
+      const sid = sanitizeMcpServerName(s.name);
+      (bySid.get(sid) ?? bySid.set(sid, []).get(sid)!).push(s.name);
+    }
+    return [...bySid.values()].filter(names => names.length > 1).flat();
   }
 
   private render() {
@@ -113,6 +133,15 @@ export class MCPManagerModal extends Modal {
       contentEl.createDiv({
         cls: "claudian-mcp-empty",
         text: `Could not list servers: ${this.listError}`,
+      });
+    }
+
+    if (this.collidingNames && this.collidingNames.length > 0) {
+      contentEl.createDiv({
+        cls: "claudian-mcp-empty",
+        text:
+          `These server names collide once sanitized for tool ids, so toggling one may also affect the other: `
+          + `${this.collidingNames.join(", ")}. Rename one in your Claude Code MCP config (claude mcp) to tell them apart.`,
       });
     }
 

@@ -60,18 +60,20 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
 
 /* Availability caveats surfaced under the model name in the picker popup
    and appended to the settings dropdown. fable-5 was relaunched 2026-07-01
-   with plan-included access (up to 50% of weekly limits) through
-   2026-07-12 11:59:59 PM PT — extended from the original Jul 7 cutoff —
-   per Anthropic's redeployment announcement. From Jul 13 it bills through
-   usage credits at standard API rates ($10/$50 per MTok), NOT the
-   subscription caps. If Anthropic pulls it entirely, delete the "fable-5"
+   with plan-included access (up to 50% of weekly limits), extended twice:
+   original Jul 7 cutoff → Jul 12 → now through 2026-07-19 per the /status
+   announcement (which also keeps Claude Code's weekly rate limits 50%
+   higher through Jul 19). After the cutoff it bills through usage credits
+   at standard API rates ($10/$50 per MTok), NOT the subscription caps.
+   Details: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+   If Anthropic pulls it entirely, delete the "fable-5"
    entries here and in MODEL_IDS/MODEL_LABELS/MODEL_GROUPS — the
    defaultModel guard in main.ts and the per-tab ModelKey guard in
    TabController fall back gracefully for anyone who had it persisted.
    1M context and xhigh effort are confirmed supported, so it carries the
    `[1m]` suffix and the full effort ladder like the Opus 1M variants. */
 export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
-  "fable-5": "After Jul 12, 2026, billed via usage credits at API rates, not plan limits.",
+  "fable-5": "After Jul 19, 2026, billed via usage credits at API rates, not plan limits.",
 };
 
 /* Ordered sections for the model-picker popup; each renders under its own
@@ -209,6 +211,13 @@ export type ClaudeChatSettings = {
      plugin is silent until hardware is on the network. */
   tc001Enabled: boolean;
   tc001Ip: string;
+  /* Last-known MCP tool list per server, keyed by the sanitized server name
+     the CLI uses in `mcp__<server>__<tool>` ids. Written on every init event;
+     read as a fallback by the cost-surface pill so tool counts show before
+     the first message of a session (new tab, after /clear, plugin reload).
+     Not user-editable — a display cache that lives in data.json alongside
+     the settings for lack of a better home. */
+  mcpToolCache: Record<string, string[]>;
 };
 
 export const DEFAULT_SETTINGS: ClaudeChatSettings = {
@@ -226,6 +235,7 @@ export const DEFAULT_SETTINGS: ClaudeChatSettings = {
   trustedFoldersInSystemPrompt: true,
   tc001Enabled: false,
   tc001Ip: "192.168.1.50",
+  mcpToolCache: {},
 };
 
 /* Build the allowlist patterns that grant Read/Glob/Grep access to anything

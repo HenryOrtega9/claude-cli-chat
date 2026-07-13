@@ -234,10 +234,10 @@ export type InputBoxCallbacks = {
 
 /* Payload TabController hands to InputBox.setCostSurface() to populate the
    cost-surface pill and its hover popup. mcpServers lists every server
-   configured in mcp.json (enabled or disabled); tools is the live tool
-   list announced by the most recent init event (empty until the first
-   turn). onMcpToggle, when provided, lets the popup wire its checkboxes
-   to TabController.setMcpEnabled. */
+   configured in mcp.json (enabled or disabled) — the popup renders only
+   the enabled ones; tools is the live tool list announced by the most
+   recent init event (empty until the first turn). Enable/disable lives
+   in the MCP servers settings modal, not here. */
 export type CostSurfacePayload = {
   pinCount: number;
   mcpServers: Array<{
@@ -245,7 +245,6 @@ export type CostSurfacePayload = {
     enabled: boolean;
     tools: string[];
   }>;
-  onMcpToggle?: (name: string, enabled: boolean) => void;
 };
 
 /* Map a raw Anthropic model id ("claude-opus-4-7", "claude-sonnet-4-6",
@@ -890,45 +889,35 @@ export class InputBox {
     });
     header.createDiv({
       cls: "claudian-cost-popup-subtitle",
-      text: "Every turn ships these tool definitions. Toggle to disable.",
+      text: "Every turn ships these tool definitions.",
     });
 
-    if (payload.mcpServers.length === 0) {
+    if (enabledServers.length === 0) {
       this.costPopup.createDiv({
         cls: "claudian-cost-popup-empty",
-        text: "No MCP servers configured.",
+        text: "No MCP servers enabled.",
       });
       return;
     }
 
-    /* One card per server, enabled or disabled. Disabled servers render
-       muted with the checkbox unchecked; clicking the checkbox toggles
-       state via the payload-supplied callback. */
+    /* One card per enabled server. Disabled servers are omitted here;
+       enable/disable lives in the MCP servers settings modal. */
     const list = this.costPopup.createDiv({ cls: "claudian-cost-popup-server-list" });
-    for (const server of payload.mcpServers) {
-      const card = list.createDiv({
-        cls: "claudian-cost-popup-server" + (server.enabled ? "" : " is-disabled"),
-      });
+    for (const server of enabledServers) {
+      const card = list.createDiv({ cls: "claudian-cost-popup-server" });
       const head = card.createDiv({ cls: "claudian-cost-popup-server-head" });
-      /* Native checkbox — accessible by default, works with shift+click
-         and keyboard, no need to reinvent. Wired to onMcpToggle. */
-      const checkbox = head.createEl("input", { attr: { type: "checkbox" } });
-      checkbox.checked = server.enabled;
-      checkbox.addEventListener("change", () => {
-        payload.onMcpToggle?.(server.name, checkbox.checked);
-      });
       head.createSpan({ cls: "claudian-cost-popup-server-name", text: server.name });
-      const toolLabel = server.enabled
-        ? `${server.tools.length} tool${server.tools.length === 1 ? "" : "s"}`
-        : "disabled";
-      head.createSpan({ cls: "claudian-cost-popup-server-count", text: toolLabel });
+      head.createSpan({
+        cls: "claudian-cost-popup-server-count",
+        text: `${server.tools.length} tool${server.tools.length === 1 ? "" : "s"}`,
+      });
 
       if (server.tools.length > 0) {
         const toolList = card.createDiv({ cls: "claudian-cost-popup-tool-list" });
         for (const tool of server.tools) {
           toolList.createDiv({ cls: "claudian-cost-popup-tool", text: tool });
         }
-      } else if (server.enabled) {
+      } else {
         /* Enabled but no tools yet means the init event hasn't landed
            (brand-new tab, no first message). Surface this so the user
            doesn't think the server is broken. */
@@ -941,7 +930,7 @@ export class InputBox {
 
     this.costPopup.createDiv({
       cls: "claudian-cost-popup-footer",
-      text: "Restart chat (/clear) to apply toggles.",
+      text: "Manage servers in Settings → MCP servers.",
     });
   }
 

@@ -15,6 +15,26 @@ const EXTRACTABLE_EXTENSIONS: ReadonlySet<string> = new Set([
   "pptx", "docx", "xlsx",
 ]);
 
+/* Mirrors InputBox.ts's MAX_ATTACHMENT_BYTES for the other three attachment
+   kinds (image/PDF/text) — office pins had no size guard at all, so a huge
+   file would be read and fully parsed with no bound. */
+const MAX_SOURCE_BYTES = 10 * 1024 * 1024;
+
+/* Extracted TEXT can be much larger than the source's compressed zip bytes
+   (verbose OOXML decompresses into a lot of plain text), so the source-byte
+   cap above doesn't bound what actually lands in the wire message. This
+   caps the inlined text itself — the lever that actually controls context
+   growth — independent of source file size. ~100k chars is generous enough
+   for a real document/spreadsheet while keeping a single pinned file from
+   dominating a turn's context budget. */
+const MAX_EXTRACTED_CHARS = 100_000;
+
+function truncateExtracted(text: string): string {
+  if (text.length <= MAX_EXTRACTED_CHARS) return text;
+  const omitted = text.length - MAX_EXTRACTED_CHARS;
+  return `${text.slice(0, MAX_EXTRACTED_CHARS)}\n\n[... truncated, ${omitted} more characters omitted]`;
+}
+
 function getExtension(path: string): string {
   const dot = path.lastIndexOf(".");
   if (dot < 0) return "";
@@ -25,10 +45,24 @@ export function isExtractableOffice(path: string): boolean {
   return EXTRACTABLE_EXTENSIONS.has(getExtension(path));
 }
 
+/* Lucide icon name for an office file's pill/flag, keyed by extension so
+   .docx/.xlsx/.pptx read as distinct document types at a glance rather
+   than sharing the generic file-text icon everything else falls back to. */
+export function officeIconName(path: string): string {
+  const ext = getExtension(path);
+  if (ext === "xlsx") return "file-spreadsheet";
+  if (ext === "pptx") return "presentation";
+  return "file-text";
+}
+
 /* Read a vault file as raw bytes. Pinned paths come from the vault, so this
    works for any file the user can pin via the pill bar. */
 async function readVaultBinary(app: App, path: string): Promise<ArrayBuffer> {
-  return app.vault.adapter.readBinary(path);
+  const buffer = await app.vault.adapter.readBinary(path);
+  if (buffer.byteLength > MAX_SOURCE_BYTES) {
+    throw new Error(`File is too large to extract (max ${MAX_SOURCE_BYTES / (1024 * 1024)}MB)`);
+  }
+  return buffer;
 }
 
 /* .pptx is a zip with slide XML at ppt/slides/slideN.xml. Each slide's
@@ -74,8 +108,15 @@ async function extractDocxText(buffer: ArrayBuffer): Promise<string> {
   /* mammoth's extractRawText preserves paragraph breaks as \n\n and ignores
      styling — good enough for an LLM to read. convertToMarkdown is heavier
      and adds noise mammoth can't always get right (e.g. mis-quoted list
-     markers). Raw text is the safer default. */
-  const result = await mammoth.extractRawText({ arrayBuffer: buffer });
+     markers). Raw text is the safer default.
+
+     esbuild bundles this plugin with platform: "node", so it resolves
+     mammoth's Node entrypoint (lib/unzip.js), which only recognizes
+     options.path/buffer/file — NOT options.arrayBuffer (that key only
+     exists on mammoth's browser/unzip.js build, which esbuild never
+     selects here). Passing arrayBuffer against the Node build silently
+     falls through to "Could not find file in options" for every .docx. */
+  const result = await mammoth.extractRawText({ buffer: Buffer.from(buffer) });
   return result.value.trimEnd();
 }
 
@@ -131,10 +172,18 @@ async function extractXlsxText(buffer: ArrayBuffer): Promise<string> {
     const siRe = /<si\b(?:[^>]*[^/>])?>([\s\S]*?)<\/si>|<si\b[^>]*\/>/g;
     let m: RegExpExecArray | null;
     while ((m = siRe.exec(xml)) !== null) {
+      /* CJK entries can carry a phonetic-guide annotation as a nested
+         <rPh sb="0" eb="2"><t>かんじ</t></rPh> inside the <si>, alongside
+         the real text's own <t>. rPh's <t> is legitimate OOXML but is a
+         reading hint, not part of the cell's actual text — strip the whole
+         <rPh>...</rPh> block before scanning for <t> runs, or its nested
+         <t> gets concatenated onto the real string (e.g. "漢字" + "かんじ"
+         -> "漢字かんじ") and corrupts every cell referencing it. */
+      const siContent = (m[1] ?? "").replace(/<rPh\b[^>]*>[\s\S]*?<\/rPh>/g, "");
       const tRe = /<t(?:[^>]*[^/>])?>([\s\S]*?)<\/t>/g;
       const parts: string[] = [];
       let t: RegExpExecArray | null;
-      while ((t = tRe.exec(m[1] ?? "")) !== null) parts.push(decodeXmlEntities(t[1]));
+      while ((t = tRe.exec(siContent)) !== null) parts.push(decodeXmlEntities(t[1]));
       sharedStrings.push(parts.join(""));
     }
   }
@@ -232,8 +281,10 @@ async function extractXlsxText(buffer: ArrayBuffer): Promise<string> {
 export async function extractOfficeText(app: App, path: string): Promise<string> {
   const ext = getExtension(path);
   const buffer = await readVaultBinary(app, path);
-  if (ext === "pptx") return extractPptxText(buffer);
-  if (ext === "docx") return extractDocxText(buffer);
-  if (ext === "xlsx") return extractXlsxText(buffer);
-  throw new Error(`No extractor for .${ext}`);
+  let text: string;
+  if (ext === "pptx") text = await extractPptxText(buffer);
+  else if (ext === "docx") text = await extractDocxText(buffer);
+  else if (ext === "xlsx") text = await extractXlsxText(buffer);
+  else throw new Error(`No extractor for .${ext}`);
+  return truncateExtracted(text);
 }
