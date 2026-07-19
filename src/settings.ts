@@ -211,6 +211,14 @@ export type ClaudeChatSettings = {
      plugin is silent until hardware is on the network. */
   tc001Enabled: boolean;
   tc001Ip: string;
+  /* Voice mode: speak assistant responses aloud via macOS `say` child
+     processes (see SpeechController). voiceDefaultOn seeds the per-tab
+     Voice pill for tabs that haven't pinned their own value. voiceName is
+     a plain `say -v` voice name like "Ava (Premium)" ("" = system default
+     voice). */
+  voiceDefaultOn: boolean;
+  voiceName: string;
+  voiceRate: number;
   /* Last-known MCP tool list per server, keyed by the sanitized server name
      the CLI uses in `mcp__<server>__<tool>` ids. Written on every init event;
      read as a fallback by the cost-surface pill so tool counts show before
@@ -235,6 +243,9 @@ export const DEFAULT_SETTINGS: ClaudeChatSettings = {
   trustedFoldersInSystemPrompt: true,
   tc001Enabled: false,
   tc001Ip: "192.168.1.50",
+  voiceDefaultOn: false,
+  voiceName: "",
+  voiceRate: 1,
   mcpToolCache: {},
 };
 
@@ -497,6 +508,8 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
 
     this.renderSubagentsSection(containerEl);
 
+    this.renderVoiceSection(containerEl);
+
     this.renderTC001Section(containerEl);
 
     this.renderProcessCleanupSection(containerEl);
@@ -539,6 +552,72 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
      does NOT emit state, only this plugin does. Toggle is default-off so
      the plugin makes no network calls until the user has hardware on the
      LAN and explicitly opts in. */
+  /* Voice mode: TTS via `say` child processes; see SpeechController. */
+  private renderVoiceSection(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Voice mode" });
+    containerEl.createEl("p", {
+      text: "Speaks Claude's responses aloud through macOS system voices while they stream in. Toggle per tab with the Voice pill in the composer; these settings choose the voice and whether new tabs start with it on. Higher-quality voices can be added in System Settings → Accessibility → Spoken Content → System Voice → Manage Voices.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("New tabs start with voice on")
+      .setDesc("Seeds the per-tab Voice pill. Existing tabs keep their own toggle.")
+      .addToggle(t =>
+        t.setValue(this.plugin.settings.voiceDefaultOn).onChange(async value => {
+          this.plugin.settings.voiceDefaultOn = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Voice")
+      .setDesc("Voice used for speech (downloaded Enhanced/Premium voices appear here after a plugin reload; Siri voices are system-private and unavailable to apps). Default follows the system voice.")
+      .addDropdown(dd => {
+        dd.addOption("", "System default");
+        dd.setValue("");
+        /* The roster comes from `say -v ?` — async, so populate in place
+           once it lands. English voices first, then the rest, both
+           alphabetical: the full list runs past 100 entries. */
+        void this.plugin.speech.listVoices().then(voices => {
+          const sorted = [...voices].sort((a, b) => {
+            const aEn = a.lang.startsWith("en") ? 0 : 1;
+            const bEn = b.lang.startsWith("en") ? 0 : 1;
+            return aEn - bEn || a.name.localeCompare(b.name);
+          });
+          for (const v of sorted) dd.addOption(v.name, `${v.name} (${v.lang})`);
+          /* A saved voice that no longer exists (deleted in System
+             Settings) would leave the select blank — show "System
+             default", which matches what playback actually does. */
+          const saved = this.plugin.settings.voiceName;
+          dd.setValue(voices.some(v => v.name === saved) ? saved : "");
+        });
+        dd.onChange(async value => {
+          this.plugin.settings.voiceName = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Speaking rate")
+      .setDesc("1.0 is normal speed.")
+      .addSlider(s =>
+        s.setLimits(0.5, 2, 0.1)
+          .setValue(this.plugin.settings.voiceRate)
+          .setDynamicTooltip()
+          .onChange(async value => {
+            this.plugin.settings.voiceRate = value;
+            await this.plugin.saveSettings();
+          })
+      )
+      .addButton(b =>
+        b.setButtonText("Test").onClick(() => {
+          this.plugin.speech.stop();
+          this.plugin.speech.speakDocument("Hi, this is the voice Claude will use in your vault.");
+        })
+      );
+  }
+
   private renderTC001Section(containerEl: HTMLElement) {
     containerEl.createEl("h3", { text: "Status display (Ulanzi TC001)" });
     containerEl.createEl("p", {

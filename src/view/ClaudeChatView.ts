@@ -347,6 +347,7 @@ export class ClaudeChatView extends ItemView {
       effort: source.state.effort,
       permissionMode: source.state.permissionMode,
       envSnippetId: source.state.envSnippetId,
+      voiceEnabled: source.state.voiceEnabled,
     };
     this.createTab(forkState);
     /* Be explicit about the semantics: the UI carries history but the new

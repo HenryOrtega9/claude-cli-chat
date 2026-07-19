@@ -671,16 +671,13 @@ mark.claudian-search-mark.is-active {
   border-color: var(--claudian-blue);
 }
 
-/* Office-binary pins (.docx/.xlsx/.pptx) — recolored in a third hue so they
-   stand out from both plain-file orange and folder blue. Mirrors the
-   .is-folder block above; only the color token changes. */
-.claudian-file-pill.is-office {
-  background: rgba(var(--claudian-purple-rgb), 0.12);
-  border-color: rgba(var(--claudian-purple-rgb), 0.4);
-  color: var(--claudian-purple);
-}
+/* Office-binary pins (.docx/.xlsx/.pptx) — unpinned pills use the default
+   grey base so pin state stays legible; hover and pinned states recolor in
+   a third hue (purple) so they stand out from plain-file orange and folder
+   blue. */
 .claudian-file-pill.is-office:hover {
-  background: rgba(var(--claudian-purple-rgb), 0.18);
+  background: rgba(var(--claudian-purple-rgb), 0.14);
+  color: var(--claudian-purple);
 }
 .claudian-file-pill.is-office.is-pinned {
   background: rgba(var(--claudian-purple-rgb), 0.18);
@@ -1761,6 +1758,12 @@ mark.claudian-search-mark.is-active {
 .claudian-input-toolbar-top {
   padding: 8px 8px 4px 8px;
   border-bottom: 1px solid var(--background-modifier-border);
+  /* The voice cluster (pill + transport + speaking bars) made this row
+     overflow at sidebar widths; unwrapped flex responded by crushing the
+     widest pill (Incognito). Wrap to a second line instead — pills below
+     get flex-shrink: 0 so they always render whole. */
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 .claudian-input-toolbar-bottom {
   border-top: 1px solid var(--background-modifier-border);
@@ -1779,6 +1782,13 @@ mark.claudian-search-mark.is-active {
   cursor: pointer;
   user-select: none;
   transition: background 120ms ease;
+}
+/* Top-row pills never crush their labels to absorb overflow — the top
+   toolbar wraps to a second line instead. Scoped to the top row: the
+   bottom row doesn't wrap, so its pills keep default shrink behavior. */
+.claudian-input-toolbar-top .claudian-toolbar-pill {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .claudian-toolbar-pill:hover { background: rgba(var(--claudian-brand-rgb), 0.1); }
 .claudian-toolbar-pill-label {
@@ -2058,6 +2068,82 @@ mark.claudian-search-mark.is-active {
   cursor: default;
   opacity: 0.4;
   pointer-events: none;
+}
+
+/* ---- Voice pill -----------------------------------------------------
+   Binary toggle mirroring the incognito pill's quiet-off / tinted-on
+   pattern, in teal so "Claude will talk" reads at a glance. Never locked —
+   voice can flip mid-stream (off doubles as the mute button). */
+.claudian-voice-pill {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  opacity: 0.7;
+}
+.claudian-voice-pill:hover {
+  background: var(--background-modifier-hover);
+  opacity: 1;
+}
+.claudian-voice-pill .claudian-toolbar-pill-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.claudian-voice-pill .claudian-toolbar-pill-value {
+  color: var(--text-muted);
+  filter: grayscale(1);
+}
+.claudian-voice-pill.is-active {
+  background: rgba(45, 212, 191, 0.18);
+  opacity: 1;
+}
+.claudian-voice-pill.is-active .claudian-toolbar-pill-label { color: #2dd4bf; }
+.claudian-voice-pill.is-active .claudian-toolbar-pill-value { filter: none; }
+
+/* Play/pause transport next to an active voice pill. Icon-only, same pill
+   silhouette, teal-tinted to read as part of the voice cluster. Hidden
+   entirely while voice mode is off. */
+.claudian-voice-pause-btn {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(45, 212, 191, 0.12);
+  display: inline-flex;
+  align-items: center;
+}
+.claudian-voice-pause-btn:hover { background: rgba(45, 212, 191, 0.25); }
+.claudian-voice-pause-btn.is-hidden { display: none; }
+.claudian-voice-pause-btn svg {
+  width: 12px;
+  height: 12px;
+  color: #2dd4bf;
+}
+
+/* Speaking indicator — three teal equalizer bars that bounce while audio
+   plays. Frozen mid-pose (animation paused) while speech is paused, hidden
+   when idle. Height staggering + phase offsets keep it lively at 12px. */
+.claudian-voice-speaking {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 14px;
+  padding: 0 2px;
+}
+.claudian-voice-speaking.is-hidden { display: none; }
+.claudian-voice-speaking-bar {
+  width: 3px;
+  border-radius: 2px;
+  background: #2dd4bf;
+  animation: claudian-voice-eq 0.9s ease-in-out infinite;
+}
+.claudian-voice-speaking-bar:nth-child(1) { height: 6px;  animation-delay: 0s; }
+.claudian-voice-speaking-bar:nth-child(2) { height: 12px; animation-delay: 0.25s; }
+.claudian-voice-speaking-bar:nth-child(3) { height: 8px;  animation-delay: 0.5s; }
+.claudian-voice-speaking.is-paused .claudian-voice-speaking-bar {
+  animation-play-state: paused;
+  opacity: 0.5;
+}
+@keyframes claudian-voice-eq {
+  0%, 100% { transform: scaleY(0.4); }
+  50%      { transform: scaleY(1.1); }
 }
 
 /* Incognito tabs in the tab bar get a violet ring so they're distinguishable

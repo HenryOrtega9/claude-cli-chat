@@ -111,6 +111,10 @@ export class TabController {
   private mentionIndex: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> | null = null;
   private mentionIndexRefs: EventRef[] = [];
 
+  /* Unsubscribe for the SpeechController playback listener that drives the
+     composer's speaking indicator. Torn down in destroy(). */
+  private speechUnsub: (() => void) | null = null;
+
   /* Optional fork handler — provided by ClaudeChatView so the controller can
      ask the view to create a new tab branching from a given message id. */
   onForkRequest?: (sourceTab: TabController, messageId: string) => void;
@@ -225,6 +229,8 @@ export class TabController {
         onEffortChange: effort => this.handleEffortChange(effort),
         onPermissionModeChange: mode => this.handlePermissionModeChange(mode),
         onIncognitoChange: incognito => this.handleIncognitoChange(incognito),
+        onVoiceChange: voice => this.handleVoiceChange(voice),
+        onVoicePauseToggle: () => this.handleVoicePauseToggle(),
         onMentionQuery: query => this.queryFileSuggestions(query),
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
@@ -248,8 +254,24 @@ export class TabController {
         effort: (this.state.effort as EffortLevel | undefined) ?? this.plugin.settings.defaultEffort,
         permissionMode: (this.state.permissionMode as PermissionMode | undefined) ?? this.plugin.settings.permissionMode,
         incognito: this.state.incognito,
+        /* Undefined = tab predates voice mode or is brand new; seed from the
+           plugin default. Written back so pill and state can't disagree. */
+        voice: this.state.voiceEnabled ?? this.plugin.settings.voiceDefaultOn,
       }
     );
+    /* Symmetric write-back: pin the seeded value (true OR false) so a later
+       change to voiceDefaultOn can't retroactively flip a tab the user
+       never touched. Persists on the tab's next state change. */
+    if (this.state.voiceEnabled === undefined) {
+      this.state.voiceEnabled = this.plugin.settings.voiceDefaultOn;
+    }
+    /* Keep the speaking indicator + play/pause icon in lockstep with actual
+       playback. Speech is a plugin-wide singleton, so every tab hears every
+       transition; each just repaints its own composer from the live state. */
+    this.speechUnsub = this.plugin.speech.onStateChange(() => {
+      this.inputBox.setVoiceSpeaking(this.plugin.speech.isSpeaking());
+      this.inputBox.setVoicePaused(this.plugin.speech.isPaused());
+    });
     /* Lock the incognito choice if this tab already has history or a session
        (e.g. restored from disk, or forked). The --no-session-persistence flag
        can only be applied at spawn time, so it can't change retroactively. */
@@ -396,6 +418,14 @@ export class TabController {
   }
   async destroy(): Promise<void> {
     this.destroyed = true;
+    /* Closing a voice tab mid-narration silences it. Channel-scoped, so a
+       sibling voice tab or an in-flight note read plays on untouched. */
+    if (this.voiceOn()) {
+      this.plugin.speech.stop(this.state.id);
+      this.plugin.speech.forgetChannel(this.state.id);
+    }
+    this.speechUnsub?.();
+    this.speechUnsub = null;
     /* Unregister BEFORE disposing so the manager's onExit callback doesn't
        race against our own teardown. teardownSession() awaits SIGTERM and
        the eventual process-exit. */
@@ -861,6 +891,10 @@ export class TabController {
      session id, restores the welcome screen. The tab id is preserved so disk
      persistence and the tab bar position stay stable. */
   async clear() {
+    if (this.voiceOn()) {
+      this.plugin.speech.stop(this.state.id);
+      this.plugin.speech.forgetChannel(this.state.id);
+    }
     await this.teardownSession("clear");
     this.state.messages = [];
     this.state.pendingApprovals.clear();
@@ -892,6 +926,12 @@ export class TabController {
   async cancelStream() {
     if (!this.state.busy) return;
     this.userCancelInitiated = true;
+    /* Esc kills the turn — kill this tab's narration of it too, and drop
+       its stream offsets (the turn is dead; nothing will finalize them). */
+    if (this.voiceOn()) {
+      this.plugin.speech.stop(this.state.id);
+      this.plugin.speech.forgetChannel(this.state.id);
+    }
     /* Best-effort deny any pending approvals so the CLI doesn't sit waiting
        for a response we'll never send. Ignore individual errors — the
        subprocess may already be gone. */
@@ -995,8 +1035,21 @@ export class TabController {
     const vaultAddendum = (this.plugin.settings.vaultSystemPromptAddendum ?? "").trim();
     const snippetAddendum = (snippet?.systemPromptAddendum ?? "").trim();
     const trustedAddendum = this.buildTrustedFoldersAddendum();
+    /* Always-on voice guidance. Field-tested failure (2026-07-18): asked in
+       chat to "read a note aloud", the model ran `say` via its Bash tool —
+       an audio stream the plugin can't pause, stop, or even see, which
+       overlapped the plugin's own voice mode as two simultaneous voices.
+       Baked in unconditionally (not gated on the Voice pill) because the
+       pill can flip mid-session while the system prompt is spawn-time. */
+    const voiceAddendum =
+      "Audio output: this chat UI has a built-in voice mode that reads your responses aloud, plus a " +
+      "\"Read note aloud\" command, both with proper pause/stop controls. NEVER run `say`, `afplay`, " +
+      "`osascript` speech, or any other command that produces spoken audio — the UI cannot pause or stop " +
+      "that audio, and it overlaps voice mode as a second voice. If asked to read something aloud, put the " +
+      "text in your response (voice mode speaks it), or point the user to the Voice pill / \"Read note aloud\" " +
+      "command. Only produce audio files/commands if the user explicitly wants an audio artifact.";
     const composedAddendum =
-      [vaultAddendum, snippetAddendum, trustedAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
+      [vaultAddendum, snippetAddendum, trustedAddendum, voiceAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
     /* Incognito sessions are never persisted, so `--resume` would point at a
        transcript that doesn't exist. On respawn (model/effort/mode change)
        start a fresh session instead — context is lost, which is the accepted
@@ -1106,6 +1159,28 @@ export class TabController {
     this.onIncognitoToggle?.(this.state.id, incognito);
   }
 
+  private handleVoiceChange(voice: boolean) {
+    this.state.voiceEnabled = voice;
+    this.state.updatedAt = Date.now();
+    /* Turning the mode off silences this tab immediately; the play/pause
+       button is the transport control while the mode stays on. The notify
+       listener re-syncs the button. */
+    if (!voice) {
+      this.plugin.speech.stop(this.state.id);
+      this.plugin.speech.forgetChannel(this.state.id);
+    }
+    this.onStateChangeCb();
+  }
+
+  private handleVoicePauseToggle() {
+    const paused = this.plugin.speech.togglePause();
+    this.inputBox.setVoicePaused(paused);
+  }
+
+  private voiceOn(): boolean {
+    return this.state.voiceEnabled === true;
+  }
+
   /* Apply an environment snippet — overwrites model + effort + permission
      mode on this tab and stores the snippet id so the addendum is reapplied
      on every subsequent spawn. Restarts the subprocess so the new
@@ -1147,6 +1222,12 @@ export class TabController {
      doesn't suppress the new turn's events. */
     this.errorBubbleEmitted = false;
     this.userCancelInitiated = false;
+
+    /* A new message interrupts this tab's speech still reading the previous
+       response — matches the mobile voice-mode feel where talking over
+       Claude cuts it off. Channel-scoped: sibling tabs and note reads keep
+       playing. The notify listener re-syncs the pause button. */
+    if (this.voiceOn()) this.plugin.speech.stop(this.state.id);
 
     /* Plugin-side slash commands. Claude Code's stream-json mode does NOT
        intercept slash commands — they get sent to the model as plain text.
@@ -1608,6 +1689,11 @@ export class TabController {
         this.statusIndicator.hide();
         const msg = this.getOrCreateStreamingAssistantMessage();
         msg.content += inner.delta.text;
+        /* Voice mode: feed the accumulated text so complete sentences get
+           spoken while the rest of the reply is still streaming. The
+           controller tracks its own spoken offset, so this is idempotent
+           per delta. */
+        if (this.voiceOn()) this.plugin.speech.updateStream(this.state.id, msg.id, msg.content);
         await this.renderer.upsertMessage(msg);
       } else if (inner.delta.type === "thinking_delta") {
         const msg = this.getOrCreateStreamingAssistantMessage();
@@ -1699,6 +1785,12 @@ export class TabController {
        text and the assistant event is the authoritative final string. */
     const finalText = blocks.filter(b => b.type === "text").map(b => (b as { text: string }).text).join("");
     if (finalText) msg.content = finalText;
+    /* Voice mode: this pass's text is now authoritative — speak the tail
+       past the last sentence boundary. In non-streaming mode (no prior
+       deltas) this is also where the whole message gets spoken. Runs
+       BEFORE maybeMergePrefixPreamble so the spoken offset always refers
+       to this message's own unmerged text. */
+    if (this.voiceOn() && finalText) this.plugin.speech.finalizeStream(this.state.id, msg.id, finalText);
 
     /* Tool uses: ensure every tool_use block has a corresponding entry. The
        streaming path (content_block_start) usually creates these first, but
@@ -1967,6 +2059,11 @@ export class TabController {
       };
       this.state.messages.push(errorMsg);
       void this.renderer.upsertMessage(errorMsg);
+      /* A voice-mode user listening away from the screen would otherwise
+         get silence with no indication the turn died mid-thought. */
+      if (this.voiceOn()) {
+        this.plugin.speech.finalizeStream(this.state.id, errorMsg.id, `The turn failed: ${label}.`);
+      }
     }
     /* Turn-end reconciliation for any still-running tools. If the model
        produced a final synthesis (we're in handleResult), every tool it relied
@@ -2019,6 +2116,11 @@ export class TabController {
        10s (matches the daemon's COMPLETE_TIMEOUT_S), and the animator daemon
        times ready -> idle after 60s. A failed turn goes straight to ready —
        "complete" on the TC001 would misreport the failure as success. */
+    /* Drop any stream offsets this turn never finalized (errored passes,
+       missed assistant events) — entries are keyed by unique message id,
+       so without this sweep they'd accumulate for the plugin's lifetime.
+       Audio is untouched; queued chunks keep playing. */
+    this.plugin.speech.forgetChannel(this.state.id);
     StateEmitter.setState(turnFailed ? "ready" : "complete");
     /* Do NOT use event.usage here — it sums across every API call in the
        turn (each tool round-trip counts the shared context again), inflating

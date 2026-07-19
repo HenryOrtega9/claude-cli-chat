@@ -1,4 +1,4 @@
-import { FileSystemAdapter, Plugin, WorkspaceLeaf, addIcon } from "obsidian";
+import { FileSystemAdapter, Plugin, WorkspaceLeaf, addIcon, getFrontMatterInfo, type Editor } from "obsidian";
 import { ClaudeChatView, VIEW_TYPE_CLAUDE_CHAT } from "./view/ClaudeChatView";
 import { ClaudeChatSettingTab, DEFAULT_SETTINGS, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, autodetectClaudePath, autodetectUserName, type ClaudeChatSettings } from "./settings";
 import { SubprocessManager, spawnOptionsFromSettings } from "./claude/SubprocessManager";
@@ -11,6 +11,7 @@ import { discoverSkillsAndCommands, type DiscoveryResult } from "./claude/SkillD
 import { discoverSubagents, type SubagentCatalog } from "./claude/SubagentDiscovery";
 import { StateEmitter } from "./claude/StateEmitter";
 import { PermissionsConfigStore } from "./permissions/PermissionsConfig";
+import { SpeechController } from "./voice/SpeechController";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
@@ -43,6 +44,12 @@ export default class ClaudeChatPlugin extends Plugin {
      The CLI applies them via `--settings`, scoped to our subprocesses only. */
   mcpDenyPatterns: string[] = [];
 
+  /* Voice output singleton. One speechSynthesis queue exists per renderer,
+     so one controller serves every tab and the read-note-aloud commands.
+     Constructed with a settings getter so voice/rate changes apply to the
+     next utterance without re-wiring. */
+  speech!: SpeechController;
+
   /* Cached result of `claude mcp list` — the authoritative set of servers the
      spawned chat actually loads (our vault .claude/mcp.json is not a CLI
      source). Populated lazily; the MCP manager modal forces a refresh on
@@ -53,6 +60,7 @@ export default class ClaudeChatPlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+    this.speech = new SpeechController(() => this.settings);
     this.permissionsStore = new PermissionsConfigStore(this.app);
     /* Prime the deny cache before any tab can spawn so disabled servers are
        hidden from the very first turn. Best-effort: a read failure just
@@ -120,6 +128,32 @@ export default class ClaudeChatPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "read-note-aloud",
+      name: "Read note aloud (selection or whole note)",
+      editorCallback: (editor) => this.readEditorAloud(editor),
+    });
+
+    this.addCommand({
+      id: "stop-speaking",
+      name: "Stop speaking",
+      callback: () => this.speech.stop(),
+    });
+
+    /* Right-click a note body → "Read aloud from here"-style entry point.
+       Mirrors the command's selection-or-whole-note behavior. */
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor) => {
+        menu.addItem(item => {
+          const hasSelection = editor.getSelection().trim().length > 0;
+          item
+            .setTitle(hasSelection ? "Read selection aloud" : "Read note aloud")
+            .setIcon("volume-2")
+            .onClick(() => this.readEditorAloud(editor));
+        });
+      })
+    );
+
     this.addSettingTab(new ClaudeChatSettingTab(this.app, this));
 
     /* TC001 status display: configure from persisted settings and emit
@@ -129,7 +163,26 @@ export default class ClaudeChatPlugin extends Plugin {
     if (this.settings.tc001Enabled) StateEmitter.setState("idle");
   }
 
+  /* Speak the editor's selection, or the whole note when nothing is
+     selected. Whole-note reads skip YAML frontmatter — property names and
+     tags are metadata, not prose. Selections read exactly as selected. */
+  private readEditorAloud(editor: Editor): void {
+    const selection = editor.getSelection();
+    let text = selection.trim().length > 0 ? selection : editor.getValue();
+    if (selection.trim().length === 0) {
+      /* Obsidian's own frontmatter parser, not a bare /^---…---/ regex —
+         the regex ate the opening body of notes that start with a
+         horizontal rule ("---\nIntro\n---\nRest" lost "Intro"). */
+      const fm = getFrontMatterInfo(text);
+      if (fm.exists) text = text.slice(fm.contentStart);
+    }
+    if (text.trim().length === 0) return;
+    this.speech.stop();
+    this.speech.speakDocument(text);
+  }
+
   async onunload() {
+    this.speech?.destroy();
     StateEmitter.dispose();
     /* Obsidian ignores the promise onunload returns, so on app quit the
        awaits below may never resume. Persist the debounced tail
@@ -242,6 +295,17 @@ export default class ClaudeChatPlugin extends Plugin {
     this.settings.envSnippets = Array.isArray(this.settings.envSnippets) ? [...this.settings.envSnippets] : [];
     if (!EFFORT_ORDER.includes(this.settings.defaultEffort)) this.settings.defaultEffort = DEFAULT_SETTINGS.defaultEffort;
     if (!PERMISSION_MODE_ORDER.includes(this.settings.permissionMode)) this.settings.permissionMode = DEFAULT_SETTINGS.permissionMode;
+    /* Voice migration: the first voice-mode build stored speechSynthesis
+       voiceURIs ("com.apple.voice.…"); playback now runs through `say`,
+       which takes plain voice names ("Ava (Premium)"). A leftover URI would
+       make every `say` spawn exit(1) — silent, total speech failure — so
+       reset it to the system default. */
+    if (/^com\.apple\./.test(this.settings.voiceName)) {
+      this.settings.voiceName = "";
+      /* Persist so the stale URI doesn't sit in data.json depending on
+         this line re-running every load. */
+      await this.saveSettings();
+    }
     /* First-install user name autodetect. Empty userName means we've never
        populated it; try the OS account once and save. Validate the result
        — if dscl misbehaves and leaks an error string into stdout, the

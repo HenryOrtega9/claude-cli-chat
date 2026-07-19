@@ -28,6 +28,7 @@ type StoredTab = {
      submit). Undefined on legacy state predating the field; TabController
      treats undefined as "all pins sticky" so behavior is preserved. */
   stickyPinnedFilePaths?: string[];
+  voiceEnabled?: boolean;
 };
 
 /* Lightweight stand-in for a sent attachment — filename/kind/mediaType only,
@@ -150,6 +151,7 @@ export class Persistence {
       envSnippetId: typeof stored.envSnippetId === "string" ? stored.envSnippetId : undefined,
       pinnedFilePaths: Array.isArray(stored.pinnedFilePaths) ? stored.pinnedFilePaths : undefined,
       stickyPinnedFilePaths: Array.isArray(stored.stickyPinnedFilePaths) ? stored.stickyPinnedFilePaths : undefined,
+      voiceEnabled: typeof stored.voiceEnabled === "boolean" ? stored.voiceEnabled : undefined,
     };
   }
 
@@ -280,6 +282,7 @@ export class Persistence {
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths,
       stickyPinnedFilePaths: state.stickyPinnedFilePaths,
+      voiceEnabled: state.voiceEnabled,
     };
     const meta: TabMeta = {
       title: stored.title,

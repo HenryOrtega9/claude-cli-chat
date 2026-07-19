@@ -166,6 +166,9 @@ export type TabState = {
      --no-session-persistence so it writes no ~/.claude session JSONL either,
      and all vault writes for this tab are skipped. */
   incognito?: boolean;
+  /* Voice mode: speak this tab's assistant responses aloud as they stream.
+     Persisted per tab; new tabs seed from settings.voiceDefaultOn. */
+  voiceEnabled?: boolean;
   availableSlashCommands?: string[];
   availableSkills?: string[];
   /* MCP tools the CLI announced in the most recent system/init event,

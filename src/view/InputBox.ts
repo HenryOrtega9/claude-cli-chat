@@ -176,6 +176,13 @@ export type InputBoxCallbacks = {
   /* Fired when the user toggles the incognito pill. Only fires while the pill
      is unlocked (no live session yet). */
   onIncognitoChange: (incognito: boolean) => void;
+  /* Fired when the user toggles the voice pill (speak responses aloud).
+     Never locked — voice can flip mid-conversation, even mid-stream. */
+  onVoiceChange: (voice: boolean) => void;
+  /* Fired when the user clicks the play/pause button that accompanies an
+     active voice pill. Caller (TabController) toggles the speech
+     controller's pause state and reports it back via setVoicePaused. */
+  onVoicePauseToggle: () => void;
   /* Return vault file matches for an @-mention query. Caller (TabController)
      reads from app.vault and ranks. Limit to ~20 results. */
   onMentionQuery: (query: string) => Suggestion[];
@@ -282,6 +289,19 @@ export class InputBox {
      exists (the --no-session-persistence decision is fixed at spawn time). */
   private incognitoPill: HTMLElement;
   private currentIncognito = false;
+  /* Voice ("speak responses") toggle pill. Active = assistant text is read
+     aloud as it streams. Per-tab, persisted, never locked. */
+  private voicePill: HTMLElement;
+  private currentVoice = false;
+  /* Play/pause transport next to the voice pill. Only visible while voice
+     is on; the pill stays the mode switch, this controls the sound. */
+  private voicePauseBtn: HTMLElement;
+  private voicePaused = false;
+  /* Animated equalizer bars shown while audio is actually playing —
+     the visual "Claude is talking" cue. Frozen (not hidden) while paused
+     mid-playback so it still reads as "there's speech to resume". */
+  private voiceSpeakingEl: HTMLElement;
+  private voiceSpeaking = false;
   private incognitoLocked = false;
   private usageChip: HTMLElement;
   private usageDonutCircle: SVGCircleElement;
@@ -353,13 +373,14 @@ export class InputBox {
     container: HTMLElement,
     settings: ClaudeChatSettings,
     callbacks: InputBoxCallbacks,
-    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode; incognito?: boolean }
+    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode; incognito?: boolean; voice?: boolean }
   ) {
     this.callbacks = callbacks;
     this.currentModel = initial?.model ?? settings.defaultModel;
     this.currentEffort = initial?.effort ?? settings.defaultEffort;
     this.currentMode = initial?.permissionMode ?? settings.permissionMode;
     this.currentIncognito = initial?.incognito ?? false;
+    this.currentVoice = initial?.voice ?? false;
 
     this.root = container.createDiv({ cls: "claudian-input-container" });
     this.wrapper = this.root.createDiv({ cls: "claudian-input-wrapper" });
@@ -521,6 +542,45 @@ export class InputBox {
       e.stopPropagation();
       this.toggleIncognito();
     });
+
+    /* Voice pill — sits right of incognito. Binary toggle: when active,
+       this tab's assistant responses are spoken aloud as they stream.
+       Toggling off mid-response also stops any in-flight speech (handled
+       by TabController's onVoiceChange). */
+    this.voicePill = this.topToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-voice-pill",
+      attr: {
+        "aria-label": "Voice — speak responses aloud",
+        title: "Voice — read Claude's responses aloud as they stream",
+      },
+    });
+    this.voicePill.createSpan({ cls: "claudian-toolbar-pill-value", text: "🔊" });
+    this.voicePill.createSpan({ cls: "claudian-toolbar-pill-label", text: "Voice" });
+    this.voicePill.addEventListener("click", e => {
+      e.stopPropagation();
+      this.toggleVoice();
+    });
+
+    /* Play/pause button — appears only while the voice pill is active, so
+       the pill can stay on as the mode switch while this controls the
+       sound (pause freezes mid-word, play resumes in place). */
+    this.voicePauseBtn = this.topToolbar.createSpan({
+      cls: "claudian-toolbar-pill claudian-voice-pause-btn",
+      attr: { "aria-label": "Pause speech", title: "Pause speech" },
+    });
+    this.voicePauseBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      this.callbacks.onVoicePauseToggle();
+    });
+
+    /* Speaking indicator — three animated bars, visible only while speech
+       is playing (or frozen while paused mid-playback). */
+    this.voiceSpeakingEl = this.topToolbar.createSpan({
+      cls: "claudian-voice-speaking",
+      attr: { "aria-label": "Claude is speaking" },
+    });
+    for (let i = 0; i < 3; i++) this.voiceSpeakingEl.createSpan({ cls: "claudian-voice-speaking-bar" });
+    this.refreshVoicePill();
 
     this.topToolbar.createDiv({ cls: "claudian-input-toolbar-spacer" });
 
@@ -1114,6 +1174,49 @@ export class InputBox {
     this.currentIncognito = !this.currentIncognito;
     this.refreshIncognitoPill();
     this.callbacks.onIncognitoChange(this.currentIncognito);
+  }
+
+  private refreshVoicePill() {
+    this.voicePill.toggleClass("is-active", this.currentVoice);
+    this.voicePauseBtn.toggleClass("is-hidden", !this.currentVoice);
+    setIcon(this.voicePauseBtn, this.voicePaused ? "play" : "pause");
+    const label = this.voicePaused ? "Resume speech" : "Pause speech";
+    this.voicePauseBtn.setAttribute("aria-label", label);
+    this.voicePauseBtn.setAttribute("title", label);
+    /* Bars show whenever there's live playback (speaking, or paused with
+       speech held); the animation itself only runs while unpaused. */
+    this.voiceSpeakingEl.toggleClass("is-hidden", !(this.currentVoice && this.voiceSpeaking));
+    this.voiceSpeakingEl.toggleClass("is-paused", this.voicePaused);
+  }
+
+  private toggleVoice() {
+    this.currentVoice = !this.currentVoice;
+    this.refreshVoicePill();
+    this.callbacks.onVoiceChange(this.currentVoice);
+  }
+
+  /* Programmatic voice toggle (commands / restore). Does NOT fire the
+     callback — callers already know. */
+  setVoice(voice: boolean) {
+    this.currentVoice = voice;
+    this.refreshVoicePill();
+  }
+
+  /* Reflect the speech controller's pause state on the transport button.
+     Called by TabController after toggles and after anything that resets
+     playback (new submit, cancel, voice off). */
+  setVoicePaused(paused: boolean) {
+    if (this.voicePaused === paused) return;  /* notify fires per chunk — skip the setIcon rebuild */
+    this.voicePaused = paused;
+    this.refreshVoicePill();
+  }
+
+  /* Reflect live playback on the speaking indicator. Driven by
+     TabController's SpeechController subscription. */
+  setVoiceSpeaking(speaking: boolean) {
+    if (this.voiceSpeaking === speaking) return;
+    this.voiceSpeaking = speaking;
+    this.refreshVoicePill();
   }
 
   /* Lock/unlock the incognito pill. TabController locks once a session exists
