@@ -36,6 +36,7 @@ function debounced<A extends unknown[]>(fn: (...args: A) => void, ms: number): (
    1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
   "fable-5": "claude-fable-5[1m]",
+  "opus-5": "claude-opus-5[1m]",
   "opus-1m": "claude-opus-4-8[1m]",
   "opus-4-7-1m": "claude-opus-4-7[1m]",
   "opus-4-6-1m": "claude-opus-4-6[1m]",
@@ -49,6 +50,7 @@ export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
   "fable-5": "Fable 5 1M",
+  "opus-5": "Opus 5 1M",
   "opus-1m": "Opus 4.8 1M",
   "opus-4-7-1m": "Opus 4.7 1M",
   "opus-4-6-1m": "Opus 4.6 1M",
@@ -60,11 +62,13 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
 
 /* Availability caveats surfaced under the model name in the picker popup
    and appended to the settings dropdown. fable-5 was relaunched 2026-07-01
-   with plan-included access (up to 50% of weekly limits), extended twice:
-   original Jul 7 cutoff → Jul 12 → now through 2026-07-19 per the /status
-   announcement (which also keeps Claude Code's weekly rate limits 50%
-   higher through Jul 19). After the cutoff it bills through usage credits
-   at standard API rates ($10/$50 per MTok), NOT the subscription caps.
+   with promotional plan-included access (up to 50% of weekly limits),
+   extended twice (Jul 7 → Jul 12 → Jul 19). On 2026-07-18 Anthropic
+   announced the permanent structure effective Jul 20: Fable 5 is included
+   in Max and Team Premium plans at up to 50% of weekly limits, with no end
+   date. Pro and Team Standard instead bill it via usage credits at API
+   rates ($10/$50 per MTok) after a one-time $100 credit. This user is on
+   Max 5x, so Fable 5 draws from the normal subscription caps.
    Details: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
    If Anthropic pulls it entirely, delete the "fable-5"
    entries here and in MODEL_IDS/MODEL_LABELS/MODEL_GROUPS — the
@@ -73,7 +77,7 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
    1M context and xhigh effort are confirmed supported, so it carries the
    `[1m]` suffix and the full effort ladder like the Opus 1M variants. */
 export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
-  "fable-5": "After Jul 19, 2026, billed via usage credits at API rates, not plan limits.",
+  "fable-5": "Included in Max plans (up to 50% of weekly limits) as of Jul 20, 2026. No usage credits needed.",
 };
 
 /* Ordered sections for the model-picker popup; each renders under its own
@@ -83,7 +87,7 @@ export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
    group. */
 export const MODEL_GROUPS: { header: string; keys: ModelKey[] }[] = [
   { header: "FABLE", keys: ["fable-5"] },
-  { header: "OPUS", keys: ["opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
+  { header: "OPUS", keys: ["opus-5", "opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
   { header: "SONNET", keys: ["sonnet-5", "sonnet-1m"] },
   { header: "HAIKU", keys: ["haiku"] },
 ];
@@ -102,11 +106,13 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   Fable 5, Opus (Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which routes
-   to Opus when in plan mode), and Sonnet 5 — the first Sonnet-tier model
-   with xhigh; everything else shows the standard four. */
+   Fable 5, Opus (Opus 5, Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which
+   routes to Opus when in plan mode), and Sonnet 5 — the first Sonnet-tier
+   model with xhigh; everything else shows the standard four. Opus 5's full
+   ladder (incl. xhigh/max) is confirmed by the effort docs as of its
+   2026-07-24 release. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "fable-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
+  if (model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
@@ -116,7 +122,7 @@ export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
    resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "fable-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 
