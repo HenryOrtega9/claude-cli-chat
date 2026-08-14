@@ -1,6 +1,8 @@
 node_modules/
 main.js
 main.js.map
+app/dist/
+app/release/
 *.log
 .DS_Store
 .vscode/

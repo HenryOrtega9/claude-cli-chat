@@ -1,0 +1,53 @@
+# electron-builder config for the standalone shell ("Claude Quick Chat").
+# Invoked by `npm run package:app`; the Obsidian plugin build never reads this.
+#
+# projectDir is the repo root, so every path below is repo-relative and the
+# packaged layout mirrors the repo layout — that is load-bearing: app/index.html
+# links `../styles.css`, which only resolves inside the asar if styles.css sits
+# at the archive root next to app/.
+appId: dev.henryortega.claude-quick-chat
+productName: Claude Quick Chat
+copyright: Henry Ortega
+
+# package.json "main" is `main.js` — the Obsidian plugin's entry contract, which
+# must not change. extraMetadata rewrites it in the packaged copy only, so
+# Electron boots the shell's main process instead of looking for a plugin bundle.
+extraMetadata:
+  main: app/dist/main.js
+
+directories:
+  output: app/release
+
+# The renderer bundle carries its own dependencies (esbuild inlines marked,
+# lucide, jszip, mammoth), and the main bundle imports nothing but electron and
+# node builtins. Nothing needs node_modules at runtime, so it is excluded
+# outright rather than pruned — that is what keeps the asar in the low tens of
+# megabytes instead of shipping mammoth twice.
+files:
+  - app/dist/**
+  - app/index.html
+  - app/desktop.css
+  - app/assets/**
+  - styles.css
+  - "!node_modules/**"
+
+asar: true
+npmRebuild: false
+
+# Self-built personal app: no notarization, no update feed. Henry rebuilds it
+# from source, so an updater would have nothing to point at.
+publish: null
+
+mac:
+  target: dir
+  # Ad-hoc signing. electron-builder signs with `-` when identity is null, which
+  # is what an Apple-silicon Mac requires to launch a modified Electron bundle;
+  # it is not a Developer ID and Gatekeeper still treats the app as unidentified.
+  identity: null
+  icon: app/assets/icon.icns
+  category: public.app-category.productivity
+  extendInfo:
+    # Menu-bar app: no Dock tile, no menu bar of its own. app.dock.hide() does
+    # the same thing at runtime, but only after the first window appears — the
+    # Info.plist key means the Dock never shows the app at all.
+    LSUIElement: true

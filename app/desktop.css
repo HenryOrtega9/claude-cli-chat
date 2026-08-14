@@ -1,0 +1,725 @@
+/* ============================================================
+   Claude Quick Chat — desktop (Electron) stylesheet
+   Loaded AFTER the plugin's styles.css. Two jobs, nothing else:
+
+     1. Supply the Obsidian-provided CSS custom properties that
+        styles.css consumes but never defines. In Obsidian these
+        come from the app theme; here nothing provides them, so
+        every color/font in styles.css would resolve to the
+        initial value and the UI would render unstyled.
+     2. Panel chrome (the floating rounded window) plus the DOM
+        surfaces the desktop platform layer creates itself
+        (toasts, context menus, modals, suggest prompts) — none
+        of which styles.css knows about, because in Obsidian the
+        app chrome supplied them.
+
+   Invariants:
+   - This file only ADDS. It must never need to override a
+     .claudian-* rule; if it does, the shared CSS has drifted and
+     styles.css is the file to fix.
+   - Every variable defined below is consumed either by
+     styles.css or by a rule in this file. Do not add "for
+     completeness" tokens — an unconsumed var is a lie about
+     what the shell theming actually covers.
+   - Selectors added here that duplicate an Obsidian-scoped rule
+     from styles.css are deliberately kept at LOWER specificity
+     (scoped to #app, not to
+     .workspace-leaf-content[data-type="claude-cli-chat-view"])
+     so the plugin's own rule still wins if that wrapper is ever
+     present.
+   ============================================================ */
+
+/* ---- Obsidian theme variables ------------------------------
+   Values track the GitHub Theme (dark) that is active in the
+   vault's Obsidian, so the panel reads as the same surface the
+   plugin lives on inside Obsidian. If the Obsidian theme
+   changes, re-lift the base scale from
+   .obsidian/themes/<name>/theme.css into the :root block below. */
+:root {
+  /* Surfaces. GitHub dark, lifted from the vault's active Obsidian
+     theme (.obsidian/themes/GitHub Theme/theme.css .theme-dark
+     block: base-00/10/20/30) so the panel matches the Obsidian
+     look. secondary stays LIGHTER than primary — same
+     relationship as before, styles.css relies on it for depth. */
+  --background-primary: #0d1117;
+  --background-primary-alt: #161b22;
+  --background-secondary: #161b22;
+  --background-modifier-border: #30363d;
+  /* Theme's --rgb-hover at its --background-modifier-hover-alpha. */
+  --background-modifier-hover: rgba(177, 186, 196, 0.12);
+
+  /* Text. GitHub theme base-100/70/50 and its red/green. */
+  --text-normal: #c9d1d9;
+  --text-muted: #8b949e;
+  --text-faint: #6e7681;
+  --text-error: #f47067;
+  --text-success: #7ee787;
+
+  /* Accents — GitHub link blue, matching how links render in the
+     Obsidian theme. The Anthropic orange brand (asterisk, send
+     button, pills) is unaffected: it comes from --claudian-*. */
+  --text-accent: #4493f8;
+  --interactive-accent: #316dca;
+
+  /* Typography. Obsidian defaults --font-text-theme to the
+     interface stack, so text and interface share one family. */
+  --font-interface: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-text: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-monospace: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas,
+    "Roboto Mono", monospace;
+  --font-text-size: 15px;
+
+  /* Brand tokens. styles.css DOES define these, but only inside
+     .workspace-leaf-content[data-type="claude-cli-chat-view"]
+     .claudian-container (and, for brand only, on
+     .claudian-history-modal). That wrapper does not exist in the
+     desktop shell, so without a :root copy every orange accent
+     and every rgba(var(--claudian-*-rgb), a) fill in the plugin
+     silently drops out. Values are copied verbatim from
+     styles.css; they must be changed in both places or not at
+     all. The scoped rule still wins under Obsidian (higher
+     specificity), so this is a floor, not an override. */
+  --claudian-brand: #d97757;
+  --claudian-brand-rgb: 217, 119, 87;
+  --claudian-blue: #5b8def;
+  --claudian-blue-rgb: 91, 141, 239;
+  --claudian-purple: #a78bfa;
+  --claudian-purple-rgb: 167, 139, 250;
+}
+
+/* ---- Baseline document ------------------------------------
+   Obsidian's app.css applies a global border-box and a body
+   font; styles.css was authored against both and only restates
+   box-sizing in the handful of places it could not assume it. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  /* The BrowserWindow is transparent + frameless: the rounded
+     #app below is the only thing that paints. Any background
+     here would square off the panel's corners. */
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-interface);
+  font-size: 14px;
+  color: var(--text-normal);
+  -webkit-font-smoothing: antialiased;
+  /* Frameless window: nothing should be able to select-drag the
+     chrome. Text inside the chat re-enables selection below. */
+  user-select: none;
+  cursor: default;
+}
+
+input,
+textarea,
+[contenteditable="true"],
+.claudian-messages,
+.claudian-message,
+.claudian-bubble,
+pre,
+code {
+  user-select: text;
+}
+
+/* ---- Panel chrome ------------------------------------------
+   #app fills the viewport because the window itself is the
+   panel; the rounded corners and border ARE the window edge.
+   The drop shadow is emitted for completeness but macOS draws
+   the real one behind the transparent window — an outward
+   shadow at the viewport edge is clipped, so the visible depth
+   cue is the 1px border plus the inset hairline. */
+#app {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  overflow: hidden;
+  /* Translucent over the window's macOS vibrancy layer (set in
+     app/src/main.ts): the frosted blur shows through here and
+     through the container tint below. Readable foreground
+     surfaces (bubbles, composer, modals) keep the solid tokens. */
+  background: rgba(13, 17, 23, 0.6);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+}
+
+/* Desktop equivalents of the four layout rules styles.css scopes
+   to the Obsidian view wrapper. Values are copied verbatim; the
+   #app scope keeps them below the plugin's specificity. */
+#app .claudian-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: var(--font-text);
+  /* Tinted, not solid: stacked on #app's wash this lands around
+     75% opacity over the vibrancy blur. */
+  background: rgba(22, 27, 34, 0.4);
+  color: var(--text-normal);
+}
+
+#app .claudian-messages-wrapper {
+  position: relative;
+}
+
+#app .claudian-welcome {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  /* Reserves the composer region so the welcome centerline lands
+     in the visual middle of the messages area. */
+  padding: 0 0 168px 0;
+  min-height: 0;
+}
+
+#app .claudian-welcome-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+#app .claudian-welcome-logo img {
+  width: 56px;
+  height: 56px;
+  opacity: 0.9;
+}
+
+#app .claudian-welcome-greeting {
+  font-family: "Copernicus", "Tiempos Headline", "Tiempos", Georgia,
+    "Times New Roman", serif;
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  color: var(--text-muted);
+}
+
+/* ---- Icons -------------------------------------------------
+   Obsidian's baseline for setIcon output. Lucide icons are
+   stroke-drawn and need fill suppressed on the root; the
+   claude-asterisk icon is fill-drawn and carries its own
+   fill="currentColor" on the <path>, which a fill rule on the
+   <svg> element cannot reach — so both render correctly.
+   styles.css sizes specific icons with higher-specificity
+   `.claudian-x svg` rules; those still win. */
+.svg-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  vertical-align: middle;
+  stroke-width: 1.75px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.svg-icon.lucide {
+  fill: none;
+  stroke: currentColor;
+}
+
+/* ---- Scrollbars --------------------------------------------
+   Chromium's default scrollbars are light-themed and read as a
+   rendering bug on this surface. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.11);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::selection {
+  background: rgba(var(--claudian-brand-rgb), 0.3);
+}
+
+/* ---- Toasts (platform.notify) ------------------------------
+   Contract fixes only the item class `claudesk-toast`, not
+   whether the platform layer wraps them. Both shapes are
+   handled: a lone toast positions itself at the bottom center,
+   and any wrapper element holding toasts becomes the stacking
+   column (column-reverse so the newest sits nearest the bottom
+   edge and older ones ride upward). */
+.claudesk-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 200;
+  max-width: min(440px, calc(100% - 32px));
+  padding: 9px 14px;
+  border-radius: 9px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  color: var(--text-normal);
+  font-family: var(--font-interface);
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: auto;
+  animation: claudesk-toast-in 140ms ease-out;
+}
+
+*:has(> .claudesk-toast):not(body):not(#app) {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 18px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 8px;
+  /* The column spans the panel width; only the toasts inside it
+     should intercept clicks. */
+  pointer-events: none;
+}
+
+*:has(> .claudesk-toast):not(body):not(#app) > .claudesk-toast {
+  position: static;
+  transform: none;
+  left: auto;
+  bottom: auto;
+}
+
+@keyframes claudesk-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* The keyframe's translateX is wrong for a statically-positioned
+   toast inside a stacking column, so that case gets its own. */
+*:has(> .claudesk-toast):not(body):not(#app) > .claudesk-toast {
+  animation: claudesk-toast-in-stacked 140ms ease-out;
+}
+
+@keyframes claudesk-toast-in-stacked {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ---- Context menu (platform.showContextMenu) ---------------
+   Chrome and density mirror .claudian-popup / .claudian-popup-row
+   in styles.css so a platform-drawn menu is indistinguishable
+   from the plugin's own popups. */
+.claudesk-menu {
+  position: fixed;
+  z-index: 150;
+  min-width: 160px;
+  max-width: 320px;
+  padding: 6px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  font-family: var(--font-interface);
+  font-size: 13px;
+  color: var(--text-normal);
+}
+
+.claudesk-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--text-normal);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+
+.claudesk-menu-item:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.12);
+}
+
+.claudesk-menu-item.is-selected {
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+  font-weight: 600;
+}
+
+.claudesk-menu-item .svg-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+}
+
+.claudesk-menu-item:hover .svg-icon {
+  color: inherit;
+}
+
+/* ---- Modals (platform.createModal) -------------------------
+   Obsidian's structural class names, so the plugin's own
+   modal-scoped rules (.claudian-mcp-modal, .claudian-history-modal,
+   .claudian-subagent-modal — all of which set their own width and
+   are applied to the .modal element) drop straight in. */
+.modal-container {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  font-family: var(--font-interface);
+}
+
+.modal-bg {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(1px);
+}
+
+.modal {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  max-width: min(720px, 100%);
+  max-height: 100%;
+  padding: 20px 24px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  color: var(--text-normal);
+  font-size: 14px;
+}
+
+.modal-close-button {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  color: var(--text-faint);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+
+/* Obsidian renders the glyph from CSS and leaves the element
+   empty; if the platform layer puts its own glyph in, this
+   stays out of the way. */
+.modal-close-button:empty::before {
+  content: "\00d7";
+}
+
+.modal-close-button:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.modal-title {
+  flex-shrink: 0;
+  margin: 0 28px 12px 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-normal);
+}
+
+/* Empty title (modals that never call setTitle) must not leave a
+   12px gap above the content. */
+.modal-title:empty {
+  display: none;
+}
+
+.modal-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Baselines for the form controls shared modal code creates via
+   plain element/Obsidian class names. Kept as element selectors
+   so every .claudian-* rule in styles.css outranks them. */
+.modal input[type="text"],
+.modal input[type="search"],
+.modal input[type="number"],
+.modal textarea,
+.modal select,
+.modal .dropdown {
+  padding: 6px 9px;
+  background: var(--background-primary-alt);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.modal input:focus,
+.modal textarea:focus,
+.modal select:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+}
+
+.modal button {
+  padding: 6px 12px;
+  background: var(--background-primary-alt);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.modal button:hover {
+  background: var(--background-modifier-hover);
+}
+
+.modal button.mod-cta {
+  background: var(--claudian-brand);
+  border-color: var(--claudian-brand);
+  color: #ffffff;
+  font-weight: 500;
+}
+
+.modal button.mod-cta:hover {
+  filter: brightness(1.08);
+}
+
+.modal button.mod-warning {
+  background: transparent;
+  border-color: var(--text-error);
+  color: var(--text-error);
+}
+
+.setting-item-description {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* ---- Suggest modal (platform.createSuggestModal) -----------
+   Obsidian anchors the prompt near the top of the screen rather
+   than centering it, so it does not jump as the result list
+   grows and shrinks. .prompt is a sibling of .modal-bg inside
+   .modal-container, hence the align-self override of the
+   container's centering. */
+.prompt {
+  position: relative;
+  z-index: 1;
+  align-self: flex-start;
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  margin-top: 8vh;
+  max-height: 70vh;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  font-family: var(--font-interface);
+}
+
+.prompt-input {
+  flex-shrink: 0;
+  width: 100%;
+  padding: 13px 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--background-modifier-border);
+  border-radius: 0;
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.prompt-input:focus {
+  outline: none;
+}
+
+.prompt-input::placeholder {
+  color: var(--text-faint);
+}
+
+.prompt-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+/* No results rendered — collapse rather than showing an empty
+   6px-padded strip under the input. */
+.prompt-results:empty {
+  display: none;
+}
+
+.suggestion-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+
+.suggestion-item:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.12);
+}
+
+/* Keyboard selection must outrank hover: arrowing down while the
+   cursor rests on another row should still read unambiguously. */
+.suggestion-item.is-selected,
+.suggestion-item.is-selected:hover {
+  background: rgba(var(--claudian-brand-rgb), 0.18);
+  color: var(--claudian-brand);
+  font-weight: 600;
+}
+
+/* ---- Settings modal (app/src/settings-modal.ts) ------------
+   Shell-only surface, so it carries its own layout rather than
+   borrowing Obsidian's .setting-item grid (which styles.css
+   never defines). One stacked block per field: name, muted
+   description, control row, status line. */
+.claudesk-settings-modal {
+  width: min(560px, 100%);
+}
+
+.claudesk-setting + .claudesk-setting {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.claudesk-setting-name {
+  color: var(--text-normal);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.claudesk-setting-desc {
+  margin-top: 3px;
+}
+
+.claudesk-setting-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+/* The path fields are long; the input takes the slack and the
+   button keeps its intrinsic width. */
+.claudesk-setting-control input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+}
+
+.claudesk-setting-control button {
+  flex-shrink: 0;
+}
+
+/* Collapsed until a submit writes into it, so an untouched field
+   leaves no empty strip under its control row. */
+.claudesk-setting-status {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.claudesk-setting-status:empty {
+  display: none;
+}
+
+.claudesk-setting-status:not(:empty) {
+  margin-top: 6px;
+}
+
+.claudesk-setting-status.is-ok {
+  color: var(--text-success);
+}
+
+.claudesk-setting-status.is-error {
+  color: var(--text-error);
+}
+
+/* ---- Window drag + resize (frameless panel) -------------------------------
+   The header doubles as the title bar: grab anywhere on it to move the
+   window. Interactive children opt back out, or their clicks would start a
+   drag instead of firing. Edge-resize needs no CSS — it comes from the
+   BrowserWindow's resizable flag — but the 4px inset keeps the drag region
+   from swallowing the top resize edge. */
+.claudian-header {
+  -webkit-app-region: drag;
+  padding-top: 4px;
+}
+
+.claudian-header :is(button, .claudian-header-btn, .claudian-header-actions) {
+  -webkit-app-region: no-drag;
+}
