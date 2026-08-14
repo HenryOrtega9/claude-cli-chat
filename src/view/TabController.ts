@@ -762,6 +762,12 @@ export class TabController {
 
   focusInput() { this.inputBox.focus(); }
 
+  /* Hand OS-dropped File objects to the composer's attach pipeline. Same
+     entry point the root drop zone uses; public so a host shell can forward
+     drops that land outside this tab's DOM (e.g. the desktop panel's
+     header strip, which the root listener never sees). */
+  ingestDroppedFiles(files: File[]) { this.inputBox.ingestDroppedFiles(files); }
+
   /* Intercept and run plugin-side slash commands. Returns true if the text
      was a command we handled (and the message should NOT be forwarded to
      the CLI), false otherwise. Case-insensitive, trimmed match. */

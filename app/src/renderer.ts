@@ -39,6 +39,29 @@ function overlayOpen(): boolean {
   return document.querySelector(OVERLAY_SELECTOR) !== null;
 }
 
+/* Whole-window Finder drop target. The shared code already handles drops over
+   the chat area (TabController's root zone -> InputBox attach pipeline, with
+   webUtils.getPathForFile covering Electron 32+'s File.path removal); this
+   document-level layer covers the strips that zone never sees (header, tab
+   bar) and, critically, cancels the default for any file drop nothing
+   consumed — without that Electron navigates the panel to the dropped
+   file:// URL and wedges the renderer. Bubble phase, so the deeper handlers
+   run first and mark what they consumed via defaultPrevented. File drags
+   only: text drags keep their native behavior. */
+function wireDragAndDrop(shell: DesktopChatShell): void {
+  const hasFiles = (e: DragEvent) =>
+    Array.from(e.dataTransfer?.types ?? []).includes("Files");
+  document.addEventListener("dragover", (e) => {
+    if (!e.defaultPrevented && hasFiles(e)) e.preventDefault();
+  });
+  document.addEventListener("drop", (e) => {
+    if (e.defaultPrevented || !hasFiles(e)) return;
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (files.length > 0) shell.ingestDroppedFiles(files);
+  });
+}
+
 function wireKeyboard(shell: DesktopChatShell, openSettings: () => void): void {
   /* Bubble phase on window, so every inner handler has already run and
      `defaultPrevented` reliably tells us whether one of them claimed the key
@@ -140,12 +163,14 @@ async function boot(): Promise<void> {
     const openSettings = (activeHotkey?: string) => openSettingsModal(host, activeHotkey);
 
     const shell = new DesktopChatShell(mount, host);
-    /* Set before mount(): the shell only adds its header gear button when a
+    /* Set before mount(): the shell only adds its header buttons when a
        handler exists, and the header is built during mount. */
     shell.onOpenSettings = () => openSettings();
+    shell.onResetPosition = () => ipcRenderer.send("claudesk:reset-position");
     await shell.mount();
     wireKeyboard(shell, () => openSettings());
     wireSettingsChannel(openSettings);
+    wireDragAndDrop(shell);
 
     /* Quit-time teardown. The renderer stays alive across hide/show (processes
        and tabs stay warm), so this only fires on a real quit — at which point

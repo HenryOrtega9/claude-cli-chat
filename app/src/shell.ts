@@ -75,6 +75,9 @@ export class DesktopChatShell {
   /* Set by renderer.ts before mount(). Absent means "no settings affordance",
      which is what keeps this class free of any modal it doesn't own. */
   onOpenSettings?: () => void;
+  /* Set by renderer.ts before mount(): asks the main process to clear the
+     pinned panel bounds and return to the default placement. */
+  onResetPosition?: () => void;
 
   private readonly host: DesktopHost;
   private readonly root: HTMLElement;
@@ -142,15 +145,26 @@ export class DesktopChatShell {
      after the fact rather than threaded through renderHeader. Same element
      shape and classes as the buttons Header builds, so styles.css covers it. */
   private mountSettingsButton(header: HTMLElement): void {
-    if (!this.onOpenSettings) return;
     const actions = header.querySelector<HTMLElement>(".claudian-header-actions");
     if (!actions) return;
-    const btn = actions.createSpan({
-      cls: "claudian-header-btn",
-      attr: { "aria-label": "Settings", title: "Settings" },
-    });
-    platform.setIcon(btn, "settings");
-    btn.addEventListener("click", () => this.onOpenSettings?.());
+    /* Reset sits left of the gear, matching the tray's Reset Window
+       Position item so the fix for a mispinned window is one click away. */
+    if (this.onResetPosition) {
+      const reset = actions.createSpan({
+        cls: "claudian-header-btn",
+        attr: { "aria-label": "Reset window position", title: "Reset window position" },
+      });
+      platform.setIcon(reset, "locate-fixed");
+      reset.addEventListener("click", () => this.onResetPosition?.());
+    }
+    if (this.onOpenSettings) {
+      const btn = actions.createSpan({
+        cls: "claudian-header-btn",
+        attr: { "aria-label": "Settings", title: "Settings" },
+      });
+      platform.setIcon(btn, "settings");
+      btn.addEventListener("click", () => this.onOpenSettings?.());
+    }
   }
 
   /* ----- window lock ---------------------------------------------------- */
@@ -557,6 +571,17 @@ export class DesktopChatShell {
     const idx = this.tabs.findIndex(t => t.state.id === this.activeTabId);
     const prev = this.tabs[(idx - 1 + this.tabs.length) % this.tabs.length];
     this.selectTab(prev.state.id);
+  }
+
+  /* Window-level Finder-drop fallback: renderer.ts forwards file drops that
+     landed outside the active tab's DOM (header, tab bar). The tab root's
+     own drop zone consumes drops over the chat area first and marks them
+     defaultPrevented, so nothing arrives here twice. */
+  ingestDroppedFiles(files: File[]): void {
+    const active = this.tabs.find(t => t.state.id === this.activeTabId);
+    if (!active) return;
+    active.ingestDroppedFiles(files);
+    active.focusInput();
   }
 
   focusActiveInput(): void {

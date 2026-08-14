@@ -60,6 +60,9 @@ const IPC_OPEN_SETTINGS = "claudesk:open-settings";
    Answers { ok: boolean, active: string } — `active` is what is registered
    NOW, so a failed attempt still tells the modal what to display. */
 const IPC_SET_HOTKEY = "claudesk:set-hotkey";
+/* renderer -> main: header button equivalent of the tray's Reset Window
+   Position — clear the pinned bounds and return to default placement. */
+const IPC_RESET_POSITION = "claudesk:reset-position";
 
 let panel: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -158,7 +161,15 @@ function createPanel(): void {
     },
   });
 
-  panel.setAlwaysOnTop(true, "screen-saver");
+  /*
+   * "floating", NOT "screen-saver": macOS renders drag images at window
+   * level ~500 (kCGDraggingWindowLevel), and a screen-saver-level window
+   * (1000) sits ABOVE that layer — a Finder drag visibly disappears behind
+   * the panel and the drop is never delivered to it. Floating (level 3)
+   * stays above normal windows while remaining below the drag layer, which
+   * is what makes drag-and-drop into the panel possible at all.
+   */
+  panel.setAlwaysOnTop(true, "floating");
   panel.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   /* main.js lives in app/dist/, index.html one level up in app/. */
@@ -560,6 +571,9 @@ function openSettings(): void {
 
 /* Renderer's Esc path. */
 ipcMain.on(IPC_HIDE, () => hidePanel());
+
+/* Renderer's header reset button. */
+ipcMain.on(IPC_RESET_POSITION, () => resetPanelPosition());
 
 /*
  * Hotkey round trip for the settings modal. Validation is the registration
