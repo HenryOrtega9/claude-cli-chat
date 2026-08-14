@@ -4,7 +4,7 @@ import { StreamJsonParser } from "./StreamJsonParser";
 import { InputWriter } from "./InputWriter";
 import type { StreamEvent, ControlRequestEvent, ContentBlock } from "./Events";
 import { RemoteControlSession } from "./RemoteControlSession";
-import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from "../settings";
+import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from "../settings-data";
 
 /* Returns PIDs of every running Remote Control process. Used by the settings
    UI to count live remote sessions and by killAllRemoteAndOrphans() to sweep

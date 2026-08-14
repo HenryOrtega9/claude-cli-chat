@@ -1,4 +1,4 @@
-import { Notice, type App, type DataAdapter } from "obsidian";
+import { platform, type AppHandle, type FileStorage } from "../platform";
 
 /* MCP server config schema. Mirrors Claude Code's `.mcp.json` and the
    Anthropic MCP spec. Servers can be stdio (command/args) or remote
@@ -71,7 +71,7 @@ export function mcpDenyPattern(name: string): string {
    (which could interleave into a corrupt result). Exported so Persistence and
    PermissionsConfig share one implementation. */
 export async function writeJsonAtomic(
-  adapter: DataAdapter,
+  adapter: FileStorage,
   path: string,
   data: unknown,
 ): Promise<void> {
@@ -124,15 +124,15 @@ function runOnMcpWriteChain<T>(path: string, op: () => Promise<T>): Promise<T> {
 }
 
 export class MCPConfigStore {
-  constructor(private app: App) {}
+  constructor(private app: AppHandle) {}
 
   async ensureDir(): Promise<void> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(".claude"))) await adapter.mkdir(".claude");
   }
 
   async load(): Promise<MCPConfigFile> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(MCP_CONFIG_PATH))) return { mcpServers: {} };
     const text = await adapter.read(MCP_CONFIG_PATH);
     try {
@@ -147,9 +147,9 @@ export class MCPConfigStore {
       const bak = `${MCP_CONFIG_PATH}.bak`;
       try {
         await adapter.write(bak, text);
-        new Notice(`Could not parse ${MCP_CONFIG_PATH}; backup saved to ${bak}`);
+        platform.notify(`Could not parse ${MCP_CONFIG_PATH}; backup saved to ${bak}`);
       } catch {
-        new Notice(`Could not parse ${MCP_CONFIG_PATH}; backup write also failed`);
+        platform.notify(`Could not parse ${MCP_CONFIG_PATH}; backup write also failed`);
       }
       return { mcpServers: {} };
     }
@@ -162,7 +162,7 @@ export class MCPConfigStore {
        (possibly mutated), so this preserves cross-tool metadata that the
        MCPConfigFile type doesn't explicitly model. */
     const payload: Record<string, unknown> = { ...config };
-    await writeJsonAtomic(this.app.vault.adapter, MCP_CONFIG_PATH, payload);
+    await writeJsonAtomic(platform.storage, MCP_CONFIG_PATH, payload);
   }
 
   async listServers(): Promise<Array<{ name: string; config: MCPServerConfig }>> {

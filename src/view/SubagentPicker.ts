@@ -1,4 +1,4 @@
-import { SuggestModal, type App } from "obsidian";
+import { PlatformSuggestModal, type AppHandle } from "../platform";
 import type { SubagentEntry } from "../claude/SubagentDiscovery";
 
 /* Picker for subagent definitions. Mirrors SnippetPicker — Obsidian's
@@ -6,11 +6,11 @@ import type { SubagentEntry } from "../claude/SubagentDiscovery";
    for free. Triggered by `/agent` alone (no name) or by the toolbar pill
    in InputBox. The caller passes the discovered catalog and a callback
    that receives the chosen entry. */
-export class SubagentPicker extends SuggestModal<SubagentEntry> {
+export class SubagentPicker extends PlatformSuggestModal<SubagentEntry> {
   private agents: SubagentEntry[];
   private onChoose: (entry: SubagentEntry) => void;
 
-  constructor(app: App, agents: SubagentEntry[], onChoose: (entry: SubagentEntry) => void) {
+  constructor(app: AppHandle, agents: SubagentEntry[], onChoose: (entry: SubagentEntry) => void) {
     super(app);
     this.agents = agents;
     this.onChoose = onChoose;

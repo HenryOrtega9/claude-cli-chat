@@ -1,4 +1,4 @@
-import { setIcon } from "obsidian";
+import { platform } from "../platform";
 
 /* In-conversation search. Opens via Cmd+F when the view is focused. Walks the
    messages DOM, wraps every matching text run in a `<mark>` element, and
@@ -25,7 +25,7 @@ export class SearchBar {
     this.root.style.display = "none";
 
     const iconEl = this.root.createSpan({ cls: "claudian-search-icon" });
-    setIcon(iconEl, "search");
+    platform.setIcon(iconEl, "search");
 
     this.input = this.root.createEl("input", {
       cls: "claudian-search-input",
@@ -43,15 +43,15 @@ export class SearchBar {
     this.countEl = this.root.createSpan({ cls: "claudian-search-count", text: "" });
 
     const prevBtn = this.root.createSpan({ cls: "claudian-search-btn", attr: { "aria-label": "Previous", title: "Previous (Shift+Enter)" } });
-    setIcon(prevBtn, "chevron-up");
+    platform.setIcon(prevBtn, "chevron-up");
     prevBtn.addEventListener("click", () => this.step(-1));
 
     const nextBtn = this.root.createSpan({ cls: "claudian-search-btn", attr: { "aria-label": "Next", title: "Next (Enter)" } });
-    setIcon(nextBtn, "chevron-down");
+    platform.setIcon(nextBtn, "chevron-down");
     nextBtn.addEventListener("click", () => this.step(1));
 
     const closeBtn = this.root.createSpan({ cls: "claudian-search-btn", attr: { "aria-label": "Close", title: "Close (Esc)" } });
-    setIcon(closeBtn, "x");
+    platform.setIcon(closeBtn, "x");
     closeBtn.addEventListener("click", () => this.close());
   }
 

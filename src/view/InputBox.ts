@@ -1,4 +1,4 @@
-import { setIcon, Notice } from "obsidian";
+import { platform } from "../platform";
 import {
   MODEL_LABELS,
   MODEL_GROUPS,
@@ -15,11 +15,11 @@ import {
   type EffortLevel,
   type PermissionMode,
   type TrustedFolder,
-} from "../settings";
+} from "../settings-data";
 import type { UsageSnapshot } from "../claude/Events";
 import { CLAUDE_ASTERISK_DATA_URI } from "./Welcome";
 import type { Attachment } from "./state";
-import type { ActiveSelection } from "./SelectionTracker";
+import type { ActiveSelection } from "../platform/host";
 
 /* Resolve a picked File to its absolute on-disk path inside Obsidian's
    Electron environment. Two APIs may apply:
@@ -474,12 +474,12 @@ export class InputBox {
       const first = files[0];
       const rel = first.webkitRelativePath ?? "";
       if (!rel) {
-        new Notice("Couldn't read the folder path (no webkitRelativePath).");
+        platform.notify("Couldn't read the folder path (no webkitRelativePath).");
         return;
       }
       const abs = resolveElectronFilePath(first);
       if (!abs) {
-        new Notice("Couldn't read the folder path (Electron didn't expose an absolute path).");
+        platform.notify("Couldn't read the folder path (Electron didn't expose an absolute path).");
         console.error("[claude-cli-chat] No File.path and no webUtils.getPathForFile available for picked folder; first file:", first);
         return;
       }
@@ -492,7 +492,7 @@ export class InputBox {
       const childTail = slash === -1 ? rel : rel.slice(slash + 1);
       const folderPath = abs.slice(0, Math.max(0, abs.length - childTail.length - 1));
       if (!folderPath) {
-        new Notice("Couldn't resolve the folder's absolute path.");
+        platform.notify("Couldn't resolve the folder's absolute path.");
         return;
       }
       this.callbacks.onAddTrustedFolder?.(folderPath);
@@ -693,7 +693,7 @@ export class InputBox {
         tabindex: "0",
       },
     });
-    setIcon(this.attachBtn, "plus");
+    platform.setIcon(this.attachBtn, "plus");
     this.attachBtn.addEventListener("click", e => {
       e.stopPropagation();
       this.toggleAttachPopup();
@@ -761,7 +761,7 @@ export class InputBox {
       cls: "claudian-send-button",
       attr: { "aria-label": "Send", title: "Send (Enter)" },
     });
-    setIcon(this.sendBtn, "send");
+    platform.setIcon(this.sendBtn, "send");
     this.sendBtn.addEventListener("click", () => this.submit());
   }
 
@@ -973,7 +973,13 @@ export class InputBox {
       });
 
       if (server.tools.length > 0) {
-        const toolList = card.createDiv({ cls: "claudian-cost-popup-tool-list" });
+        /* Servers with big tool surfaces (webull ships 68) would otherwise
+           stretch the popup to full screen height; past 10 tools the list
+           becomes its own scroll region capped at ~10 rows. */
+        const toolList = card.createDiv({
+          cls: "claudian-cost-popup-tool-list" +
+            (server.tools.length > 10 ? " is-scrollable" : ""),
+        });
         for (const tool of server.tools) {
           toolList.createDiv({ cls: "claudian-cost-popup-tool", text: tool });
         }
@@ -1179,7 +1185,7 @@ export class InputBox {
   private refreshVoicePill() {
     this.voicePill.toggleClass("is-active", this.currentVoice);
     this.voicePauseBtn.toggleClass("is-hidden", !this.currentVoice);
-    setIcon(this.voicePauseBtn, this.voicePaused ? "play" : "pause");
+    platform.setIcon(this.voicePauseBtn, this.voicePaused ? "play" : "pause");
     const label = this.voicePaused ? "Resume speech" : "Pause speech";
     this.voicePauseBtn.setAttribute("aria-label", label);
     this.voicePauseBtn.setAttribute("title", label);
@@ -1367,7 +1373,7 @@ export class InputBox {
        Finder drops. */
     const pickRow = popup.createDiv({ cls: "claudian-popup-row claudian-popup-row-action" });
     const pickIcon = pickRow.createSpan({ cls: "claudian-popup-row-icon" });
-    setIcon(pickIcon, "folder-open");
+    platform.setIcon(pickIcon, "folder-open");
     pickRow.createSpan({ cls: "claudian-popup-row-label", text: "Pick a file…" });
     pickRow.addEventListener("click", e => {
       e.stopPropagation();
@@ -1396,7 +1402,7 @@ export class InputBox {
 
       const addRow = popup.createDiv({ cls: "claudian-popup-row claudian-popup-row-action" });
       const addIcon = addRow.createSpan({ cls: "claudian-popup-row-icon" });
-      setIcon(addIcon, "plus");
+      platform.setIcon(addIcon, "plus");
       addRow.createSpan({ cls: "claudian-popup-row-label", text: "Add folder…" });
       addRow.addEventListener("click", e => {
         e.stopPropagation();
@@ -1438,7 +1444,7 @@ export class InputBox {
       cls: "claudian-popup-row-remove",
       attr: { "aria-label": "Remove folder", title: "Remove from trusted folders" },
     });
-    setIcon(removeBtn, "x");
+    platform.setIcon(removeBtn, "x");
     removeBtn.addEventListener("click", e => {
       e.stopPropagation();
       this.callbacks.onRemoveTrustedFolder?.(folder.path);
@@ -1657,7 +1663,7 @@ export class InputBox {
       if (i === activeIndex) activeRow = row;
       if (item.icon) {
         const iconEl = row.createSpan({ cls: "claudian-suggestion-icon" });
-        setIcon(iconEl, item.icon);
+        platform.setIcon(iconEl, item.icon);
       }
       const labels = row.createDiv({ cls: "claudian-suggestion-labels" });
       labels.createDiv({ cls: "claudian-suggestion-primary", text: item.primary });
@@ -1755,7 +1761,7 @@ export class InputBox {
          huge pasted image base64-inflates into one stream-json stdin line
          and the turn fails at the CLI/API layer with an opaque error. */
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        new Notice(`Pasted image is too large (max 10MB)`);
+        platform.notify(`Pasted image is too large (max 10MB)`);
         continue;
       }
       /* Avoid FileReader: in some Obsidian/Electron renderer configurations
@@ -1849,7 +1855,7 @@ export class InputBox {
     const target = this.attachments;
     for (const file of files) {
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        new Notice(`${file.name} is too large (max 10MB)`);
+        platform.notify(`${file.name} is too large (max 10MB)`);
         continue;
       }
       try {
@@ -1859,7 +1865,7 @@ export class InputBox {
       } catch (err) {
         console.error("claude-cli-chat: failed to attach file", file.name, err);
         const msg = err instanceof Error ? err.message : String(err);
-        new Notice(`Couldn't attach ${file.name}: ${msg}`);
+        platform.notify(`Couldn't attach ${file.name}: ${msg}`);
       }
     }
     if (this.destroyed) return;
@@ -1920,7 +1926,7 @@ export class InputBox {
       const sel = this.currentSelection;
       const chip = this.contextRow.createDiv({ cls: "claudian-context-chip claudian-context-chip-selection" });
       const iconEl = chip.createSpan({ cls: "claudian-context-chip-icon" });
-      setIcon(iconEl, "text-cursor");
+      platform.setIcon(iconEl, "text-cursor");
       const fileName = sel.filePath.split("/").pop() ?? sel.filePath;
       const rangeLabel = sel.startLine === sel.endLine
         ? `line ${sel.startLine}`
@@ -1934,7 +1940,7 @@ export class InputBox {
         cls: "claudian-context-chip-remove",
         attr: { "aria-label": "Detach selection", title: "Detach selection" },
       });
-      setIcon(remove, "x");
+      platform.setIcon(remove, "x");
       remove.addEventListener("click", e => {
         e.stopPropagation();
         this.currentSelection = null;
@@ -1967,14 +1973,14 @@ export class InputBox {
         iconName = "file";
         label = att.filename ?? "text file";
       }
-      setIcon(iconEl, iconName);
+      platform.setIcon(iconEl, iconName);
       chip.createSpan({
         cls: "claudian-context-chip-label",
         text: label,
         attr: att.filename ? { title: att.filename } : {},
       });
       const remove = chip.createSpan({ cls: "claudian-context-chip-remove", attr: { "aria-label": "Remove", title: "Remove" } });
-      setIcon(remove, "x");
+      platform.setIcon(remove, "x");
       remove.addEventListener("click", e => {
         e.stopPropagation();
         this.attachments.splice(i, 1);

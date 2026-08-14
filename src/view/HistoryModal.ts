@@ -1,4 +1,4 @@
-import { App, Modal, setIcon } from "obsidian";
+import { platform, PlatformModal, type AppHandle } from "../platform";
 import type { Persistence } from "../storage/Persistence";
 
 type ConversationRow = {
@@ -8,7 +8,7 @@ type ConversationRow = {
   messageCount: number;
 };
 
-export class HistoryModal extends Modal {
+export class HistoryModal extends PlatformModal {
   /* Guards against a second click landing while the first onPick is still
      mid-flight. Without it, a user double-clicking a row (or clicking two
      rows in quick succession) could spawn two tab-creation paths racing
@@ -16,7 +16,7 @@ export class HistoryModal extends Modal {
   private processing = false;
 
   constructor(
-    app: App,
+    app: AppHandle,
     private persistence: Persistence,
     private onPick: (conversationId: string) => void
   ) {
@@ -54,7 +54,7 @@ export class HistoryModal extends Modal {
       cls: "claudian-history-action",
       attr: { "aria-label": "Open in new tab", title: "Open in new tab" },
     });
-    setIcon(openBtn, "external-link");
+    platform.setIcon(openBtn, "external-link");
 
     row.addEventListener("click", () => {
       if (this.processing) return;

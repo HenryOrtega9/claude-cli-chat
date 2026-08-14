@@ -1,4 +1,4 @@
-import { FileSystemAdapter, type App } from "obsidian";
+import { platform, type AppHandle } from "../platform";
 import { mkdirSync, renameSync, writeFileSync } from "fs";
 import type { Attachment, ChatMessage, TabState, ToolCall } from "../view/state";
 import { truncateToolResult } from "../view/state";
@@ -72,9 +72,14 @@ type TabIndex = {
 };
 
 export class Persistence {
-  private dir = ".claude-cli-chat";
-  private convDir = `${this.dir}/conversations`;
-  private indexPath = `${this.dir}/tabs.json`;
+  /* Base-relative store directory. Defaults to the plugin's historical
+     location; the standalone desktop shell passes a namespaced subdirectory
+     so the two UIs keep independent tab stores and never contend (which is
+     what lets them run concurrently — each guards only its own store with
+     its own window.lock). */
+  private readonly dir: string;
+  private readonly convDir: string;
+  private readonly indexPath: string;
   private pendingWrites = new Map<string, { handle: ReturnType<typeof setTimeout>; state: TabState }>();
   /* Per-tab in-flight save promise. Used by deleteTab/flush to await a save
      that's already started before issuing remove() or returning. */
@@ -92,16 +97,23 @@ export class Persistence {
      load). */
   private lastIndexWrite: Promise<void> = Promise.resolve();
 
-  constructor(private app: App) {}
+  constructor(
+    private app: AppHandle,
+    dir = ".claude-cli-chat",
+  ) {
+    this.dir = dir;
+    this.convDir = `${dir}/conversations`;
+    this.indexPath = `${dir}/tabs.json`;
+  }
 
   private async ensureDirs(): Promise<void> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(this.dir))) await adapter.mkdir(this.dir);
     if (!(await adapter.exists(this.convDir))) await adapter.mkdir(this.convDir);
   }
 
   async loadIndex(): Promise<TabIndex | null> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(this.indexPath))) return null;
     try {
       const parsed = JSON.parse(await adapter.read(this.indexPath));
@@ -118,7 +130,7 @@ export class Persistence {
   }
 
   async loadTab(id: string): Promise<TabState | null> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     const path = this.convPath(id);
     if (!(await adapter.exists(path))) return null;
     let stored: Partial<StoredTab> | null;
@@ -173,7 +185,7 @@ export class Persistence {
     const write = this.lastIndexWrite.then(async () => {
       try {
         await this.ensureDirs();
-        await writeJsonAtomic(this.app.vault.adapter, this.indexPath, index);
+        await writeJsonAtomic(platform.storage, this.indexPath, index);
       } catch (err) {
         this.lastIndexJson = null;
         throw err;
@@ -295,7 +307,7 @@ export class Persistence {
   private async doSaveTab(state: TabState): Promise<void> {
     await this.ensureDirs();
     const { stored, meta } = this.toStored(state);
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     /* Sidecar meta file lets listConversations skip the full body read.
        Written atomically too so a crash mid-rotation never leaves the
        History dropdown reading half-written JSON. Meta is written FIRST:
@@ -313,12 +325,11 @@ export class Persistence {
      mid-write and the last 500ms of debounced edits silently lost. This
      writes any still-pending debounced tab states plus the latest index
      payload with sync fs calls (tmp + rename, so files stay whole) before
-     teardown proceeds. Desktop-only: degrades to a no-op off
-     FileSystemAdapter. */
+     teardown proceeds. Desktop-only: degrades to a no-op when storage
+     isn't filesystem-backed (basePath() === null). */
   flushSync(): void {
-    const adapter = this.app.vault.adapter;
-    if (!(adapter instanceof FileSystemAdapter)) return;
-    const base = adapter.getBasePath();
+    const base = platform.storage.basePath();
+    if (base === null) return;
     const writeSync = (relPath: string, payload: string) => {
       const abs = `${base}/${relPath}`;
       const tmp = `${abs}.${Date.now().toString(36)}.tmp`;
@@ -380,7 +391,7 @@ export class Persistence {
     if (inflight) {
       try { await inflight; } catch { /* ignore — we're deleting anyway */ }
     }
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     const path = this.convPath(id);
     if (await adapter.exists(path)) await adapter.remove(path);
     const metaPath = this.metaPath(id);
@@ -428,7 +439,7 @@ export class Persistence {
      the full file if a sidecar is missing (e.g. old data from before
      sidecars existed). */
   async listConversations(): Promise<Array<{ id: string; title: string; updatedAt: number; messageCount: number }>> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(this.convDir))) return [];
     const listing = await adapter.list(this.convDir);
     const out: Array<{ id: string; title: string; updatedAt: number; messageCount: number }> = [];

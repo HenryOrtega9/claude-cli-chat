@@ -1,6 +1,6 @@
-import { Modal, Notice, type App } from "obsidian";
+import { platform, PlatformModal, type AppHandle } from "../platform";
 import { spawn } from "node:child_process";
-import type ClaudeChatPlugin from "../main";
+import type { PluginHost } from "../platform/host";
 import type { SubagentEntry } from "../claude/SubagentDiscovery";
 
 /* Read-only manager for subagent definitions discovered on disk. Mirrors
@@ -8,10 +8,10 @@ import type { SubagentEntry } from "../claude/SubagentDiscovery";
    button, grouped list of rows) but skips the inline editor since YAML
    frontmatter is a footgun and the user is better served by opening the
    file directly. */
-export class SubagentManagerModal extends Modal {
-  private plugin: ClaudeChatPlugin;
+export class SubagentManagerModal extends PlatformModal {
+  private plugin: PluginHost;
 
-  constructor(app: App, plugin: ClaudeChatPlugin) {
+  constructor(app: AppHandle, plugin: PluginHost) {
     super(app);
     this.plugin = plugin;
   }
@@ -49,7 +49,7 @@ export class SubagentManagerModal extends Modal {
     refreshBtn.addEventListener("click", () => {
       this.plugin.refreshSubagentCatalog();
       this.render();
-      new Notice(`Rescanned subagents: ${this.plugin.subagentCatalog.agents.length} discovered.`);
+      platform.notify(`Rescanned subagents: ${this.plugin.subagentCatalog.agents.length} discovered.`);
     });
 
     if (agents.length === 0) {
@@ -120,7 +120,7 @@ export class SubagentManagerModal extends Modal {
     try {
       spawn("open", [filePath], { stdio: "ignore", detached: true }).unref();
     } catch (err) {
-      new Notice(`Failed to open file: ${(err as Error).message}`);
+      platform.notify(`Failed to open file: ${(err as Error).message}`);
     }
   }
 
@@ -128,7 +128,7 @@ export class SubagentManagerModal extends Modal {
     try {
       spawn("open", ["-R", filePath], { stdio: "ignore", detached: true }).unref();
     } catch (err) {
-      new Notice(`Failed to reveal file: ${(err as Error).message}`);
+      platform.notify(`Failed to reveal file: ${(err as Error).message}`);
     }
   }
 }

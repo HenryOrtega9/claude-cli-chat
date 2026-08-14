@@ -1,4 +1,4 @@
-import { Notice, type App } from "obsidian";
+import { platform, type AppHandle } from "../platform";
 import { writeJsonAtomic } from "../mcp/MCPConfig";
 
 /* Schema mirrors Claude Code's <vault>/.claude/settings.json `permissions`
@@ -67,15 +67,15 @@ export class PermissionsConfigStore {
      promise; readers stay lock-free since stale reads are tolerable. */
   private writeChain: Promise<void> = Promise.resolve();
 
-  constructor(private app: App) {}
+  constructor(private app: AppHandle) {}
 
   private async ensureDir(): Promise<void> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(".claude"))) await adapter.mkdir(".claude");
   }
 
   async load(): Promise<SettingsJsonFile> {
-    const adapter = this.app.vault.adapter;
+    const adapter = platform.storage;
     if (!(await adapter.exists(SETTINGS_JSON_PATH))) return {};
     const text = await adapter.read(SETTINGS_JSON_PATH);
     try {
@@ -110,9 +110,9 @@ export class PermissionsConfigStore {
       const bak = `${SETTINGS_JSON_PATH}.bak`;
       try {
         await adapter.write(bak, text);
-        new Notice(`Could not parse ${SETTINGS_JSON_PATH}; backup saved to ${bak}`);
+        platform.notify(`Could not parse ${SETTINGS_JSON_PATH}; backup saved to ${bak}`);
       } catch {
-        new Notice(`Could not parse ${SETTINGS_JSON_PATH}; backup write also failed`);
+        platform.notify(`Could not parse ${SETTINGS_JSON_PATH}; backup write also failed`);
       }
       return {};
     }
@@ -120,7 +120,7 @@ export class PermissionsConfigStore {
 
   async save(config: SettingsJsonFile): Promise<void> {
     await this.ensureDir();
-    await writeJsonAtomic(this.app.vault.adapter, SETTINGS_JSON_PATH, config);
+    await writeJsonAtomic(platform.storage, SETTINGS_JSON_PATH, config);
   }
 
   async listAllow(): Promise<string[]> {

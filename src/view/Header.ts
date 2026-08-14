@@ -1,4 +1,4 @@
-import { setIcon } from "obsidian";
+import { platform } from "../platform";
 import { CLAUDE_ASTERISK_DATA_URI } from "./Welcome";
 
 export type HeaderCallbacks = {
@@ -26,42 +26,42 @@ export function renderHeader(parent: HTMLElement, callbacks: HeaderCallbacks): H
     cls: "claudian-header-btn claudian-new-tab-btn",
     attr: { "aria-label": "New chat tab", title: "New chat tab" },
   });
-  setIcon(newTabBtn, "square-plus");
+  platform.setIcon(newTabBtn, "square-plus");
   newTabBtn.addEventListener("click", () => callbacks.onNewTab());
 
   const clearBtn = actions.createSpan({
     cls: "claudian-header-btn",
     attr: { "aria-label": "Clear current chat", title: "Clear current chat" },
   });
-  setIcon(clearBtn, "square-pen");
+  platform.setIcon(clearBtn, "square-pen");
   clearBtn.addEventListener("click", () => callbacks.onClear());
 
   const snippetsBtn = actions.createSpan({
     cls: "claudian-header-btn",
     attr: { "aria-label": "Environment snippets", title: "Apply environment snippet" },
   });
-  setIcon(snippetsBtn, "layers");
+  platform.setIcon(snippetsBtn, "layers");
   snippetsBtn.addEventListener("click", () => callbacks.onSnippets());
 
   const mcpBtn = actions.createSpan({
     cls: "claudian-header-btn",
     attr: { "aria-label": "MCP servers", title: "Manage MCP servers" },
   });
-  setIcon(mcpBtn, "plug-zap");
+  platform.setIcon(mcpBtn, "plug-zap");
   mcpBtn.addEventListener("click", () => callbacks.onMcp());
 
   const historyBtn = actions.createSpan({
     cls: "claudian-header-btn",
     attr: { "aria-label": "Conversation history", title: "Conversation history" },
   });
-  setIcon(historyBtn, "history");
+  platform.setIcon(historyBtn, "history");
   historyBtn.addEventListener("click", () => callbacks.onHistory());
 
   const remoteBtn = actions.createSpan({
     cls: "claudian-header-btn",
     attr: { "aria-label": "Toggle Remote Control", title: "Toggle Remote Control" },
   });
-  setIcon(remoteBtn, "smartphone");
+  platform.setIcon(remoteBtn, "smartphone");
   remoteBtn.addEventListener("click", () => callbacks.onToggleRemoteControl());
 
   return header;

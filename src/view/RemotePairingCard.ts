@@ -1,4 +1,4 @@
-import { Notice, setIcon } from "obsidian";
+import { platform } from "../platform";
 import type { RemoteStatus } from "../claude/RemoteControlSession";
 
 export type PairingCardCallbacks = {
@@ -21,7 +21,7 @@ export class RemotePairingCard {
 
     const header = this.root.createDiv({ cls: "claudian-remote-header" });
     const iconEl = header.createSpan({ cls: "claudian-remote-icon" });
-    setIcon(iconEl, "smartphone");
+    platform.setIcon(iconEl, "smartphone");
     header.createSpan({ cls: "claudian-remote-title", text: "Remote Control" });
     this.statusEl = header.createSpan({ cls: "claudian-remote-status" });
     this.setStatus("starting");
@@ -39,7 +39,7 @@ export class RemotePairingCard {
       cls: "claudian-remote-copy",
       attr: { "aria-label": "Copy URL", title: "Copy URL" },
     });
-    setIcon(this.copyBtn, "copy");
+    platform.setIcon(this.copyBtn, "copy");
     this.copyBtn.addEventListener("click", () => this.copyUrl());
 
     const actions = body.createDiv({ cls: "claudian-remote-actions" });
@@ -95,6 +95,6 @@ export class RemotePairingCard {
   private copyUrl() {
     if (!this.url) return;
     void navigator.clipboard.writeText(this.url);
-    new Notice("Pairing URL copied");
+    platform.notify("Pairing URL copied");
   }
 }

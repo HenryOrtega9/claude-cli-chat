@@ -31,7 +31,7 @@
    left off instead of re-narrating from sentence one. */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import type { ClaudeChatSettings } from "../settings";
+import type { ClaudeChatSettings } from "../settings-data";
 
 /* A stream = one assistant message being spoken incrementally. Keyed by
    message id. `spoken` is the index into the RAW markdown text up to which

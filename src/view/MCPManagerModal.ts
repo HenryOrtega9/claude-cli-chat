@@ -1,7 +1,7 @@
-import { Modal, Notice, type App } from "obsidian";
+import { platform, PlatformModal, type AppHandle } from "../platform";
 import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
 import type { ParsedMcpServer } from "../mcp/McpServerList";
-import type ClaudeChatPlugin from "../main";
+import type { PluginHost } from "../platform/host";
 
 /* Modal for per-vault MCP server control. Lists every server the Claude Code
    CLI actually loads (via `claude mcp list` — the authoritative source, since
@@ -16,8 +16,8 @@ import type ClaudeChatPlugin from "../main";
    Server definitions (command, URL, env, auth) are owned by Claude Code and
    managed with `claude mcp add` / `claude mcp remove`; this modal intentionally
    does not edit them, so it can't drift from or corrupt the CLI's own config. */
-export class MCPManagerModal extends Modal {
-  private plugin: ClaudeChatPlugin;
+export class MCPManagerModal extends PlatformModal {
+  private plugin: PluginHost;
   private store: MCPConfigStore;
   /* Set on close so async list/toggle callbacks that resolve after the user
      dismissed the modal don't touch a torn-down DOM. */
@@ -37,7 +37,7 @@ export class MCPManagerModal extends Modal {
      tab's cost-surface pill in case toggles changed the enabled set. */
   private onClosed: (() => void) | null = null;
 
-  constructor(app: App, plugin: ClaudeChatPlugin, onClosed?: () => void) {
+  constructor(app: AppHandle, plugin: PluginHost, onClosed?: () => void) {
     super(app);
     this.plugin = plugin;
     this.store = new MCPConfigStore(app);
@@ -210,7 +210,7 @@ export class MCPManagerModal extends Modal {
         if (enabled) this.disabled.delete(name);
         else this.disabled.add(name);
         await this.plugin.refreshMcpDenyPatterns();
-        new Notice(
+        platform.notify(
           `${enabled ? "Enabled" : "Disabled"} "${name}" for this vault. Restart any active chats (/clear) to apply.`,
           6000,
         );
@@ -218,7 +218,7 @@ export class MCPManagerModal extends Modal {
       if (!this.closed) this.render();
     } catch (err) {
       checkbox.checked = !enabled; /* revert to the pre-click state */
-      new Notice(`Failed to toggle MCP server: ${(err as Error).message}`);
+      platform.notify(`Failed to toggle MCP server: ${(err as Error).message}`);
     }
   }
 }

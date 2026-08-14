@@ -1,4 +1,4 @@
-import { Notice, TFile, TFolder, type App, type Component, type EventRef } from "obsidian";
+import { platform, type RenderLifecycle } from "../platform";
 import { MessageListRenderer } from "./MessageRenderer";
 import { ApprovalArea, type ApprovalDecision } from "./ApprovalModal";
 import { InputBox, extractObsidianUrlPaths, type SubmitPayload, type Suggestion } from "./InputBox";
@@ -6,11 +6,10 @@ import { renderWelcome, setWelcomeVisible } from "./Welcome";
 import { RemotePairingCard } from "./RemotePairingCard";
 import { StatusIndicator } from "./StatusIndicator";
 import { SearchBar } from "./SearchBar";
-import { ActiveFileIndicator } from "./ActiveFileIndicator";
-import { SelectionTracker, type ActiveSelection } from "./SelectionTracker";
+import type { PluginHost, ActiveSelection, ActiveFileIndicatorHandle, SelectionTrackerHandle } from "../platform/host";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
-import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings";
+import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings-data";
 import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
 import { RemoteControlSession, sessionFilePathFor, projectDirFor } from "../claude/RemoteControlSession";
 import { rm } from "node:fs/promises";
@@ -23,7 +22,6 @@ import { CreateSubagentModal } from "./CreateSubagentModal";
 import type { SubagentEntry } from "../claude/SubagentDiscovery";
 import { StateEmitter } from "../claude/StateEmitter";
 import { extractOfficeText, isExtractableOffice } from "../util/officeExtract";
-import type ClaudeChatPlugin from "../main";
 import type {
   StreamEvent,
   ContentBlock,
@@ -56,9 +54,8 @@ export class TabController {
   readonly root: HTMLElement;
   mode: TabMode = "local";
 
-  private plugin: ClaudeChatPlugin;
-  private app: App;
-  private component: Component;
+  private plugin: PluginHost;
+  private component: RenderLifecycle;
   private session: TabSession | null = null;
   private remoteSession: RemoteControlSession | null = null;
   /* Session ids this tab has used while incognito. `--no-session-persistence`
@@ -84,8 +81,8 @@ export class TabController {
   private inputBox: InputBox;
   private statusIndicator: StatusIndicator;
   private searchBar: SearchBar;
-  private activeFileIndicator: ActiveFileIndicator;
-  private selectionTracker: SelectionTracker;
+  private activeFileIndicator: ActiveFileIndicatorHandle;
+  private selectionTracker: SelectionTrackerHandle;
   private onStateChangeCb: () => void;
 
   /* Maps tool_use_id to the ChatMessage holding that tool call, so tool_result
@@ -109,7 +106,7 @@ export class TabController {
      empty-query "recently modified" ordering can lag a content edit until the
      next structural change — an accepted trade for the typing-latency win. */
   private mentionIndex: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> | null = null;
-  private mentionIndexRefs: EventRef[] = [];
+  private mentionIndexUnsub: (() => void) | null = null;
 
   /* Unsubscribe for the SpeechController playback listener that drives the
      composer's speaking indicator. Torn down in destroy(). */
@@ -146,28 +143,24 @@ export class TabController {
   private replayDone: Promise<void>;
 
   constructor(
-    plugin: ClaudeChatPlugin,
+    plugin: PluginHost,
     parent: HTMLElement,
-    component: Component,
+    component: RenderLifecycle,
     state: TabState | null,
     onStateChange: () => void
   ) {
     this.plugin = plugin;
-    this.app = plugin.app;
     this.component = component;
     this.state = state ?? makeTabState();
     this.onStateChangeCb = onStateChange;
 
     /* Invalidate the cached @-mention index when the vault tree changes. Torn
-       down in destroy() via offref so the listeners don't outlive the tab.
-       Content "modify" is intentionally not watched — it would rebuild the
-       index mid-edit and defeat the cache; only structural changes matter. */
+       down in destroy() via the unsubscribe closure so the listener doesn't
+       outlive the tab. Content "modify" is intentionally not watched — it
+       would rebuild the index mid-edit and defeat the cache; only structural
+       changes matter (onTreeChange fires on create/delete/rename only). */
     const invalidateMentionIndex = () => { this.mentionIndex = null; };
-    this.mentionIndexRefs.push(
-      this.app.vault.on("create", invalidateMentionIndex),
-      this.app.vault.on("delete", invalidateMentionIndex),
-      this.app.vault.on("rename", invalidateMentionIndex),
-    );
+    this.mentionIndexUnsub = platform.vaultFeatures?.onTreeChange(invalidateMentionIndex) ?? null;
 
     this.root = parent.createDiv({ cls: "claudian-tab-content" });
 
@@ -207,7 +200,7 @@ export class TabController {
       }
     });
 
-    this.renderer = new MessageListRenderer(this.app, this.component, this.messagesEl);
+    this.renderer = new MessageListRenderer(null, this.component, this.messagesEl);
     this.renderer.setActionCallbacks({
       onFork: messageId => this.onForkRequest?.(this, messageId),
     });
@@ -341,9 +334,8 @@ export class TabController {
        authoritative — even when empty. */
     const initialPinned = this.state.pinnedFilePaths ?? [];
     const initialSticky = this.state.stickyPinnedFilePaths ?? initialPinned;
-    this.activeFileIndicator = new ActiveFileIndicator(
+    this.activeFileIndicator = this.plugin.createActiveFileIndicator(
       this.root,
-      this.app,
       initialPinned,
       initialSticky,
       {
@@ -373,7 +365,7 @@ export class TabController {
     /* SelectionTracker pushes the active editor selection into the input
        box as a pinned context chip. Selection survives keystrokes; the chip
        is consumed (cleared) on submit. */
-    this.selectionTracker = new SelectionTracker(this.app, sel => {
+    this.selectionTracker = this.plugin.createSelectionTracker(sel => {
       this.inputBox.setSelection(sel);
     });
 
@@ -413,8 +405,7 @@ export class TabController {
   private sentOfficePaths = new Map<string, number>();
 
   private officeFileMtime(path: string): number | undefined {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    return file instanceof TFile ? file.stat.mtime : undefined;
+    return platform.vaultFeatures?.fileMtime(path);
   }
   async destroy(): Promise<void> {
     this.destroyed = true;
@@ -430,8 +421,8 @@ export class TabController {
        race against our own teardown. teardownSession() awaits SIGTERM and
        the eventual process-exit. */
     if (this.remoteSession) this.plugin.subprocessManager.unregisterRemote(this.state.id);
-    for (const ref of this.mentionIndexRefs) this.app.vault.offref(ref);
-    this.mentionIndexRefs = [];
+    this.mentionIndexUnsub?.();
+    this.mentionIndexUnsub = null;
     await this.teardownSession("destroy");
     const remoteWork = this.remoteSession ? [this.remoteSession.dispose()] : [];
     const tailerWork = this.jsonlTailer ? [this.jsonlTailer.stop()] : [];
@@ -451,7 +442,7 @@ export class TabController {
        writes (--no-session-persistence). Block the switch rather than start a
        remote session that can never receive events. */
     if (mode === "remote" && this.state.incognito) {
-      new Notice("Incognito chats are local-only — Remote Control needs the session file that incognito disables.", 6000);
+      platform.notify("Incognito chats are local-only — Remote Control needs the session file that incognito disables.", 6000);
       return;
     }
     /* eslint-disable no-console */
@@ -612,7 +603,7 @@ export class TabController {
     const pinCount = (this.state.pinnedFilePaths ?? []).length;
     let mcpServers: Array<{ name: string; enabled: boolean; tools: string[] }> = [];
     try {
-      const disabled = new Set(await new MCPConfigStore(this.app).getDisabledServerNames());
+      const disabled = new Set(await new MCPConfigStore(null).getDisabledServerNames());
       const toolMap = this.state.mcpToolsByServer ?? {};
       const cachedMap = this.plugin.settings.mcpToolCache;
       /* Authoritative server set from the CLI (cached). Tool counts come from
@@ -783,7 +774,7 @@ export class TabController {
     switch (head) {
       case "/clear":
         void this.clear();
-        new Notice("Cleared chat — next message starts a new Claude session.");
+        platform.notify("Cleared chat — next message starts a new Claude session.");
         return true;
       case "/help": {
         const skills = this.state.availableSkills ?? [];
@@ -794,7 +785,7 @@ export class TabController {
         const agentsLine = this.plugin.subagentCatalog.agents.length > 0
           ? `Subagents (${this.plugin.subagentCatalog.agents.length}): ${this.plugin.subagentCatalog.agents.map(a => a.name).join(", ")}`
           : "Subagents: (none discovered — add .md files under <vault>/.claude/agents/)";
-        new Notice(
+        platform.notify(
           [
             "Plugin commands:",
             "  /clear — reset this tab to a fresh session",
@@ -824,7 +815,7 @@ export class TabController {
         }
         const entry = this.plugin.subagentCatalog.agents.find(a => a.name === name);
         if (!entry) {
-          new Notice(
+          platform.notify(
             `No subagent named "${name}". Run /agent (no name) to pick from the discovered catalog.`,
             8000,
           );
@@ -842,7 +833,7 @@ export class TabController {
      calls back and we refresh the toolbar pill count so the new agent
      surfaces immediately. */
   openCreateSubagentModal(): void {
-    new CreateSubagentModal(this.app, this.plugin, () => {
+    new CreateSubagentModal(null, this.plugin, () => {
       this.inputBox.setAgentCount(this.plugin.subagentCatalog.agents.length);
     }).open();
   }
@@ -854,13 +845,13 @@ export class TabController {
   openSubagentPicker(followup?: string): void {
     const agents = this.plugin.subagentCatalog.agents;
     if (agents.length === 0) {
-      new Notice(
+      platform.notify(
         "No subagents discovered. Add a markdown file under <vault>/.claude/agents/ or ~/.claude/agents/.",
         8000,
       );
       return;
     }
-    new SubagentPicker(this.app, agents, (entry) => {
+    new SubagentPicker(null, agents, (entry) => {
       this.launchSubagent(entry, followup ?? "");
     }).open();
   }
@@ -873,7 +864,7 @@ export class TabController {
      Opus the most creative interpretation). */
   launchSubagent(entry: SubagentEntry, followup?: string): void {
     if (this.state.busy) {
-      new Notice("Wait for the current turn to finish before launching a subagent.");
+      platform.notify("Wait for the current turn to finish before launching a subagent.");
       return;
     }
     const followupText = (followup ?? "").trim();
@@ -962,7 +953,7 @@ export class TabController {
        needs_permission), whose 5s heartbeat would otherwise re-assert that app
        on the TC001 forever. Drop back to ready, mirroring clearConversation. */
     StateEmitter.setState("ready");
-    new Notice("Stopped Claude.");
+    platform.notify("Stopped Claude.");
     this.onStateChangeCb();
   }
 
@@ -1276,7 +1267,7 @@ export class TabController {
         if (mtime !== undefined && this.sentOfficePaths.get(p) === mtime) continue;
       }
       try {
-        const extracted = await extractOfficeText(this.app, p);
+        const extracted = await extractOfficeText(null, p);
         officeInlines.push(`<file path="${p}">\n${extracted}\n</file>`);
         if (stickySet.has(p)) {
           const mtime = this.officeFileMtime(p);
@@ -1284,7 +1275,7 @@ export class TabController {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        new Notice(`Couldn't extract text from ${p}: ${message}`);
+        platform.notify(`Couldn't extract text from ${p}: ${message}`);
         /* Extraction failing must not silently drop the file from what
            Claude sees — the user still pinned it and expects it in
            context. Note the path and failure inline instead of an @-ref:
@@ -2307,7 +2298,7 @@ export class TabController {
     const overageSuffix = (info.isUsingOverage || info.overageStatus === "blocked") && info.overageResetsAt
       ? ` Overage resets ${this.formatResetTime(info.overageResetsAt)}.`
       : "";
-    new Notice(`Claude ${cap} ${verb}.${resetSuffix}${overageSuffix}`, 8000);
+    platform.notify(`Claude ${cap} ${verb}.${resetSuffix}${overageSuffix}`, 8000);
   }
 
   /* resetsAt arrives as Unix epoch seconds; tolerate ms just in case. */
@@ -2454,67 +2445,34 @@ export class TabController {
      fallback. The pill bar handles file-vs-folder rendering via its own
      vault lookup, so this method doesn't need to distinguish kinds. */
   private tryPinVaultPath(path: string): boolean {
-    const direct = this.app.vault.getAbstractFileByPath(path);
-    if (direct instanceof TFile || direct instanceof TFolder) {
-      this.activeFileIndicator.addPinnedPath(direct.path);
+    const kind = platform.vaultFeatures?.pathKind(path);
+    if (kind === "file" || kind === "folder") {
+      this.activeFileIndicator.addPinnedPath(path);
       return true;
     }
     /* Wikilink fallback: resolve bare note names like "MyNote" against the
        metadata cache. Sources from the active file's path so relative
        resolution works the same as Obsidian's built-in link resolution. */
-    const activePath = this.app.workspace.getActiveFile()?.path ?? "";
-    const dest = this.app.metadataCache.getFirstLinkpathDest(path, activePath);
+    const activePath = platform.vaultFeatures?.activeFilePath() ?? "";
+    const dest = platform.vaultFeatures?.resolveLink(path, activePath);
     if (dest) {
-      this.activeFileIndicator.addPinnedPath(dest.path);
+      this.activeFileIndicator.addPinnedPath(dest);
       return true;
     }
     return false;
   }
 
-  /* Reads Obsidian's internal drag state and resolves it to vault paths.
-     File-explorer drags populate `app.dragManager.draggable` with the
-     dragged TFile/TFolder (or a `files` array for multi-select) but
-     typically leave the HTML5 dataTransfer empty, so this is the only
-     reliable way to detect that a vault drag is in flight from inside our
-     dragover/drop handlers. Link drags (a [[wikilink]] dragged out of an
-     editor, a search result, a backlink, a bookmark, a tab header) carry
-     no TFile at all — just `linktext` + `sourcePath` — so those resolve
-     through the metadata cache like Obsidian's own link resolution. The
-     `dragManager` field is internal (not in the public Obsidian d.ts), so
-     we narrow through `unknown` rather than reaching for `any`. */
+  /* Reads the host's internal drag state and resolves it to vault paths.
+     File-explorer drags populate the drag manager with the dragged file or
+     folder (or a `files` array for multi-select) but typically leave the
+     HTML5 dataTransfer empty, so this is the only reliable way to detect
+     that a vault drag is in flight from inside our dragover/drop handlers.
+     Link drags (a [[wikilink]] dragged out of an editor, a search result, a
+     backlink, a bookmark, a tab header) carry no file at all — just linktext
+     + sourcePath — and resolve through link resolution inside readDragPaths.
+     Empty array = no vault drag in flight (or no vault at all). */
   private readDragManagerPaths(): string[] {
-    const dm = (this.app as unknown as {
-      dragManager?: {
-        draggable?: {
-          file?: unknown;
-          files?: unknown[];
-          linktext?: unknown;
-          sourcePath?: unknown;
-          source?: unknown;
-          type?: unknown;
-        };
-      };
-    }).dragManager;
-    const draggable = dm?.draggable;
-    if (!draggable) return [];
-    const paths: string[] = [];
-    if (draggable.file instanceof TFile || draggable.file instanceof TFolder) {
-      paths.push(draggable.file.path);
-    }
-    if (Array.isArray(draggable.files)) {
-      for (const f of draggable.files) {
-        if (f instanceof TFile || f instanceof TFolder) paths.push(f.path);
-      }
-    }
-    if (paths.length === 0 && draggable.type === "link" && typeof draggable.linktext === "string") {
-      /* linktext may carry a heading/block subpath ("Note#Section") — strip
-         it; pins are whole-file. */
-      const bare = draggable.linktext.split("#")[0].trim();
-      const source = typeof draggable.sourcePath === "string" ? draggable.sourcePath : "";
-      const dest = this.app.metadataCache.getFirstLinkpathDest(bare, source);
-      if (dest) paths.push(dest.path);
-    }
-    return paths;
+    return platform.vaultFeatures?.readDragPaths() ?? [];
   }
 
   private isVaultDragActive(): boolean {
@@ -2574,7 +2532,7 @@ export class TabController {
     this.plugin.settings.trustedFolders = list;
     await this.plugin.saveSettings();
     await this.plugin.permissionsStore.addAllowMany(trustedFolderAllowPatterns(path));
-    new Notice(`Trusted ${path}`);
+    platform.notify(`Trusted ${path}`);
   }
 
   private async toggleTrustedFolder(rawPath: string, enabled: boolean): Promise<void> {
@@ -2616,23 +2574,8 @@ export class TabController {
      the empty-query list, matching Obsidian's quick-switcher behavior. */
   private getMentionIndex(): Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> {
     if (this.mentionIndex) return this.mentionIndex;
-    const index: Array<{ kind: "file" | "folder"; path: string; name: string; mtime: number; ext: string }> = [];
-    for (const f of this.app.vault.getFiles()) {
-      index.push({ kind: "file", path: f.path, name: f.basename, mtime: f.stat.mtime, ext: f.extension });
-    }
-    const walkFolders = (folder: TFolder) => {
-      for (const child of folder.children) {
-        if (child instanceof TFolder) {
-          if (child.path !== "" && child.path !== "/") {
-            index.push({ kind: "folder", path: child.path, name: child.name, mtime: 0, ext: "" });
-          }
-          walkFolders(child);
-        }
-      }
-    };
-    walkFolders(this.app.vault.getRoot());
-    this.mentionIndex = index;
-    return index;
+    this.mentionIndex = platform.vaultFeatures?.listIndexEntries() ?? [];
+    return this.mentionIndex;
   }
 
   /* Rank vault files AND folders for an @-mention query. Simple heuristic:

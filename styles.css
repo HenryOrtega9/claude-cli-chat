@@ -2292,6 +2292,13 @@ mark.claudian-search-mark.is-active {
   flex-direction: column;
   gap: 2px;
 }
+/* Applied by InputBox when a server has >10 tools: cap at ~10 rows and
+   scroll internally so one big server can't stretch the whole popup. */
+.claudian-cost-popup-tool-list.is-scrollable {
+  max-height: 176px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
 .claudian-cost-popup-tool {
   font-family: var(--font-monospace);
   font-size: 11px;

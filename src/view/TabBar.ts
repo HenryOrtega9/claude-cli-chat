@@ -1,4 +1,4 @@
-import { Menu, setIcon } from "obsidian";
+import { platform } from "../platform";
 
 export type TabBarCallbacks = {
   onSelect: (tabId: string) => void;
@@ -29,7 +29,7 @@ export class TabBar {
       cls: "claudian-tab-badge claudian-tab-badge-new",
       attr: { "aria-label": "New tab", title: "New tab" },
     });
-    setIcon(this.newBtn, "plus");
+    platform.setIcon(this.newBtn, "plus");
     this.newBtn.addEventListener("click", () => this.callbacks.onNew());
   }
 
@@ -56,13 +56,9 @@ export class TabBar {
            step. Now opens a tiny one-item menu; middle-click still closes
            instantly via the auxclick handler above for users who want the
            old behavior. */
-        const menu = new Menu();
-        menu.addItem(item =>
-          item.setTitle("Close tab")
-            .setIcon("x")
-            .onClick(() => this.callbacks.onClose(tab.id))
-        );
-        menu.showAtMouseEvent(e);
+        platform.showContextMenu(e, [
+          { title: "Close tab", icon: "x", onClick: () => this.callbacks.onClose(tab.id) },
+        ]);
       });
     });
   }

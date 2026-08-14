@@ -2,12 +2,12 @@
 
    Claude Code's Read tool rejects binary container formats (.pptx, .docx,
    .xlsx) with a tool_use_error. To let the user pin or @-mention these
-   files, we read the bytes via the Obsidian vault adapter, extract a plain
+   files, we read the bytes via the platform storage layer, extract a plain
    text representation here, and inline that into the wire text before it
    reaches the CLI. Claude then sees the slide/document/sheet content as if
    it were plain text. */
 
-import type { App } from "obsidian";
+import { platform, type AppHandle } from "../platform";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 
@@ -57,8 +57,8 @@ export function officeIconName(path: string): string {
 
 /* Read a vault file as raw bytes. Pinned paths come from the vault, so this
    works for any file the user can pin via the pill bar. */
-async function readVaultBinary(app: App, path: string): Promise<ArrayBuffer> {
-  const buffer = await app.vault.adapter.readBinary(path);
+async function readVaultBinary(app: AppHandle, path: string): Promise<ArrayBuffer> {
+  const buffer = await platform.storage.readBinary(path);
   if (buffer.byteLength > MAX_SOURCE_BYTES) {
     throw new Error(`File is too large to extract (max ${MAX_SOURCE_BYTES / (1024 * 1024)}MB)`);
   }
@@ -278,7 +278,7 @@ async function extractXlsxText(buffer: ArrayBuffer): Promise<string> {
 /* Extract a plain-text representation of an office binary file. Throws on
    unsupported extension or read/parse failure — caller decides how to
    surface the error to the user. */
-export async function extractOfficeText(app: App, path: string): Promise<string> {
+export async function extractOfficeText(app: AppHandle, path: string): Promise<string> {
   const ext = getExtension(path);
   const buffer = await readVaultBinary(app, path);
   let text: string;

@@ -26,7 +26,7 @@
    All HTTP is fail-silent with a tight timeout, so a powered-off TC001
    never blocks plugin event handling. */
 
-import { requestUrl } from "obsidian";
+import { platform } from "../platform";
 import { writeFileSync } from "node:fs";
 
 export type DisplayState = "idle" | "ready" | "thinking" | "needs_permission" | "complete";
@@ -134,12 +134,12 @@ class StateEmitterImpl {
   private async post(url: string, body: Record<string, unknown>): Promise<void> {
     try {
       await Promise.race([
-        requestUrl({
+        platform.httpRequest({
           url,
           method: "POST",
           contentType: "application/json",
           body: JSON.stringify(body),
-          throw: false,
+          throwOnError: false,
         }),
         new Promise<void>((_, reject) => setTimeout(() => reject(new Error("timeout")), HTTP_TIMEOUT_MS)),
       ]);

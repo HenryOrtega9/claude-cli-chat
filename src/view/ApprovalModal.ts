@@ -1,4 +1,4 @@
-import { setIcon } from "obsidian";
+import { platform } from "../platform";
 import type { PendingApproval } from "./state";
 import { editOpsFromInput, renderDiff, renderWritePreview } from "./DiffRenderer";
 
@@ -93,7 +93,7 @@ export class ApprovalArea {
 
     const toolRow = card.createDiv({ cls: "claudian-ask-approval-tool" });
     const iconEl = toolRow.createSpan({ cls: "claudian-ask-approval-icon" });
-    setIcon(iconEl, this.iconForTool(approval.toolName));
+    platform.setIcon(iconEl, this.iconForTool(approval.toolName));
     toolRow.createSpan({ cls: "claudian-ask-approval-tool-name", text: approval.toolName });
 
     if (approval.decisionReason) {

@@ -1,8 +1,8 @@
-import { Modal, Notice, type App } from "obsidian";
+import { platform, PlatformModal, type AppHandle } from "../platform";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type ClaudeChatPlugin from "../main";
+import type { PluginHost } from "../platform/host";
 
 /* Captures the fields needed to write a subagent definition (.md with YAML
    frontmatter) to disk in either the user-global agents dir or the project
@@ -21,8 +21,8 @@ type SaveLocation = "project" | "user";
 
 const FILENAME_SAFE = /^[a-z0-9][a-z0-9_-]*$/i;
 
-export class CreateSubagentModal extends Modal {
-  private plugin: ClaudeChatPlugin;
+export class CreateSubagentModal extends PlatformModal {
+  private plugin: PluginHost;
   /* Called after a successful save so the caller (TabController) can refresh
      the toolbar pill count without reaching into plugin internals from here. */
   private onCreated: () => void;
@@ -32,7 +32,7 @@ export class CreateSubagentModal extends Modal {
   private locationSelect!: HTMLSelectElement;
   private saveBtn!: HTMLButtonElement;
 
-  constructor(app: App, plugin: ClaudeChatPlugin, onCreated: () => void) {
+  constructor(app: AppHandle, plugin: PluginHost, onCreated: () => void) {
     super(app);
     this.plugin = plugin;
     this.onCreated = onCreated;
@@ -140,7 +140,7 @@ export class CreateSubagentModal extends Modal {
     }
     const vault = this.plugin.getVaultPath();
     if (!vault) {
-      new Notice("Couldn't resolve the vault path for project-scoped save. Pick User instead.");
+      platform.notify("Couldn't resolve the vault path for project-scoped save. Pick User instead.");
       return null;
     }
     return { dir: join(vault, ".claude", "agents"), label: "project" };
@@ -151,7 +151,7 @@ export class CreateSubagentModal extends Modal {
     const desc = this.descInput.value.trim();
     const body = this.bodyInput.value.trim();
     if (!FILENAME_SAFE.test(name)) {
-      new Notice("Name must start with a letter or number; use letters, digits, _ or -.");
+      platform.notify("Name must start with a letter or number; use letters, digits, _ or -.");
       return;
     }
     const location = this.resolveLocation();
@@ -161,7 +161,7 @@ export class CreateSubagentModal extends Modal {
     /* Refuse to clobber. If the user really wants to overwrite they can
        delete or rename the existing file first. */
     if (existsSync(filePath)) {
-      new Notice(`A ${location.label} subagent named "${name}" already exists. Pick a different name.`);
+      platform.notify(`A ${location.label} subagent named "${name}" already exists. Pick a different name.`);
       return;
     }
 
@@ -179,7 +179,7 @@ export class CreateSubagentModal extends Modal {
       writeFileSync(filePath, fileContents, "utf8");
     } catch (err) {
       console.error("[claude-cli-chat] failed to write subagent file", err);
-      new Notice(`Couldn't create subagent: ${err instanceof Error ? err.message : String(err)}`);
+      platform.notify(`Couldn't create subagent: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
 
@@ -189,7 +189,7 @@ export class CreateSubagentModal extends Modal {
        Refresh button in the manager modal uses. */
     this.plugin.refreshSubagentCatalog();
     this.onCreated();
-    new Notice(`Created ${location.label} subagent "${name}".`);
+    platform.notify(`Created ${location.label} subagent "${name}".`);
     this.close();
   }
 }

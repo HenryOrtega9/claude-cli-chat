@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { autodetectClaudePath } from "../settings";
+import { autodetectClaudePath } from "../settings-data";
 
 export type RemoteStatus = "starting" | "waiting" | "ready" | "exited" | "error";
 

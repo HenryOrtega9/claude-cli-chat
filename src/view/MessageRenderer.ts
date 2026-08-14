@@ -1,4 +1,4 @@
-import { App, Component, MarkdownRenderer, Notice, setIcon, TFolder } from "obsidian";
+import { platform, type AppHandle, type RenderLifecycle } from "../platform";
 import type { Attachment, ChatMessage, NestedSubagentEvent, ToolCall } from "./state";
 import { truncateToolResult } from "./state";
 import { editOpsFromInput, renderDiff, renderWritePreview } from "./DiffRenderer";
@@ -26,8 +26,8 @@ export class MessageListRenderer {
   /* At or above this many attached notes, the pill row collapses behind a
      single "N notes" summary pill the user can click to expand. */
   private static readonly NOTE_COLLAPSE_THRESHOLD = 4;
-  private app: App;
-  private component: Component;
+  private app: AppHandle;
+  private component: RenderLifecycle;
   private container: HTMLElement;
   private bottomSentinel: HTMLElement;
   private liveEls = new Map<string, { root: HTMLElement; content: HTMLElement }>();
@@ -62,7 +62,7 @@ export class MessageListRenderer {
      visible message stream. Reference survives reset() so we can re-attach. */
   private tailEl: HTMLElement | null = null;
 
-  constructor(app: App, component: Component, container: HTMLElement) {
+  constructor(app: AppHandle, component: RenderLifecycle, container: HTMLElement) {
     this.app = app;
     this.component = component;
     this.container = container;
@@ -249,7 +249,7 @@ export class MessageListRenderer {
       toolEl = parentEl.createDiv({ cls: "claudian-tool-call", attr: { "data-tool-id": tool.id } });
       const header = toolEl.createDiv({ cls: "claudian-tool-header" });
       const icon = header.createSpan({ cls: "claudian-tool-icon" });
-      setIcon(icon, this.iconForTool(tool.name));
+      platform.setIcon(icon, this.iconForTool(tool.name));
       header.createSpan({ cls: "claudian-tool-name", text: tool.name });
       /* Inline subject (e.g. "cortex", "Cortex.md", "git status") shown
          next to the tool name so the row reads as one compact phrase. */
@@ -281,7 +281,7 @@ export class MessageListRenderer {
     statusEl.className = "claudian-tool-status";
     statusEl.addClass(`status-${tool.status}`);
     const statusIcon = this.iconForStatus(tool.status, tool.isError);
-    if (statusIcon) setIcon(statusEl, statusIcon);
+    if (statusIcon) platform.setIcon(statusEl, statusIcon);
     statusEl.setAttr("aria-label", this.labelForStatus(tool.status));
 
     /* Auto-expand on first sight while running (so the user sees what's about
@@ -377,7 +377,7 @@ export class MessageListRenderer {
       const item = container.createDiv({ cls: `claudian-todo-item status-${todo.status ?? "pending"}` });
       const iconEl = item.createSpan({ cls: "claudian-todo-status-icon" });
       const iconName = this.iconForTodoStatus(todo.status);
-      setIcon(iconEl, iconName);
+      platform.setIcon(iconEl, iconName);
       const text = item.createSpan({ cls: "claudian-todo-text" });
       /* Use activeForm if the todo is currently in progress and the SDK gave
          us one ("Reading file" vs "Read file"); otherwise the static content. */
@@ -452,7 +452,7 @@ export class MessageListRenderer {
   private renderSelectionFlag(parent: HTMLElement, ctx: NonNullable<ChatMessage["selectionContext"]>) {
     const flag = parent.createDiv({ cls: "claudian-selection-flag" });
     const iconEl = flag.createSpan({ cls: "claudian-selection-flag-icon" });
-    setIcon(iconEl, "text-cursor");
+    platform.setIcon(iconEl, "text-cursor");
     const fileName = ctx.filePath.split("/").pop() ?? ctx.filePath;
     const range = ctx.startLine === ctx.endLine
       ? `line ${ctx.startLine}`
@@ -483,10 +483,10 @@ export class MessageListRenderer {
     /* Collapsed: a single summary pill that toggles the expanded list below. */
     const summary = row.createDiv({ cls: "claudian-attached-note-summary" });
     const iconEl = summary.createSpan({ cls: "claudian-attached-note-flag-icon" });
-    setIcon(iconEl, "paperclip");
+    platform.setIcon(iconEl, "paperclip");
     summary.createSpan({ cls: "claudian-attached-note-flag-text", text: `${paths.length} notes` });
     const chevron = summary.createSpan({ cls: "claudian-attached-note-chevron" });
-    setIcon(chevron, "chevron-down");
+    platform.setIcon(chevron, "chevron-down");
 
     const expanded = row.createDiv({ cls: "claudian-attached-note-expanded" });
     for (const path of paths) this.renderNotePill(expanded, path);
@@ -509,24 +509,24 @@ export class MessageListRenderer {
   private renderNotePill(container: HTMLElement, path: string) {
     const flag = container.createDiv({ cls: "claudian-attached-note-flag" });
     const iconEl = flag.createSpan({ cls: "claudian-attached-note-flag-icon" });
-    const node = this.app.vault.getAbstractFileByPath(path);
-    if (node instanceof TFolder) {
+    const isFolder = platform.vaultFeatures?.pathKind(path) === "folder";
+    if (isFolder) {
       flag.addClass("is-folder");
-      setIcon(iconEl, "folder");
+      platform.setIcon(iconEl, "folder");
     } else if (isExtractableOffice(path)) {
       flag.addClass("is-office");
-      setIcon(iconEl, officeIconName(path));
+      platform.setIcon(iconEl, officeIconName(path));
     } else {
       const ext = path.split(".").pop() ?? "";
-      setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
+      platform.setIcon(iconEl, ext === "canvas" ? "layout-grid" : "file-text");
     }
     const fileName = path.split("/").pop() ?? path;
     flag.createSpan({ cls: "claudian-attached-note-flag-text", text: fileName });
     flag.setAttr("title", `Attached as context: ${path}`);
     flag.addEventListener("click", e => {
       e.stopPropagation();
-      if (node instanceof TFolder) return;
-      void this.app.workspace.openLinkText(path, "", "tab");
+      if (isFolder) return;
+      platform.vaultFeatures?.openPath(path, "tab");
     });
   }
 
@@ -541,7 +541,7 @@ export class MessageListRenderer {
       cls: "claudian-message-action",
       attr: { "aria-label": "Fork from here", title: "Fork into a new tab" },
     });
-    setIcon(forkBtn, "git-branch");
+    platform.setIcon(forkBtn, "git-branch");
     forkBtn.addEventListener("click", e => {
       e.stopPropagation();
       this.actionCallbacks?.onFork(msg.id);
@@ -551,13 +551,13 @@ export class MessageListRenderer {
       cls: "claudian-message-action",
       attr: { "aria-label": "Copy message", title: "Copy message text" },
     });
-    setIcon(copyBtn, "copy");
+    platform.setIcon(copyBtn, "copy");
     copyBtn.addEventListener("click", e => {
       e.stopPropagation();
       const live = this.container.querySelector(`[data-message-id="${msg.id}"]`);
       const text = (live as HTMLElement | null)?.querySelector(".claudian-text-block")?.textContent ?? msg.content;
       void navigator.clipboard.writeText(text);
-      new Notice("Copied message");
+      platform.notify("Copied message");
     });
   }
 
@@ -591,7 +591,7 @@ export class MessageListRenderer {
            rather than misleading "file" iconography. */
         const chip = parent.createDiv({ cls: "claudian-message-attachment claudian-message-attachment-file" });
         const iconEl = chip.createSpan({ cls: "claudian-message-attachment-icon" });
-        setIcon(iconEl, "image");
+        platform.setIcon(iconEl, "image");
         const label = att.filename ?? "Image (data missing)";
         chip.createSpan({ cls: "claudian-message-attachment-label", text: label, attr: { title: label } });
         return;
@@ -600,7 +600,7 @@ export class MessageListRenderer {
          both; only the icon differs so the user can scan-distinguish. */
       const chip = parent.createDiv({ cls: "claudian-message-attachment claudian-message-attachment-file" });
       const iconEl = chip.createSpan({ cls: "claudian-message-attachment-icon" });
-      setIcon(iconEl, kind === "pdf" ? "file-text" : "file");
+      platform.setIcon(iconEl, kind === "pdf" ? "file-text" : "file");
       const label = att.filename ?? (kind === "pdf" ? "document.pdf" : "file");
       chip.createSpan({ cls: "claudian-message-attachment-label", text: label, attr: { title: label } });
     };
@@ -625,7 +625,7 @@ export class MessageListRenderer {
       }
       const block = el.createDiv({ cls: "claudian-text-block" });
       if (msg.content.trim().length > 0) {
-        await MarkdownRenderer.render(this.app, msg.content, block, "", this.component);
+        await platform.renderMarkdown(msg.content, block, "", this.component);
         this.wireInternalLinks(block);
       }
       if (msg.durationMs !== undefined && !msg.streaming && this.passHasVisibleContent(msg)) {
@@ -657,22 +657,15 @@ export class MessageListRenderer {
            plain click and bare Cmd/Ctrl both open a new tab in the main
            editor area (sidebar-originated openLeaf("tab") routes there). */
         const split = (e.metaKey || e.ctrlKey) && e.shiftKey;
-        void this.app.workspace.openLinkText(linkpath, "", split ? "split" : "tab");
+        platform.vaultFeatures?.openPath(linkpath, split ? "split" : "tab");
       });
       a.addEventListener("auxclick", e => {
         if (e.button !== 1) return;
         e.preventDefault();
-        void this.app.workspace.openLinkText(linkpath, "", "tab");
+        platform.vaultFeatures?.openPath(linkpath, "tab");
       });
       a.addEventListener("mouseover", event => {
-        this.app.workspace.trigger("hover-link", {
-          event,
-          source: "claude-cli-chat",
-          hoverParent: this.component,
-          targetEl: a,
-          linktext: linkpath,
-          sourcePath: "",
-        });
+        platform.vaultFeatures?.triggerHoverLink(event, a, linkpath, this.component);
       });
     }
   }
@@ -686,7 +679,7 @@ export class MessageListRenderer {
     });
     const header = wrap.createDiv({ cls: "claudian-thinking-header" });
     const chevron = header.createSpan({ cls: "claudian-thinking-chevron" });
-    setIcon(chevron, "chevron-down");
+    platform.setIcon(chevron, "chevron-down");
     header.createSpan({
       cls: "claudian-thinking-label",
       text: msg.thinkingStreaming ? "Thinking…" : "Thinking",
@@ -871,7 +864,7 @@ export class MessageListRenderer {
       });
       if (hasEvents) {
         const chevron = toggle.createSpan({ cls: "claudian-subagent-chevron" });
-        setIcon(chevron, "chevron-down");
+        platform.setIcon(chevron, "chevron-down");
       }
       toggle.createSpan({
         cls: "claudian-subagent-toggle-label",

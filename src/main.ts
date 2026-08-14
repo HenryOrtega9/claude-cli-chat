@@ -12,6 +12,11 @@ import { discoverSubagents, type SubagentCatalog } from "./claude/SubagentDiscov
 import { StateEmitter } from "./claude/StateEmitter";
 import { PermissionsConfigStore } from "./permissions/PermissionsConfig";
 import { SpeechController } from "./voice/SpeechController";
+import { initializePlatform } from "./platform";
+import { ObsidianPlatform } from "./platform/obsidian";
+import type { ActiveFileIndicatorHandle, ActiveSelection, SelectionTrackerHandle } from "./platform/host";
+import { ActiveFileIndicator } from "./view/ActiveFileIndicator";
+import { SelectionTracker } from "./view/SelectionTracker";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
@@ -59,6 +64,12 @@ export default class ClaudeChatPlugin extends Plugin {
   private mcpServerListInflight: Promise<ParsedMcpServer[]> | null = null;
 
   async onload() {
+    /* Install the platform abstraction FIRST — before settings, stores,
+       views, or any engine code constructs. Shared modules reach Obsidian
+       exclusively through this singleton (src/platform/), so it must be
+       live before anything that might call platform.* runs. The standalone
+       shell will make the equivalent call with its own Platform. */
+    initializePlatform(new ObsidianPlatform(this.app));
     await this.loadSettings();
     this.speech = new SpeechController(() => this.settings);
     this.permissionsStore = new PermissionsConfigStore(this.app);
@@ -206,6 +217,26 @@ export default class ClaudeChatPlugin extends Plugin {
     const adapter = this.app.vault.adapter;
     if (adapter instanceof FileSystemAdapter) return adapter.getBasePath();
     return "";
+  }
+
+  /* PluginHost factories (src/platform/host.ts). ActiveFileIndicator and
+     SelectionTracker are Obsidian-only widgets that need the live App;
+     routing their construction through the plugin lets shared code
+     (TabController) mount them without importing their modules. The real
+     classes satisfy the narrow handle interfaces structurally. */
+  createActiveFileIndicator(
+    parent: HTMLElement,
+    initialPinned: string[],
+    initialSticky: string[],
+    callbacks: { onPinChange: (pinnedPaths: string[], stickyPaths: string[]) => void },
+  ): ActiveFileIndicatorHandle {
+    return new ActiveFileIndicator(parent, this.app, initialPinned, initialSticky, callbacks);
+  }
+
+  createSelectionTracker(
+    onChange: (sel: ActiveSelection | null) => void,
+  ): SelectionTrackerHandle {
+    return new SelectionTracker(this.app, onChange);
   }
 
   /* Recompute the cached per-vault MCP deny patterns from the on-disk
