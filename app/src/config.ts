@@ -14,7 +14,7 @@
      apps therefore keep independent settings while sharing sessions, tabs,
      and .claude config. */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { platform } from "../../src/platform";
@@ -66,21 +66,69 @@ export const DEFAULT_WORKING_DIR =
 export const DESKTOP_SETTINGS_DIR = ".claude-cli-chat";
 export const DESKTOP_SETTINGS_PATH = `${DESKTOP_SETTINGS_DIR}/desktop-settings.json`;
 
-/* The file's raw contents as a plain object, or null when it is missing,
-   unreadable, or not a JSON object. Kept separate from loadAppConfig so the
-   write path can preserve fields this build does not know about (and, more
-   to the point, the field the other process owns). */
-async function readRawAppConfig(): Promise<Record<string, unknown> | null> {
+/* Why this is a discriminated result rather than `Record | null`: the three
+   failure modes need three different write policies, and collapsing them is
+   what let a transient read error destroy a good config.
+
+   - "missing"     first run (ENOENT). Safe to seed.
+   - "corrupt"     the file existed but did not parse. The bytes are moved
+                   aside to config.json.corrupt-<ts> first, so seeding no
+                   longer destroys anything.
+   - "unreadable"  we could not even read it (EACCES, an iCloud placeholder
+                   that has not materialized). The contents are unknown and
+                   still on disk, so NOTHING may be written over them. */
+type RawAppConfig =
+  | { status: "ok"; data: Record<string, unknown> }
+  | { status: "missing" }
+  | { status: "corrupt" }
+  | { status: "unreadable" };
+
+function isErrnoCode(err: unknown, code: string): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === code;
+}
+
+/* Kept separate from loadAppConfig so the write path can preserve fields this
+   build does not know about (and, more to the point, the field the other
+   process owns). */
+async function readRawAppConfig(): Promise<RawAppConfig> {
+  let raw: string;
   try {
-    const raw = await readFile(APP_CONFIG_PATH, "utf8");
+    raw = await readFile(APP_CONFIG_PATH, "utf8");
+  } catch (err) {
+    if (isErrnoCode(err, "ENOENT")) return { status: "missing" };
+    console.warn("[claude-quick-chat] could not read config.json:", err);
+    return { status: "unreadable" };
+  }
+  try {
     const parsed: unknown = JSON.parse(raw);
     if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
+      return { status: "ok", data: parsed as Record<string, unknown> };
     }
   } catch {
-    /* Missing, unreadable, or invalid JSON. */
+    /* falls through to the quarantine below */
   }
-  return null;
+  /* Quarantine rather than overwrite: a truncated file (the old non-atomic
+     writer) or a bad hand edit still holds the user's hotkey and pinned
+     bounds, and those are unrecoverable once they are gone. */
+  const quarantine = `${APP_CONFIG_PATH}.corrupt-${Date.now()}`;
+  try {
+    await rename(APP_CONFIG_PATH, quarantine);
+    console.warn(`[claude-quick-chat] config.json did not parse; moved to ${quarantine}`);
+    return { status: "corrupt" };
+  } catch (err) {
+    console.warn("[claude-quick-chat] config.json did not parse and could not be moved aside:", err);
+    return { status: "unreadable" };
+  }
+}
+
+/* tmp-file + rename inside APP_CONFIG_DIR: rename is only atomic within one
+   filesystem, and the pid suffix keeps this writer from colliding with the
+   main process's synchronous one on the staging path. */
+async function writeAppConfigFile(value: Record<string, unknown>): Promise<void> {
+  const tmp = `${APP_CONFIG_PATH}.${process.pid}.tmp`;
+  await mkdir(APP_CONFIG_DIR, { recursive: true });
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tmp, APP_CONFIG_PATH);
 }
 
 function readString(source: Record<string, unknown> | null, key: string): string | null {
@@ -91,30 +139,37 @@ function readString(source: Record<string, unknown> | null, key: string): string
 }
 
 /* Read config.json, creating it with the default working directory on first
-   run. A malformed or unreadable file is treated as missing and rewritten —
-   the alternative (refusing to start) leaves the user with a menu-bar icon
-   that does nothing and no way to fix it from inside the app.
+   run. Refusing to start is not an option — that leaves the user with a
+   menu-bar icon that does nothing and no way to fix it from inside the app —
+   so every failure path still returns a usable in-memory config.
 
-   The seed writes `workingDir` only. `hotkey` stays absent until main persists
-   one, which keeps the "main is the only writer of hotkey" rule literally true
-   and lets an absent field mean "use the default". */
+   The seed MERGES over whatever the file already held. Only `workingDir` is
+   this side's to set, and main legitimately creates a hotkey-only or
+   bounds-only file before the renderer has ever seeded (see main.ts's
+   writeConfiguredHotkey / writeConfiguredBounds); writing a bare
+   `{ workingDir }` over that silently reset the global hotkey and un-pinned
+   the panel. */
 export async function loadAppConfig(): Promise<AppConfig> {
   const raw = await readRawAppConfig();
-  const workingDir = readString(raw, "workingDir");
-  if (workingDir !== null) {
-    return { workingDir, hotkey: readString(raw, "hotkey") ?? DEFAULT_HOTKEY };
-  }
+  const stored = raw.status === "ok" ? raw.data : null;
+  const workingDir = readString(stored, "workingDir");
+  const hotkey = readString(stored, "hotkey") ?? DEFAULT_HOTKEY;
+  if (workingDir !== null) return { workingDir, hotkey };
 
-  const config = { workingDir: DEFAULT_WORKING_DIR };
-  try {
-    await mkdir(APP_CONFIG_DIR, { recursive: true });
-    await writeFile(APP_CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-  } catch (err) {
-    /* Non-fatal: we still return the default so this launch works; the next
-       launch just re-seeds. */
-    console.warn("[claude-quick-chat] could not write config.json:", err);
+  /* An unreadable file's contents are unknown and still on disk: seeding over
+     it would destroy fields we could not even see. */
+  if (raw.status !== "unreadable") {
+    const next: Record<string, unknown> = { ...(stored ?? {}) };
+    next.workingDir = DEFAULT_WORKING_DIR;
+    try {
+      await writeAppConfigFile(next);
+    } catch (err) {
+      /* Non-fatal: we still return the default so this launch works; the next
+         launch just re-seeds. */
+      console.warn("[claude-quick-chat] could not write config.json:", err);
+    }
   }
-  return { ...config, hotkey: readString(raw, "hotkey") ?? DEFAULT_HOTKEY };
+  return { workingDir: DEFAULT_WORKING_DIR, hotkey };
 }
 
 /* Persist a new working directory (renderer-owned field). Read-modify-write so
@@ -123,32 +178,74 @@ export async function loadAppConfig(): Promise<AppConfig> {
    at boot, and re-pointing those live would strand open tabs and subprocesses
    against the old root. */
 export async function saveWorkingDir(workingDir: string): Promise<void> {
-  const next: Record<string, unknown> = { ...(await readRawAppConfig()) };
+  const raw = await readRawAppConfig();
+  /* Throwing is the right answer here, not a blind overwrite: the settings
+     modal surfaces the message, and writing would drop the hotkey and pinned
+     bounds sitting in a file we could not read. */
+  if (raw.status === "unreadable") {
+    throw new Error(`${APP_CONFIG_PATH} could not be read; fix or remove it and try again.`);
+  }
+  const next: Record<string, unknown> = { ...(raw.status === "ok" ? raw.data : {}) };
   next.workingDir = workingDir;
-  await mkdir(APP_CONFIG_DIR, { recursive: true });
-  await writeFile(APP_CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  await writeAppConfigFile(next);
 }
 
 /* Load and normalize settings, mirroring ClaudeChatPlugin.loadSettings()'s
    clamping exactly — same enum guards, same defensive re-wrapping of the
    mutable collections, same voice-URI migration. The shapes are shared, so a
    drift here would show up as a subtly different chat than the plugin's. */
-export async function loadDesktopSettings(): Promise<ClaudeChatSettings> {
+export async function loadDesktopSettings(
+  opts: { seed?: boolean } = {},
+): Promise<ClaudeChatSettings> {
+  /* Callers running against a fallback base directory (a working dir that no
+     longer exists) pass seed:false so the recovery path does not conjure a
+     settings file into a directory the user never chose. */
+  const seed = opts.seed ?? true;
   let stored: Partial<ClaudeChatSettings> = {};
   let existed = false;
+  /* Distinct from `!existed`: a read/parse failure means the file is THERE and
+     holds something we could not understand. Reseeding over it would delete
+     the user's env snippets, claudePath, voice and MCP tool cache with no
+     backup — the failure mode PermissionsConfigStore and MCPConfigStore both
+     avoid by rotating the bad text to a .bak first. */
+  let readFailed = false;
+  let rawText: string | null = null;
   try {
     if (await platform.storage.exists(DESKTOP_SETTINGS_PATH)) {
-      const raw = await platform.storage.read(DESKTOP_SETTINGS_PATH);
-      const parsed: unknown = JSON.parse(raw);
+      rawText = await platform.storage.read(DESKTOP_SETTINGS_PATH);
+      const parsed: unknown = JSON.parse(rawText);
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
         stored = parsed as Partial<ClaudeChatSettings>;
         existed = true;
+      } else {
+        readFailed = true;
       }
     }
   } catch (err) {
-    /* A corrupt settings file degrades to defaults rather than blocking the
-       launch; the reseed below rewrites it. */
+    readFailed = true;
     console.warn("[claude-quick-chat] settings read failed; using defaults:", err);
+  }
+
+  if (readFailed) {
+    const bak = `${DESKTOP_SETTINGS_PATH}.bak`;
+    let backedUp = false;
+    try {
+      if (rawText !== null) {
+        await platform.storage.write(bak, rawText);
+        backedUp = true;
+      }
+    } catch (err) {
+      console.warn("[claude-quick-chat] could not back up unreadable settings:", err);
+    }
+    /* Loud, because suppressing the reseed only protects the file until the
+       next saveSettings() (an MCP init, a model-pill change) writes defaults
+       over it anyway. The user has to act. */
+    platform.notify(
+      `Could not read ${DESKTOP_SETTINGS_PATH}; running on defaults` +
+        (backedUp ? ` (backup at ${bak})` : "") +
+        ". Fix or move that file before changing any setting, or it will be overwritten.",
+      12000,
+    );
   }
 
   const settings: ClaudeChatSettings = Object.assign({}, DEFAULT_SETTINGS, stored);
@@ -169,8 +266,9 @@ export async function loadDesktopSettings(): Promise<ClaudeChatSettings> {
 
   /* Seed anything the first run should autodetect. `dirty` also covers the
      no-file case so a fresh install lands a complete file on disk instead of
-     re-running the detectors on every launch. */
-  let dirty = !existed;
+     re-running the detectors on every launch — but ONLY a genuine
+     exists()===false counts as a first run, never a file we failed to read. */
+  let dirty = !existed && !readFailed;
 
   /* Voice migration: an early build stored speechSynthesis voiceURIs
      ("com.apple.voice.…"); playback runs through `say`, which takes plain
@@ -206,7 +304,7 @@ export async function loadDesktopSettings(): Promise<ClaudeChatSettings> {
     }
   }
 
-  if (dirty) {
+  if (dirty && seed && !readFailed) {
     try {
       await saveDesktopSettings(settings);
     } catch (err) {

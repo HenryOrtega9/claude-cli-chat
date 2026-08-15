@@ -200,19 +200,21 @@ export class DesktopHost implements PluginHost {
     return new InertSelectionTracker();
   }
 
-  /* Teardown mirroring ClaudeChatPlugin.onunload. Only reachable on a clean
-     quit path that can await; the renderer also calls disposeSync() from
-     beforeunload, where nothing async survives. */
+  /* Teardown mirroring ClaudeChatPlugin.onunload. Reached from the quit
+     handshake (main holds the quit open while the renderer awaits this); the
+     renderer also calls disposeSync() from beforeunload, where nothing async
+     survives. */
   async dispose(): Promise<void> {
     this.speech.destroy();
     StateEmitter.dispose();
     this.persistence.flushSync();
     await this.persistence.flush();
     await this.subprocessManager.killAll();
-    /* killAll gives the RC PTY proxy only ~1.5s between SIGTERM and SIGKILL;
-       a slower inner `claude remote-control` outlives it and reparents to
-       launchd. Same orphan sweep the plugin runs on unload. */
-    try { await this.subprocessManager.killAllRemoteAndOrphans(); } catch { /* best-effort */ }
+    /* DELIBERATELY no killAllRemoteAndOrphans() here, unlike the plugin's
+       onunload. This shell never starts Remote Control (toggleRemoteControl
+       refers the user to the plugin), so it tracks zero remote sessions —
+       every pid that sweep found would belong to the OBSIDIAN plugin's live
+       session, and quitting the menu-bar app would kill it. */
   }
 
   /* The part of dispose() that can actually complete inside a beforeunload

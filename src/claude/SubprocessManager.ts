@@ -126,6 +126,14 @@ export class TabSession {
   sessionId: string | null = null;
   status: TabSessionStatus = "starting";
 
+  /* OS pid of the spawned child, or undefined when the spawn failed outright.
+     Exposed so an embedder that outlives this process (the standalone shell's
+     Electron main process) can reap children this renderer never got to
+     kill. */
+  get pid(): number | undefined {
+    return this.child.pid;
+  }
+
   private child: ChildProcessWithoutNullStreams;
   private parser = new StreamJsonParser();
   private writer: InputWriter;
@@ -430,6 +438,15 @@ export class TabSession {
    Phase C will hook this into the view: tab creation calls .spawn(), tab close
    calls .kill(), and the view subscribes to .onEvent() per tab for rendering. */
 export class SubprocessManager {
+  /* Optional observer, called with each spawned child's pid — `alive: true`
+     on spawn, `alive: false` when it exits. The Obsidian plugin leaves it
+     unset (Obsidian's own process owns the children and outlives them); the
+     standalone Electron shell points it at an IPC send so the MAIN process
+     holds an authoritative live set and can SIGTERM the strays if the
+     renderer dies before killAll() can run. Never used to drive behavior in
+     here — a missing hook is a no-op. */
+  onChildPid?: (pid: number, alive: boolean) => void;
+
   private sessions = new Map<string, TabSession>();
   private remoteSessions = new Map<string, RemoteControlSession>();
   /* Session-file paths already claimed by an active RemoteControlSession.
@@ -480,11 +497,16 @@ export class SubprocessManager {
        second set of listeners onto it and double every subsequent event. */
     if (existing && !existing.isTerminal()) return existing;
     const session = new TabSession(tabId, opts);
+    /* Read once: after the child exits, child.pid can go undefined, and the
+       exit report has to name the same pid the spawn reported. */
+    const pid = session.pid;
     session.onExit(() => {
       const current = this.sessions.get(tabId);
       if (current === session) this.sessions.delete(tabId);
+      if (pid !== undefined) this.onChildPid?.(pid, false);
     });
     this.sessions.set(tabId, session);
+    if (pid !== undefined) this.onChildPid?.(pid, true);
     return session;
   }
 

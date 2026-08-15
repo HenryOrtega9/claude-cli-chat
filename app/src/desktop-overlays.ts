@@ -124,6 +124,40 @@ export function showContextMenuAt(evt: MouseEvent, items: MenuItemSpec[]): void 
 
 /* ----- shared overlay plumbing ------------------------------------------ */
 
+/* Where focus goes when an overlay closes and the element it was taken from
+   is unusable — which is the common case here, not the exception: the
+   settings modal is usually opened from the tray with the panel freshly
+   shown, so document.activeElement was already <body>. Set once by
+   renderer.ts to the shell's composer. Obsidian's Modal/SuggestModal restore
+   focus themselves and the user lands back in an editor either way; in the
+   standalone panel the composer IS the app, and a dropped focus makes the
+   whole keyboard-first surface go dead until the user reaches for the mouse. */
+let overlayFocusFallback: (() => void) | null = null;
+
+export function setOverlayFocusFallback(fn: (() => void) | null): void {
+  overlayFocusFallback = fn;
+}
+
+/* Hand focus back after `containerEl` is torn down. `prevFocus` wins when it
+   is still usable; otherwise the fallback. A chooser that already moved focus
+   somewhere real (SuggestModal.choose closes BEFORE calling the chooser, and
+   SubagentPicker's submit() focuses the composer) is left alone. */
+function restoreFocusAfterClose(containerEl: HTMLElement, prevFocus: HTMLElement | null): void {
+  const active = document.activeElement;
+  const focusIsLoose = active === null || active === document.body || containerEl.contains(active);
+  if (!focusIsLoose) return;
+  if (prevFocus && prevFocus.isConnected && prevFocus !== document.body) {
+    prevFocus.focus();
+    return;
+  }
+  overlayFocusFallback?.();
+}
+
+function currentFocus(): HTMLElement | null {
+  const active = document.activeElement;
+  return active instanceof HTMLElement ? active : null;
+}
+
 /* Esc must only reach the topmost overlay: MCPManagerModal opens an edit
    modal over itself, and closing both on one keypress would lose the edit.
    `.modal-container` is also the marker the renderer's own Esc handler
@@ -151,6 +185,8 @@ export class DomModalHost implements ModalHost {
   readonly titleEl: HTMLElement;
   readonly contentEl: HTMLElement;
   private isOpen = false;
+  /* Whatever had focus when we took it, so close() can give it back. */
+  private prevFocus: HTMLElement | null = null;
 
   constructor(private readonly delegate: ModalDelegate) {
     /* obsidian.Modal builds its DOM in the constructor and subclasses touch
@@ -179,6 +215,7 @@ export class DomModalHost implements ModalHost {
   open(): void {
     if (this.isOpen) return;
     this.isOpen = true;
+    this.prevFocus = currentFocus();
     document.body.appendChild(this.containerEl);
     document.addEventListener("keydown", this.onKeyDown, true);
     this.modalEl.focus();
@@ -195,6 +232,10 @@ export class DomModalHost implements ModalHost {
     /* contentEl is NOT emptied here — subclasses do it in their own
        onClose(), same as under Obsidian. */
     this.delegate.onClose?.();
+    /* After onClose, so a delegate that deliberately focuses something wins. */
+    const prev = this.prevFocus;
+    this.prevFocus = null;
+    restoreFocusAfterClose(this.containerEl, prev);
   }
 }
 
@@ -207,6 +248,8 @@ export class DomSuggestModalHost<T> implements SuggestModalHost {
   private isOpen = false;
   private items: T[] = [];
   private selected = 0;
+  /* Whatever had focus when we took it, so close() can give it back. */
+  private prevFocus: HTMLElement | null = null;
   /* Monotonic token so a slow getSuggestions() promise can't overwrite the
      results of a query the user has already typed past. */
   private queryToken = 0;
@@ -235,6 +278,7 @@ export class DomSuggestModalHost<T> implements SuggestModalHost {
   open(): void {
     if (this.isOpen) return;
     this.isOpen = true;
+    this.prevFocus = currentFocus();
     document.body.appendChild(this.containerEl);
     document.addEventListener("keydown", this.onEscape, true);
     this.inputEl.value = "";
@@ -249,6 +293,9 @@ export class DomSuggestModalHost<T> implements SuggestModalHost {
     this.containerEl.detach();
     this.resultsEl.empty();
     this.items = [];
+    const prev = this.prevFocus;
+    this.prevFocus = null;
+    restoreFocusAfterClose(this.containerEl, prev);
   }
 
   /* Esc is caught at the document so it works even if focus wandered out of
@@ -289,7 +336,11 @@ export class DomSuggestModalHost<T> implements SuggestModalHost {
       const el = this.resultsEl.createDiv({ cls: "suggestion-item" });
       this.delegate.renderSuggestion(item, el);
       if (idx === this.selected) el.addClass("is-selected");
-      el.addEventListener("mousemove", () => this.setSelection(idx));
+      /* scroll:false — the row is under the cursor by definition. Scrolling on
+         hover moves a DIFFERENT row under a stationary pointer, which fires
+         another mousemove and makes the selection skitter. Obsidian's
+         SuggestModal makes the same distinction. */
+      el.addEventListener("mousemove", () => this.setSelection(idx, false));
       /* mousedown, not click: the input still has focus and a click would
          first blur it, which some renderSuggestion trees intercept. */
       el.addEventListener("mousedown", e => {
@@ -305,7 +356,9 @@ export class DomSuggestModalHost<T> implements SuggestModalHost {
     this.setSelection(next);
   }
 
-  private setSelection(index: number): void {
+  /* `scroll` is only correct for keyboard navigation, where the target may be
+     off-screen. */
+  private setSelection(index: number, scroll = true): void {
     if (index === this.selected) return;
     const rows = this.resultsEl.children;
     rows[this.selected]?.removeClass("is-selected");
@@ -313,7 +366,7 @@ export class DomSuggestModalHost<T> implements SuggestModalHost {
     const el = rows[index];
     if (el) {
       el.addClass("is-selected");
-      el.scrollIntoView({ block: "nearest" });
+      if (scroll) el.scrollIntoView({ block: "nearest" });
     }
   }
 

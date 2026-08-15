@@ -30,6 +30,7 @@ import { StateEmitter } from "../../src/claude/StateEmitter";
 import { HistoryModal } from "../../src/view/HistoryModal";
 import { MCPManagerModal } from "../../src/view/MCPManagerModal";
 import { makeTabState, type TabState } from "../../src/view/state";
+import { DESKTOP_SETTINGS_PATH } from "./config";
 import { DesktopSnippetPicker } from "./snippet-picker";
 import type { DesktopHost } from "./host";
 
@@ -90,6 +91,10 @@ export class DesktopChatShell {
   private holdingLock = false;
   /* Unique per-shell lock payload: `<pid>:<uuid>`. */
   private readonly instanceToken = `${process.pid}:${makeInstanceId()}`;
+  /* Set by whichever teardown ran first. The quit path runs destroy() over
+     IPC and THEN unloads the page, so beforeunload's shutdownSync() would
+     otherwise re-run the whole disposal against already-torn-down objects. */
+  private torndown = false;
 
   constructor(root: HTMLElement, host: DesktopHost) {
     this.root = root;
@@ -514,7 +519,15 @@ export class DesktopChatShell {
     if (!active) return;
     const snippets = this.host.settings.envSnippets;
     if (snippets.length === 0) {
-      platform.notify("No environment snippets yet. Add one in the plugin's settings.");
+      /* Not "the plugin's settings": that store is the vault's Obsidian-managed
+         data.json, which this app never reads. The app's settings live in its
+         own file and its modal has no snippet editor, so the only path that
+         actually populates this list is a hand edit of that file. Name it. */
+      platform.notify(
+        `No environment snippets yet. Add them under "envSnippets" in ` +
+          `${this.host.getVaultPath()}/${DESKTOP_SETTINGS_PATH}, then relaunch.`,
+        8000,
+      );
       return;
     }
     new DesktopSnippetPicker(snippets, active.getAppliedSnippetId(), choice => {
@@ -615,9 +628,15 @@ export class DesktopChatShell {
 
   /* ----- teardown ------------------------------------------------------- */
 
-  /* Mirrors ClaudeChatView.onClose. Only reachable where the caller can await
-     (an explicit shutdown command); the quit path uses shutdownSync below. */
+  /* Mirrors ClaudeChatView.onClose. This is the path the quit handshake takes
+     (main holds the quit open on IPC and the renderer awaits this), because
+     TabController.destroy() is what deletes an incognito tab's session file —
+     the CLI writes an `ai-title` record summarizing the chat there even under
+     --no-session-persistence, so skipping it defeats incognito entirely.
+     shutdownSync below stays as the crash/force fallback. */
   async destroy(): Promise<void> {
+    if (this.torndown) return;
+    this.torndown = true;
     await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs = [];
     /* Surrender the process-local slot only if WE own it — a placeholder shell
@@ -630,6 +649,8 @@ export class DesktopChatShell {
   /* beforeunload path: nothing async completes, so persist what can be
      persisted synchronously and drop the lock with a direct fs call. */
   shutdownSync(): void {
+    if (this.torndown) return;
+    this.torndown = true;
     if (activeShellInstance === this) activeShellInstance = null;
     this.host.disposeSync();
     this.releaseWindowLockSync();
