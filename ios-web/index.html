@@ -2,16 +2,44 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!-- viewport-fit=cover lets the page paint under the notch and home
+         indicator; the safe-area insets native pushes through `safeArea` are
+         what keep content out from under them. maximum-scale + user-scalable
+         off because pinch-zooming a chat composer is never the intent and iOS
+         otherwise zooms on any input smaller than 16px. -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
     />
     <meta name="color-scheme" content="dark" />
+    <!-- The page talks to the gateway two ways: through the native bridge (no
+         network from the page at all) and, in the desktop-browser dev
+         fallback, directly over http/ws. connect-src covers both so one build
+         serves both hosts. Scripts and styles stay first-party; markdown
+         rendering writes inline style attributes, hence 'unsafe-inline' on
+         style only. frame-ancestors is deliberately absent: it is ignored in a
+         <meta> CSP and only warns. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' vaultgw:;
+               script-src 'self' vaultgw:;
+               style-src 'self' vaultgw: 'unsafe-inline';
+               img-src 'self' vaultgw: data: blob:;
+               font-src 'self' vaultgw: data:;
+               media-src 'self' vaultgw: data: blob:;
+               connect-src 'self' vaultgw: http: https: ws: wss:;
+               object-src 'none';
+               base-uri 'none';
+               form-action 'none'"
+    />
     <title>Claude</title>
     <!-- Served from vaultgw://app/ by the native WKURLSchemeHandler; every
-         asset sits next to this file in ios/Web/. -->
+         asset sits next to this file in ios/Web/. Order matters: styles.css is
+         the shared plugin stylesheet, desktop.css supplies the theme tokens it
+         consumes, and ios.css is the touch/glass layer on top. -->
     <link rel="stylesheet" href="styles.css" />
     <link rel="stylesheet" href="desktop.css" />
+    <link rel="stylesheet" href="ios.css" />
   </head>
   <body>
     <div id="app" class="claudian-container" data-provider="claude"></div>

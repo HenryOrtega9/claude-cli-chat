@@ -16,7 +16,15 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-const GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F";
+/* RFC 6455 section 1.3. Verified byte-for-byte against a real browser: the
+   RFC's own example key "dGhlIHNhbXBsZSBub25jZQ==" must hash to
+   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=". The previous value had the last two groups
+   mis-split ("95CA-5AB0DC85B11F"), which no test could catch because
+   test/ws-client.mjs carried the same typo — and which made every real browser
+   reject the handshake with "Incorrect 'Sec-WebSocket-Accept' header value".
+   That, not a broken client, is what the "Node's WebSocket fails every ws://
+   handshake on this machine" note in CONTRACTS.md was actually observing. */
+const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /* Frames larger than this are a protocol abuse, not a real message: the
    biggest thing the phone ever sends is a turn with an inline image, and the

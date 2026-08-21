@@ -161,12 +161,15 @@ const iosRendererOptions = {
   plugins: [forbidNodeImports],
 };
 
-/* index.html plus the two stylesheets the page links, copied flat next to
-   renderer.js because the native scheme handler serves the folder verbatim. */
+/* index.html plus the three stylesheets the page links, copied flat next to
+   renderer.js because the native scheme handler serves the folder verbatim.
+   Load order matters and matches index.html: styles.css (shared plugin CSS),
+   desktop.css (the theme tokens it consumes), ios.css (touch + glass). */
 const copyIosAssets = () => {
   copyFileSync("ios-web/index.html", join(IOS_WEB_DIR, "index.html"));
   copyFileSync("styles.css", join(IOS_WEB_DIR, "styles.css"));
   copyFileSync("app/desktop.css", join(IOS_WEB_DIR, "desktop.css"));
+  copyFileSync("ios-web/ios.css", join(IOS_WEB_DIR, "ios.css"));
 };
 
 if (iosMode) {

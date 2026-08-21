@@ -1,0 +1,421 @@
+/* ============================================================
+   Vault Gateway iOS — touch + glass layer.
+
+   Loaded AFTER styles.css (shared plugin CSS) and desktop.css
+   (the GitHub-dark theme tokens styles.css consumes). Three
+   jobs, nothing else:
+
+     1. Glass. The native shell paints a dark gradient behind
+        the WebView; the page goes transparent so it shows
+        through, and the header and composer become translucent
+        cards over it.
+     2. Touch. Everything the desktop reveals on :hover needs a
+        tap-reachable equivalent, and every target needs to be
+        at least 40px on a coarse pointer.
+     3. Fit. 390px-wide viewport: popups, modals and the tab bar
+        all have desktop-era minimums that overflow it.
+
+   Invariant, same as desktop.css: this file only ADDS or
+   OVERRIDES for the touch host. If a rule here has to fight
+   styles.css for something that is not touch- or glass-related,
+   the shared CSS is the file to fix.
+   ============================================================ */
+
+:root {
+  /* Written by native's `safeArea` dispatch (and by getConfig at
+     boot). env() is the fallback for the dev browser and for the
+     window between load and the first dispatch. */
+  --vgw-safe-top: env(safe-area-inset-top, 0px);
+  --vgw-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --vgw-safe-left: env(safe-area-inset-left, 0px);
+  --vgw-safe-right: env(safe-area-inset-right, 0px);
+  /* Height the software keyboard covers, from visualViewport.
+     0 whenever the keyboard is down. */
+  --kb-inset: 0px;
+
+  --vgw-glass-bg: rgba(22, 27, 34, 0.55);
+  --vgw-glass-border: rgba(255, 255, 255, 0.12);
+  --vgw-glass-highlight: rgba(255, 255, 255, 0.06);
+  --vgw-blur: blur(24px) saturate(160%);
+}
+
+/* ---- Ground -------------------------------------------------
+   Transparent all the way down so the native gradient is the
+   only thing painting the background. desktop.css gives #app a
+   rounded translucent panel and a shadow — both are window
+   chrome for a floating Electron panel and have no meaning on a
+   full-screen phone. */
+html,
+body {
+  background: transparent;
+  height: 100%;
+  margin: 0;
+  overscroll-behavior: none;
+}
+
+/* The dev browser has no native gradient behind it, so paint one
+   here. Under WKWebView the native layer is already there and
+   this simply sits behind a transparent page. */
+body {
+  background-image:
+    radial-gradient(120% 80% at 50% 0%, #1b2230 0%, rgba(27, 34, 48, 0) 60%),
+    linear-gradient(180deg, #0d1117 0%, #090c11 100%);
+  background-attachment: fixed;
+  background-color: #0d1117;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  border-radius: 0;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  overflow: hidden;
+}
+
+#app .claudian-container {
+  background: transparent;
+  /* Safe-area gutters live on the container so the header's
+     glass still bleeds to the true screen edge. */
+  padding-left: var(--vgw-safe-left);
+  padding-right: var(--vgw-safe-right);
+}
+
+/* ---- Header glass ------------------------------------------ */
+#app .claudian-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding-top: calc(var(--vgw-safe-top) + 8px);
+  padding-bottom: 8px;
+  padding-left: 14px;
+  padding-right: 14px;
+  background: var(--vgw-glass-bg);
+  -webkit-backdrop-filter: var(--vgw-blur);
+  backdrop-filter: var(--vgw-blur);
+  border-bottom: 1px solid var(--vgw-glass-border);
+  box-shadow: inset 0 1px 0 0 var(--vgw-glass-highlight);
+}
+
+#app .claudian-title-text {
+  font-size: 16px;
+}
+
+#app .claudian-logo,
+#app .claudian-logo img {
+  width: 18px;
+  height: 18px;
+}
+
+/* The tab strip sits directly under the header; styles.css pins
+   it with `top: 36px`, which assumed a fixed-height desktop
+   header. Here the header's height varies with the safe-area
+   inset, so the strip rides along instead of sticking. */
+#app .claudian-input-nav-row {
+  position: relative;
+  top: auto;
+  background: transparent;
+  padding: 6px 12px;
+}
+
+#app .claudian-tab-bar-container {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 2px;
+}
+
+#app .claudian-tab-bar-container::-webkit-scrollbar {
+  display: none;
+}
+
+#app .claudian-tab-badges {
+  flex-wrap: nowrap;
+}
+
+/* ---- Connectivity strip ------------------------------------
+   Secondary to the native banner (CONTRACTS.md: the page may
+   show an inline state but must not be the only indicator). */
+.vaultgw-state-strip {
+  flex-shrink: 0;
+  margin: 0 12px 6px 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--vgw-glass-border);
+}
+
+.vaultgw-state-strip.is-error {
+  color: var(--text-error);
+  background: rgba(244, 112, 103, 0.1);
+  border-color: rgba(244, 112, 103, 0.28);
+}
+
+.vaultgw-boot-error {
+  padding: 2em 1.5em;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.vaultgw-boot-error h3 {
+  color: var(--text-normal);
+  font-family: "Copernicus", "Tiempos Headline", Georgia, serif;
+  font-weight: 500;
+}
+
+/* ---- Composer glass ----------------------------------------
+   The brand-orange border is the composer's identity in the
+   plugin and the desktop app; it stays. What changes is the
+   fill: translucent over the gradient, with the same hairline
+   and inner highlight as the header so the two read as one
+   material. */
+#app .claudian-input-wrapper {
+  background: var(--vgw-glass-bg);
+  -webkit-backdrop-filter: var(--vgw-blur);
+  backdrop-filter: var(--vgw-blur);
+  box-shadow: inset 0 1px 0 0 var(--vgw-glass-highlight);
+  /* On desktop the brand edge only appears on :focus-within, because the
+     panel already reads as a chat window. Floating on a gradient with no
+     window chrome around it, the composer needs its own edge to be a card at
+     all — so the brand border is always on, and focus deepens it. */
+  border-color: rgba(var(--claudian-brand-rgb), 0.38);
+}
+
+#app .claudian-input-wrapper:focus-within {
+  border-color: rgba(var(--claudian-brand-rgb), 0.7);
+}
+
+#app .claudian-input-container {
+  /* Keyboard inset first, then the home indicator when the
+     keyboard is down. iOS reports the keyboard height inclusive
+     of the home indicator, so max() rather than a sum — adding
+     both would double-count the safe area. */
+  padding-bottom: max(var(--kb-inset), var(--vgw-safe-bottom));
+  transition: padding-bottom 120ms ease-out;
+}
+
+#app .claudian-input,
+#app .modal input,
+#app .modal textarea,
+.prompt-input {
+  /* Below 16px iOS zooms the whole page on focus. */
+  font-size: 16px;
+}
+
+/* ---- Text selection ----------------------------------------
+   desktop.css turns selection off globally (a frameless window
+   must not be select-draggable). On a phone there is no window
+   to drag and long-press-to-select is the only way to copy, so
+   it comes back on everything that holds content. */
+#app .claudian-message,
+#app .claudian-message-content,
+#app .claudian-bubble,
+#app .claudian-text-block,
+#app .claudian-tool-content,
+#app .claudian-tool-input,
+#app .claudian-tool-result-row,
+#app .claudian-thinking-block,
+#app pre,
+#app code {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* ---- Touch targets + always-visible actions ----------------
+   Everything below is gated on a coarse pointer / no hover, so
+   the same stylesheet stays correct if this build is ever loaded
+   on a trackpad (iPad with a Magic Keyboard, or the dev
+   browser). */
+@media (hover: none) {
+  /* Message actions (copy, fork) are hover-revealed on desktop,
+     which on a touch screen means never revealed. They cannot
+     simply be un-hidden either: the toolbar is an absolutely
+     positioned pill anchored at `top: 100%`, so with nothing to
+     hide it it lands on top of whatever follows the message.
+     Keep the desktop geometry — it is what puts the pill under
+     the right bubble — and reserve the space it occupies, so the
+     pill has somewhere to sit instead of covering the next
+     message. Dimmed until touched. */
+  #app .claudian-message {
+    margin-bottom: 30px;
+  }
+
+  #app .claudian-message-actions {
+    opacity: 0.45;
+    visibility: visible;
+    transition: opacity 120ms ease;
+  }
+
+  #app .claudian-message-actions:active,
+  #app .claudian-message-actions:focus-within {
+    opacity: 1;
+  }
+
+  /* The donut's "Nk / Mk" chip is toggled by the delegated tap
+     handler in renderer.ts rather than by hover. */
+  #app .claudian-context-window-chip {
+    pointer-events: none;
+  }
+}
+
+@media (pointer: coarse) {
+  #app .claudian-header-btn {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+  }
+
+  #app .claudian-header-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  #app .claudian-tab-badge,
+  #app .claudian-tab-badge-new {
+    min-width: 40px;
+    height: 40px;
+    font-size: 14px;
+  }
+
+  #app .claudian-send-button,
+  #app .claudian-attach-button {
+    min-width: 40px;
+    min-height: 40px;
+  }
+
+  #app .claudian-message-action {
+    min-width: 40px;
+    min-height: 40px;
+  }
+
+  #app .claudian-toolbar-pill,
+  #app .claudian-mode-pill,
+  #app .claudian-model-pill {
+    min-height: 34px;
+  }
+
+  #app .claudian-approval-btn-allow,
+  #app .claudian-approval-btn-deny,
+  #app .claudian-askuser-option {
+    min-height: 44px;
+  }
+
+  #app .claudian-popup-row,
+  #app .suggestion-item,
+  #app .claudian-history-row {
+    min-height: 44px;
+  }
+}
+
+/* ---- Narrow-viewport fits ----------------------------------
+   Desktop minimums that overflow a 390px screen. */
+
+/* The bottom toolbar (effort, MCP, agents, attach, usage, send)
+   is an unwrapped flex row sized for a sidebar. At 390px the MCP
+   pill's "(103 tools)" suffix forces a line break inside the
+   pill and pushes the send button off the right edge. Wrapping
+   the ROW instead keeps every pill whole and the send button
+   reachable. */
+#app .claudian-input-toolbar-bottom {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+#app .claudian-input-toolbar-bottom .claudian-toolbar-pill {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+#app .claudian-send-button {
+  flex-shrink: 0;
+  margin-left: auto;
+}
+#app .claudian-popup,
+#app .claudian-popup-attach {
+  max-width: calc(100vw - 24px);
+}
+
+#app .claudian-cost-popup {
+  max-width: calc(100vw - 24px);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.modal {
+  min-width: min(320px, calc(100vw - 32px));
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - var(--vgw-safe-top) - var(--vgw-safe-bottom) - 32px);
+}
+
+.modal-container,
+.prompt {
+  padding-top: var(--vgw-safe-top);
+  padding-bottom: var(--vgw-safe-bottom);
+}
+
+.prompt {
+  max-width: calc(100vw - 24px);
+}
+
+/* Modals render into `body > .modal-container`, OUTSIDE #app, so rules for
+   them cannot be scoped the way the rest of this file is.
+
+   The MCP manager's server rows lay their head out as an unwrapped flex row
+   (checkbox, name, type, status) sized for a desktop modal. At 390px the row
+   overflows and its own `overflow: hidden` silently crops the endpoint line
+   underneath. Wrapping the head keeps every field readable. */
+.claudian-mcp-server-head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+.claudian-mcp-server-row {
+  overflow: visible;
+}
+
+/* Long tool output and code blocks scroll inside their own box
+   rather than widening the page. */
+#app pre,
+#app .claudian-tool-input,
+#app .claudian-tool-result-row,
+#app .claudian-diff {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* ---- Welcome ------------------------------------------------
+   Same serif as the desktop greeting, sized for a phone. The
+   reserved space at the bottom matches the composer's height so
+   the greeting lands in the visual middle. */
+#app .claudian-welcome {
+  padding-bottom: 150px;
+}
+
+#app .claudian-welcome-logo img {
+  width: 48px;
+  height: 48px;
+}
+
+#app .claudian-welcome-greeting {
+  font-family: "Copernicus", "Tiempos Headline", "Tiempos", Georgia,
+    "Times New Roman", serif;
+  font-size: 24px;
+  text-align: center;
+  padding: 0 24px;
+}
+
+/* ---- Motion ------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  #app *,
+  #app *::before,
+  #app *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

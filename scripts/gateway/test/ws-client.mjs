@@ -18,7 +18,11 @@ import { connect as netConnect } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { createHash, randomBytes } from "node:crypto";
 
-const GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F";
+/* RFC 6455 section 1.3 — must stay identical to the one in ../src/ws.ts, and
+   both must be the REAL constant rather than merely agreeing with each other:
+   a shared typo here validates a handshake no browser will accept. Check:
+   sha1("dGhlIHNhbXBsZSBub25jZQ==" + GUID) === "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=". */
+const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 export function wsConnect(url, { timeoutMs = 15_000 } = {}) {
   const u = new URL(url);
