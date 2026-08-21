@@ -9,10 +9,13 @@
     "build": "node esbuild.config.mjs",
     "build:app": "node esbuild.config.mjs --app",
     "build:app:prod": "node esbuild.config.mjs --app --production",
+    "build:ios": "node esbuild.config.mjs --ios",
+    "build:ios:prod": "node esbuild.config.mjs --ios --production",
+    "dev:ios": "node esbuild.config.mjs --ios --watch",
     "dev:app": "node esbuild.config.mjs --app --watch",
     "start:app": "npm run build:app && electron app/dist/main.js",
     "package:app": "npm run build:app:prod && electron-builder --mac dir --config electron-builder.yml",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json && tsc --noEmit -p ios-web/tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

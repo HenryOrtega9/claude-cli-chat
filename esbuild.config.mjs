@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 const watch = process.argv.includes("--watch");
 const appMode = process.argv.includes("--app");
+const iosMode = process.argv.includes("--ios");
 
 /*
  * --production only affects the --app build: it is what electron-builder packs.
@@ -16,7 +17,7 @@ const production = process.argv.includes("--production");
 
 const VAULT_PLUGIN_DIR = "/Users/henryortega/Library/Mobile Documents/iCloud~md~obsidian/Documents/Henry Ortega's Second Brain/.obsidian/plugins/claude-cli-chat";
 
-if (!appMode) {
+if (!appMode && !iosMode) {
   if (!existsSync(VAULT_PLUGIN_DIR)) {
     mkdirSync(VAULT_PLUGIN_DIR, { recursive: true });
   }
@@ -106,7 +107,97 @@ const appRendererOptions = {
   plugins: [forbidObsidianImports],
 };
 
-if (appMode) {
+/*
+ * --ios builds the browser bundle the iOS app loads from vaultgw://app/. Unlike
+ * the two builds above there is no node here at all: the engine lives in the
+ * gateway daemon on the Mac and the page talks to it over HTTP/WebSocket. The
+ * shared view layer only stays loadable in that world if nothing in its import
+ * graph reaches for a node builtin, electron, or obsidian — forbidNodeImports
+ * below turns any regression into a build error naming the importer, which is
+ * the whole point of having this target land before the client is written.
+ */
+const IOS_WEB_DIR = "ios/Web";
+const IOS_ENTRY = "ios-web/src/renderer.ts";
+
+const FORBIDDEN_NODE_BUILTINS =
+  /^(node:)?(fs|fs\/promises|child_process|path|os|http|https|net|readline|stream|zlib|url|crypto|util|events)$/;
+
+const forbidNodeImports = {
+  name: "forbid-node",
+  setup(build) {
+    build.onResolve({ filter: FORBIDDEN_NODE_BUILTINS }, (args) => ({
+      errors: [
+        {
+          text:
+            `The iOS web bundle must not import "${args.path}" ` +
+            `(imported from ${args.importer}). There is no node in a WKWebView — route it ` +
+            `through a PluginHost capability (src/platform/host.ts) or the gateway daemon.`,
+        },
+      ],
+    }));
+    build.onResolve({ filter: /^(electron|obsidian)$/ }, (args) => ({
+      errors: [
+        {
+          text:
+            `The iOS web bundle must not import "${args.path}" ` +
+            `(imported from ${args.importer}). Route host access through src/platform/ instead.`,
+        },
+      ],
+    }));
+  },
+};
+
+const iosRendererOptions = {
+  entryPoints: [IOS_ENTRY],
+  bundle: true,
+  outfile: join(IOS_WEB_DIR, "renderer.js"),
+  format: "iife",
+  platform: "browser",
+  target: "es2022",
+  logLevel: "info",
+  treeShaking: true,
+  sourcemap: production ? false : "inline",
+  minify: production,
+  plugins: [forbidNodeImports],
+};
+
+/* index.html plus the two stylesheets the page links, copied flat next to
+   renderer.js because the native scheme handler serves the folder verbatim. */
+const copyIosAssets = () => {
+  copyFileSync("ios-web/index.html", join(IOS_WEB_DIR, "index.html"));
+  copyFileSync("styles.css", join(IOS_WEB_DIR, "styles.css"));
+  copyFileSync("app/desktop.css", join(IOS_WEB_DIR, "desktop.css"));
+};
+
+if (iosMode) {
+  mkdirSync(IOS_WEB_DIR, { recursive: true });
+
+  if (!existsSync(IOS_ENTRY)) {
+    console.error(`Missing iOS entry: ${IOS_ENTRY}`);
+    process.exit(1);
+  }
+
+  if (watch) {
+    const ctx = await esbuild.context({
+      ...iosRendererOptions,
+      plugins: [
+        ...iosRendererOptions.plugins,
+        {
+          name: "copy-ios-assets",
+          setup(build) {
+            build.onEnd(() => copyIosAssets());
+          },
+        },
+      ],
+    });
+    await ctx.watch();
+    console.log(`Watching iOS web... output: ${IOS_WEB_DIR}`);
+  } else {
+    await esbuild.build(iosRendererOptions);
+    copyIosAssets();
+    console.log(`Built iOS web (${production ? "production" : "development"}). output: ${IOS_WEB_DIR}`);
+  }
+} else if (appMode) {
   mkdirSync(APP_DIST, { recursive: true });
 
   /*

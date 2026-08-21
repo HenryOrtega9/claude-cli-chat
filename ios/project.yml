@@ -1,0 +1,84 @@
+# XcodeGen manifest — the authoritative source for the VaultGateway target.
+# Regenerate with `xcodegen generate` from inside `ios/`; VaultGateway.xcodeproj,
+# Sources/Info.plist and Sources/VaultGateway.entitlements are all derived from
+# this file, so edit here and never in Xcode's inspector.
+name: VaultGateway
+
+options:
+  bundleIdPrefix: dev.henryortega
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: SHMR9277Y3
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: 1
+
+targets:
+  VaultGateway:
+    type: application
+    platform: iOS
+    sources:
+      # Secrets.swift is gitignored and holds local first-launch defaults;
+      # Secrets.example.swift is the committed template and must stay out of
+      # the compile sources or the `Secrets` enum is declared twice.
+      - path: Sources
+        excludes:
+          - "Secrets.example.swift"
+      # Blue folder reference: the whole tree is copied into the bundle as
+      # `Web/` with its directory layout intact, which is what the
+      # vaultgw:// scheme handler serves. Written by the shared-ui agent's
+      # `--ios` esbuild target; a placeholder index.html lives here until then.
+      - path: Web
+        type: folder
+        buildPhase: resources
+    entitlements:
+      path: Sources/VaultGateway.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.dev.henryortega.vaultgateway
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Vault Gateway
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen:
+          UIColorName: ""
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIViewControllerBasedStatusBarAppearance: false
+        ITSAppUsesNonExemptEncryption: false
+        # So the banner's "Open Tailscale" button can canOpenURL-check first.
+        LSApplicationQueriesSchemes:
+          - tailscale
+        # Honest string: the app only probes/talks to the Mac running the
+        # gateway. On a tailnet that is not technically "local network", but
+        # iOS prompts for the raw-IP override path, so the copy has to be true
+        # for both.
+        NSLocalNetworkUsageDescription: >-
+          Vault Gateway connects to the Claude gateway running on your Mac.
+          If your Mac is on the same Wi-Fi instead of Tailscale, iOS needs
+          local network access to reach it.
+        # Scoped ATS exception, NOT NSAllowsArbitraryLoads. The gateway speaks
+        # plain HTTP inside the Tailscale WireGuard tunnel, so only the tailnet
+        # domain is excepted. ATS exception domains cannot name an IP literal,
+        # so the raw-IP override in Settings works only over https (or with the
+        # FQDN); see ios/README.md.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            tail92466c.ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.henryortega.vaultgateway
+        TARGETED_DEVICE_FAMILY: 1
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: YES

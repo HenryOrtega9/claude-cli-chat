@@ -1,0 +1,18 @@
+# Xcode / XcodeGen output. VaultGateway.xcodeproj is regenerated from
+# project.yml, but it is committed so a clone opens without xcodegen; only the
+# per-user cruft inside it is ignored.
+xcuserdata/
+*.xcuserstate
+DerivedData/
+*.xcresult
+build/
+
+# Local-only first-launch defaults (tailnet host + bearer token).
+# Copy Sources/Secrets.example.swift to Sources/Secrets.swift.
+Sources/Secrets.swift
+
+# Simulator smoke-test artifacts.
+shell-smoke*.png
+
+# Note: Web/ is build output from the shared-ui `--ios` esbuild target and is
+# handled by the repo-root .gitignore, not here.

@@ -3,6 +3,7 @@ main.js
 main.js.map
 app/dist/
 app/release/
+ios/Web/
 *.log
 .DS_Store
 .vscode/
