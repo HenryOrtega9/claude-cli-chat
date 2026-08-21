@@ -155,8 +155,13 @@ body {
   border-color: rgba(244, 112, 103, 0.28);
 }
 
+/* The one screen that renders before the shell exists, so it cannot lean on
+   the header's own safe-area padding. --vgw-safe-top carries the Dynamic
+   Island inset PLUS the height of the native connectivity banner, which is
+   drawn over the web view. Without both, this message renders under the
+   island and behind the banner that is explaining the same failure. */
 .vaultgw-boot-error {
-  padding: 2em 1.5em;
+  padding: calc(var(--vgw-safe-top, 0px) + 2em) 1.5em calc(var(--vgw-safe-bottom, 0px) + 2em);
   text-align: center;
   color: var(--text-muted);
 }
@@ -239,9 +244,15 @@ body {
      Keep the desktop geometry — it is what puts the pill under
      the right bubble — and reserve the space it occupies, so the
      pill has somewhere to sit instead of covering the next
-     message. Dimmed until touched. */
+     message. Dimmed until touched.
+
+     The reserve has to match the pill's real height, which on a
+     coarse pointer is the 40px minimum touch target below plus
+     its 3px padding either side = 46px; 52px leaves a 6px gap so
+     the next row does not sit flush against it. 30px was not
+     enough and the pill crossed the following tool row. */
   #app .claudian-message {
-    margin-bottom: 30px;
+    margin-bottom: 52px;
   }
 
   #app .claudian-message-actions {

@@ -36,6 +36,9 @@ struct WebHost: UIViewRepresentable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         ))
+        #if DEBUG
+        if let seed = DebugLaunchEnvironment.settingsSeedScript() { controller.addUserScript(seed) }
+        #endif
         config.userContentController = controller
 
         let webView = WKWebView(frame: .zero, configuration: config)

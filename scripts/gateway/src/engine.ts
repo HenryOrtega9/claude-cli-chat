@@ -17,6 +17,7 @@
    there is no transcript-discovery path here, unlike RemoteControlSession. */
 
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 
 import { SubprocessManager, type SpawnOptions, type TabSession } from "../../../src/claude/SubprocessManager";
 import type {
@@ -28,6 +29,7 @@ import type {
   ToolUseBlock,
   UsageSnapshot,
 } from "../../../src/claude/Events";
+import { sessionFilePathFor } from "../../../src/claude/session-files";
 import type { Persistence } from "../../../src/storage/Persistence";
 import type { ChatMessage, TabState, ToolCall } from "../../../src/view/state";
 import { MODEL_IDS, type ModelKey, type PermissionMode } from "../../../src/settings-data";
@@ -91,17 +93,36 @@ export class TabEngine {
 
   private seq = 0;
   private session: TabSession | null = null;
-  /* True once the CLI has actually created the session on disk, which is what
-     makes `--resume` legal. Set on the first `system/init`. */
+  /* True once THIS process has seen the child's `system/init`, which proves
+     the CLI created the session and `--resume` is legal. Deliberately not set
+     from the fact of rehydration; see canResume(). */
   private sessionEstablished = false;
+  /* Set when a `--resume` spawn died before it ever emitted `system/init`,
+     i.e. the CLI rejected the session id. Forces `--session-id` from then on. */
+  private resumeUnavailable = false;
+  /* Per-spawn: did this child resume, and did it get as far as `system/init`? */
+  private resumedThisSpawn = false;
+  private sawInitThisSpawn = false;
   private ring: ReplayRing;
   private pending = new Map<string, { req: ControlRequestEvent; timer: ReturnType<typeof setTimeout> }>();
   private state: TabState;
   private toolToMessage = new Map<string, string>();
   private currentAssistant: ChatMessage | null = null;
-  private currentTurn: { turnId: string; startedAt: number } | null = null;
+  /* The API message id (`msg_…`) the current bubble belongs to. One turn can
+     span several API calls (text, then a tool_use, then the answer), and the
+     client's live rendering starts a new bubble per call. Tracking the id here
+     keeps the persisted projection split the same way; without it a restored
+     conversation folded the whole turn into one bubble and rendered its tool
+     rows AFTER the answer they produced. */
+  private currentAssistantId: string | null = null;
+  private currentTurn: { turnId: string; startedAt: number; blocks: ContentBlock[]; retriedWithoutResume?: boolean } | null = null;
   private stderrTail = "";
   private disposed = false;
+  /* An engine-affecting patch landed while a child was alive: that child is
+     running on the old model/effort/mode and must be replaced before the next
+     turn. See patch() / prepareForTurn(). */
+  private needsRespawn = false;
+  private pendingTeardown: Promise<void> | null = null;
 
   constructor(
     private deps: EngineDeps,
@@ -134,14 +155,20 @@ export class TabEngine {
       effort: init.effort,
       permissionMode: init.permissionMode ?? DEFAULT_PERMISSION_MODE,
     };
-    /* A restored tab already ran once, so its session exists on disk and the
-       next spawn must resume rather than re-declare the id. */
-    if (init.restored) this.sessionEstablished = true;
+    /* NOTE: a restored tab is NOT assumed to have an established session.
+       POST /tabs mints a session id without spawning anything, so a tab that
+       never took a turn before the daemon restarted has an id and no
+       conversation. canResume() asks the disk instead. */
     this.state.sessionId = this.sessionId;
     if (init.title) this.state.title = init.title;
     if (init.model) this.state.model = init.model;
     if (init.effort) this.state.effort = init.effort;
     if (init.permissionMode) this.state.permissionMode = init.permissionMode;
+    /* Persist a brand-new tab straight away. The index lists it either way,
+       but restore() drops any entry whose conversation file is missing, so a
+       tab created and not used before a restart would otherwise 404 on the
+       phone that is holding its id. */
+    if (!init.restored) this.save();
   }
 
   /* ---------- public surface ---------- */
@@ -197,11 +224,24 @@ export class TabEngine {
      live child — the contract says they take effect on the next turn's
      respawn, so a patch mid-turn can never orphan a running child. */
   patch(p: TabPatch): void {
+    const before = `${this.state.model}|${this.state.effort}|${this.state.permissionMode}`;
     if (typeof p.title === "string" && p.title.trim()) this.state.title = p.title.trim();
     if (typeof p.model === "string") this.state.model = p.model;
     if (typeof p.effort === "string") this.state.effort = p.effort;
     if (typeof p.permissionMode === "string" && p.permissionMode !== "bypassPermissions") {
       this.state.permissionMode = p.permissionMode;
+    }
+    /* A live child cannot change model, effort or permission mode: those are
+       argv. The desktop client kills its child on such a change and the remote
+       client's dispose() maps to /abort, but a client that patched WITHOUT
+       holding a session (a page that just reloaded, or any second client)
+       would otherwise leave the daemon reusing a child spawned on the old
+       settings, and the change would silently not apply. Own it here instead
+       of trusting the caller: drop the child now if the tab is idle, or at the
+       start of the next turn if it is mid-turn or holding an approval. */
+    if (`${this.state.model}|${this.state.effort}|${this.state.permissionMode}` !== before && this.hasLiveChild) {
+      this.needsRespawn = true;
+      if (!this.busy && this.pending.size === 0) this.pendingTeardown = this.dropChildForRespawn();
     }
     if (Array.isArray(p.pinnedFilePaths)) this.state.pinnedFilePaths = p.pinnedFilePaths;
     this.state.updatedAt = Date.now();
@@ -231,12 +271,35 @@ export class TabEngine {
 
   /* ---------- turns ---------- */
 
+  /* Awaited by the server immediately before submit(): settles any child
+     replacement an engine-affecting patch asked for, so the turn always spawns
+     on the settings the tab currently advertises. */
+  async prepareForTurn(): Promise<void> {
+    const pending = this.pendingTeardown;
+    if (pending) {
+      this.pendingTeardown = null;
+      await pending;
+    }
+    /* A busy tab is about to be rejected with 409; never take its child. */
+    if (this.busy) return;
+    if (this.needsRespawn && this.hasLiveChild) await this.dropChildForRespawn();
+  }
+
+  private async dropChildForRespawn(): Promise<void> {
+    this.needsRespawn = false;
+    await this.teardownSession();
+    if (this.disposed) return;
+    this.status = "idle";
+    this.emit("tab_status", this.statusPayload());
+    this.deps.log(`tab ${this.id}: child released (config change)`);
+  }
+
   submit(blocks: ContentBlock[], clientTurnId?: string): { turnId: string; seq: number } {
     if (this.busy) throw new BusyError();
     const turnId = clientTurnId || `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     this.busy = true;
     this.state.busy = true;
-    this.currentTurn = { turnId, startedAt: Date.now() };
+    this.currentTurn = { turnId, startedAt: Date.now(), blocks };
     this.touch();
 
     /* Project the user turn immediately rather than waiting for the CLI's
@@ -258,6 +321,7 @@ export class TabEngine {
     };
     this.state.messages.push(userMsg);
     this.currentAssistant = null;
+    this.currentAssistantId = null;
     this.state.updatedAt = Date.now();
     this.save();
 
@@ -367,14 +431,38 @@ export class TabEngine {
     this.deps.persistence.scheduleSaveTab(this.state);
   }
 
+  /* `--resume <uuid>` is only legal for a conversation that actually exists.
+     Three ways to know:
+       - this process watched the child emit `system/init` for it (authoritative);
+       - the CLI wrote a transcript for it under ~/.claude/projects (the case
+         after a daemon restart, where the flag above is gone but the
+         conversation is not);
+       - otherwise it does not exist, and resuming it makes the CLI exit 1 with
+         "No conversation found with session ID", surfacing every turn as
+         error_during_execution forever.
+     Incognito tabs spawn with --no-session-persistence, so their transcript is
+     never a resume source; only the in-process flag counts for them. */
+  private canResume(): boolean {
+    if (this.resumeUnavailable) return false;
+    if (this.sessionEstablished) return true;
+    if (this.incognito) return false;
+    try {
+      return existsSync(sessionFilePathFor(this.deps.vault, this.sessionId));
+    } catch {
+      return false;
+    }
+  }
+
   private spawnOptions(): SpawnOptions {
     const extraArgs = ["--replay-user-messages"];
     /* First spawn declares the id; every later one resumes it. Passing both
        makes the CLI reject the invocation. */
-    if (!this.sessionEstablished) extraArgs.push("--session-id", this.sessionId);
+    const resume = this.canResume();
+    this.resumedThisSpawn = resume;
+    if (!resume) extraArgs.push("--session-id", this.sessionId);
     return {
       cwd: this.deps.vault,
-      sessionId: this.sessionEstablished ? this.sessionId : undefined,
+      sessionId: resume ? this.sessionId : undefined,
       model: resolveModel(this.state.model),
       effort: this.state.effort,
       claudePath: this.deps.claudePath,
@@ -390,12 +478,24 @@ export class TabEngine {
     if (this.session && !this.session.isTerminal()) return this.session;
     this.status = "starting";
     this.stderrTail = "";
+    this.sawInitThisSpawn = false;
     const session = this.deps.subprocess.spawn(this.id, this.spawnOptions());
     this.session = session;
-    session.onEvent(e => this.handleEvent(e));
-    session.onStderr(chunk => { this.stderrTail = (this.stderrTail + chunk).slice(-4000); });
-    session.onError(err => this.handleFatal(`spawn failed: ${err.message}`));
-    session.onExit((code, signal) => this.handleExit(code, signal));
+    /* Identity guards: teardownSession() nulls `this.session` before the
+       child has finished dying, so a replaced child's trailing events, stderr
+       and exit must not be projected onto the tab that has already moved on.
+       An ungated onExit would null out the session that replaced it. */
+    session.onEvent(e => { if (this.session === session) this.handleEvent(e); });
+    session.onStderr(chunk => {
+      if (this.session !== session) return;
+      this.stderrTail = (this.stderrTail + chunk).slice(-4000);
+    });
+    session.onError(err => {
+      if (this.session === session) this.handleFatal(`spawn failed: ${err.message}`);
+    });
+    session.onExit((code, signal) => {
+      if (this.session === session) this.handleExit(code, signal);
+    });
     return session;
   }
 
@@ -417,6 +517,9 @@ export class TabEngine {
         case "system":
           if ((event as { subtype?: string }).subtype === "init") {
             this.sessionEstablished = true;
+            this.sawInitThisSpawn = true;
+            /* A re-declared id that reached init exists again. */
+            this.resumeUnavailable = false;
             this.status = this.busy ? "running" : "ready";
             this.emit("tab_status", this.statusPayload());
           }
@@ -481,6 +584,11 @@ export class TabEngine {
   }
 
   private projectAssistant(event: AssistantEvent): void {
+    const apiId = (event.message as { id?: string } | undefined)?.id;
+    if (apiId && apiId !== this.currentAssistantId) {
+      this.currentAssistantId = apiId;
+      this.currentAssistant = null;
+    }
     const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
     for (const block of blocks) {
       if (block.type === "text") {
@@ -545,6 +653,7 @@ export class TabEngine {
       if (turn) this.currentAssistant.durationMs = Date.now() - turn.startedAt;
     }
     this.currentAssistant = null;
+    this.currentAssistantId = null;
     this.currentTurn = null;
     this.state.updatedAt = Date.now();
     this.save();
@@ -563,6 +672,31 @@ export class TabEngine {
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.disposed) return;
     this.session = null;
+    const failedResume = this.resumedThisSpawn && !this.sawInitThisSpawn && code !== 0;
+    this.resumedThisSpawn = false;
+
+    /* Belt and braces for the resume check above: if a --resume child died
+       before `system/init`, the session id was rejected (deleted transcript,
+       a `claude` that cleaned up, a resume the CLI would not take). Nothing
+       was streamed, so re-declaring the id and re-sending the same blocks is
+       safe and invisible. Once per turn only. */
+    const retryTurn = this.currentTurn;
+    if (failedResume && this.busy && retryTurn && !retryTurn.retriedWithoutResume) {
+      this.resumeUnavailable = true;
+      retryTurn.retriedWithoutResume = true;
+      this.deps.log(
+        `tab ${this.id}: --resume ${this.sessionId} failed (exit ${code}); respawning with --session-id`,
+      );
+      try {
+        const session = this.ensureSession();
+        this.emit("tab_status", this.statusPayload("starting"));
+        session.sendUserContent(retryTurn.blocks);
+        return;
+      } catch (err) {
+        this.deps.log(`tab ${this.id}: resume fallback failed: ${String(err)}`);
+        this.session = null;
+      }
+    }
     for (const requestId of Array.from(this.pending.keys())) {
       this.resolveApproval(requestId, false, "Subprocess exited", undefined, "restart");
     }

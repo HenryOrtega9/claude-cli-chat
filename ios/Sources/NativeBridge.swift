@@ -196,6 +196,16 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
         webView.evaluateJavaScript(script)
     }
 
+    /// Raw `evaluateJavaScript`. Only the DEBUG automation hook uses it; the
+    /// contract's native → page direction is `dispatch`.
+    func evaluate(_ script: String, completion: ((Any?, Error?) -> Void)? = nil) {
+        guard let webView else {
+            completion?(nil, nil)
+            return
+        }
+        webView.evaluateJavaScript(script) { result, error in completion?(result, error) }
+    }
+
     func updateSafeArea(_ insets: SafeAreaInsets) {
         guard insets != safeArea else { return }
         safeArea = insets

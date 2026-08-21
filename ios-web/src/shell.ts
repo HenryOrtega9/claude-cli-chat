@@ -40,6 +40,7 @@ import {
 } from "../../src/settings-data";
 import type { Persistence } from "../../src/storage/Persistence";
 import type { GatewayConnection, LinkState } from "../../src/platform/remote/GatewayConnection";
+import { isNativeHost } from "./native";
 import type { RemoteHost } from "../../src/platform/remote/RemoteHost";
 import type { RemoteFileStorage } from "../../src/platform/remote/RemoteFileStorage";
 import type { GatewayTransport } from "../../src/platform/remote/transport";
@@ -533,16 +534,27 @@ export class IosChatShell {
     composer.focus();
   }
 
+  /* Native's connectivity dispatch. Inside the app this is the same sentence
+     the native banner is already showing in a view the page cannot cover, and
+     printing it twice, stacked, reads as a bug rather than as emphasis. The
+     dev browser has no native banner, so there the strip stays the only
+     indicator. Socket-level states that native does not know about still go
+     through showStrip(); see renderLinkState. */
   setConnectivity(payload: ConnectivityPayload): void {
     const state = typeof payload.state === "string" ? payload.state : "ok";
-    if (state === "ok") {
-      this.stateStrip.style.display = "none";
-      return;
-    }
+    if (state === "ok" || isNativeHost()) return this.hideStrip();
     const text = payload.message || CONNECTIVITY_TEXT[state] || state;
+    this.showStrip(text, state === "unauthorized" || state === "gateway_down");
+  }
+
+  private showStrip(text: string, isError: boolean): void {
     this.stateStrip.setText(text);
     this.stateStrip.style.display = "";
-    this.stateStrip.toggleClass("is-error", state === "unauthorized" || state === "gateway_down");
+    this.stateStrip.toggleClass("is-error", isError);
+  }
+
+  private hideStrip(): void {
+    this.stateStrip.style.display = "none";
   }
 
   /* The socket's own view of the link, which is finer-grained than native's
@@ -551,13 +563,15 @@ export class IosChatShell {
   private renderLinkState(state: LinkState): void {
     switch (state) {
       case "open":
-        this.setConnectivity({ state: "ok" });
+        this.hideStrip();
         return;
       case "unauthorized":
         this.setConnectivity({ state: "unauthorized" });
         return;
       case "reconnecting":
-        this.setConnectivity({ state: "gateway_down", message: "Reconnecting to the Mac…" });
+        /* Native's /health probe cannot see this (the tunnel is up and the
+           socket is not), so the strip shows it even under the app. */
+        this.showStrip("Reconnecting to the Mac…", false);
         return;
       default:
         return;

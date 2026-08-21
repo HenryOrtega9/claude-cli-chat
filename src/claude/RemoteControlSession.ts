@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { autodetectClaudePath } from "../settings-autodetect";
+import { projectDirFor, sessionFilePathFor } from "./session-files";
 
 export type RemoteStatus = "starting" | "waiting" | "ready" | "exited" | "error";
 
@@ -459,15 +460,6 @@ function isAiTitleResidue(path: string): boolean {
   }
 }
 
-/* Computes Claude Code's project directory under ~/.claude/projects. The
-   algorithm replaces every non-alphanumeric character in the cwd with a
-   single dash. Verified empirically against existing entries. */
-export function projectDirFor(cwd: string): string {
-  const home = process.env.HOME ?? "";
-  const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-");
-  return `${home}/.claude/projects/${slug}`;
-}
-
-export function sessionFilePathFor(cwd: string, sessionId: string): string {
-  return `${projectDirFor(cwd)}/${sessionId}.jsonl`;
-}
+/* Moved to ./session-files (pure path math, no PTY). Re-exported so existing
+   `from "./RemoteControlSession"` imports are unchanged. */
+export { projectDirFor, sessionFilePathFor } from "./session-files";

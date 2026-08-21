@@ -20,6 +20,7 @@
 		719887B024880E7B5AAD2BE8 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */; };
 		80DE10F676FB711FAE44D05B /* ConnectivityMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */; };
 		87010C30E14352A55F01DFD2 /* TurnNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4041BF1C59EF00F173A0256D /* TurnNotifier.swift */; };
+		8D481D2184EF47F6F062F63D /* DebugLaunchEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -29,6 +30,7 @@
 		4041BF1C59EF00F173A0256D /* TurnNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnNotifier.swift; sourceTree = "<group>"; };
 		487B5693410A068B4A5E21CE /* WebHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebHost.swift; sourceTree = "<group>"; };
 		4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLaunchEnvironment.swift; sourceTree = "<group>"; };
 		626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeBridge.swift; sourceTree = "<group>"; };
 		7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayConfig.swift; sourceTree = "<group>"; };
 		974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectivityBanner.swift; sourceTree = "<group>"; };
@@ -64,6 +66,7 @@
 			children = (
 				974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */,
 				FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */,
+				5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */,
 				B870DB873970D7A12AB3179A /* GatewayClient.swift */,
 				7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */,
 				CF805F7F96FD1EE807EAA231 /* Info.plist */,
@@ -153,6 +156,7 @@
 			files = (
 				37F572A6E4F2694ECB238A6E /* ConnectivityBanner.swift in Sources */,
 				80DE10F676FB711FAE44D05B /* ConnectivityMonitor.swift in Sources */,
+				8D481D2184EF47F6F062F63D /* DebugLaunchEnvironment.swift in Sources */,
 				4B1D68BDCCA3D71066BE2929 /* GatewayClient.swift in Sources */,
 				5A0BA34A95404F6D3333DFFB /* GatewayConfig.swift in Sources */,
 				719887B024880E7B5AAD2BE8 /* KeychainStore.swift in Sources */,

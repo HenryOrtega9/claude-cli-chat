@@ -72,20 +72,30 @@ export class MessageListRenderer {
       this.resizeObserver = new ResizeObserver(() => this.pinIfSticky());
       this.resizeObserver.observe(this.container);
     }
-    if (typeof IntersectionObserver !== "undefined") {
-      /* Threshold 0.01 means "any pixel of the sentinel is visible" — that
-         counts as being at the bottom. Margin of 80px lets the user be
-         slightly off-bottom and still trigger stickiness. */
-      this.intersectionObserver = new IntersectionObserver(
-        entries => {
-          for (const entry of entries) {
-            this.stickToBottom = entry.isIntersecting;
-          }
-        },
-        { root: null, rootMargin: "0px 0px 80px 0px", threshold: 0.01 }
-      );
-      this.intersectionObserver.observe(this.bottomSentinel);
-    }
+    /* Threshold 0.01 means "any pixel of the sentinel is visible" — that
+       counts as being at the bottom. Margin of 80px lets the user be
+       slightly off-bottom and still trigger stickiness. */
+    this.observeSentinel();
+  }
+
+  /* One observer definition for both the constructor and reset(). */
+  private observeSentinel() {
+    if (typeof IntersectionObserver === "undefined") return;
+    this.intersectionObserver = new IntersectionObserver(
+      entries => {
+        /* A hidden document (the iOS app in the background, an Obsidian tab
+           the user switched away from) reports every element as NOT
+           intersecting. Reading that as "the user scrolled away" turns
+           stickiness off for good, so the reply that streamed in while the
+           app was backgrounded ends up below the fold when they come back. */
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+        for (const entry of entries) {
+          this.stickToBottom = entry.isIntersecting;
+        }
+      },
+      { root: null, rootMargin: "0px 0px 80px 0px", threshold: 0.01 }
+    );
+    this.intersectionObserver.observe(this.bottomSentinel);
   }
 
   destroy() {
@@ -103,17 +113,7 @@ export class MessageListRenderer {
     this.container.empty();
     this.bottomSentinel = this.container.createDiv({ cls: "claudian-bottom-sentinel" });
     this.intersectionObserver?.disconnect();
-    if (typeof IntersectionObserver !== "undefined") {
-      this.intersectionObserver = new IntersectionObserver(
-        entries => {
-          for (const entry of entries) {
-            this.stickToBottom = entry.isIntersecting;
-          }
-        },
-        { root: null, rootMargin: "0px 0px 80px 0px", threshold: 0.01 }
-      );
-      this.intersectionObserver.observe(this.bottomSentinel);
-    }
+    this.observeSentinel();
     this.liveEls.clear();
     this.toolEls.clear();
     this.thinkingOpenOverride.clear();

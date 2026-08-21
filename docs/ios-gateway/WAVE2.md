@@ -143,7 +143,9 @@ Two one-line constants in `scripts/gateway/` is outside this change's declared
 ownership; it was unavoidable, since without it the wave-2 deliverable cannot
 connect from any browser, WKWebView included.
 
-**2. A restored tab that never ran spawns with `--resume`.** Not fixed here.
+**2. A restored tab that never ran spawns with `--resume`.** Fixed in the
+integration pass (see [`INTEGRATION.md`](INTEGRATION.md)); the description
+below is what wave 2 found.
 `TabEngine` treats a tab rehydrated from disk as having an established session,
 so a tab created (`POST /tabs`, which mints a session id) but never given a turn
 before the daemon restarts spawns with `--resume <uuid>` for a conversation that

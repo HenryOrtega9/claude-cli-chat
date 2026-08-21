@@ -11,6 +11,13 @@
      4. Disconnect, reconnect with `since`, and the replay has no gaps and no
         duplicates (seq is contiguous across the cut)
      5. GET /tabs/:id returns the persisted tab with the conversation in it
+     6. The HTTP replay endpoint agrees with the socket
+     7. REGRESSION: a tab created but never given a turn survives a daemon
+        restart and its FIRST turn still succeeds. The daemon used to mark
+        every rehydrated tab as having an established session, so that tab
+        spawned `--resume <uuid>` for a conversation the CLI had never
+        created, exited 1, and the turn surfaced as error_during_execution.
+        Needs the launchd job (skipped otherwise, or with --no-restart).
 
    The WebSocket client is ./ws-client.mjs (see its header for why the built-in
    one is unusable here), so this needs no dependencies.
@@ -23,6 +30,7 @@
    the ws:// or wss:// origin from it, which is exactly how it doubles as the
    proof that WebSocket upgrade survives serve. */
 
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { wsConnect } from "./ws-client.mjs";
@@ -31,6 +39,8 @@ const BASE = (process.argv[2] || process.env.BASE || "http://127.0.0.1:8788").re
 const TOKEN_FILE = process.env.VAULT_GATEWAY_TOKEN_FILE || `${homedir()}/.config/vault-gateway/token`;
 const TOKEN = readFileSync(TOKEN_FILE, "utf8").trim();
 const WS_BASE = BASE.replace(/^http/, "ws");
+const LAUNCHD_LABEL = "dev.claude-cli-chat.vault-gateway";
+const ALLOW_RESTART = !process.argv.includes("--no-restart");
 
 let failures = 0;
 const t0 = Date.now();
@@ -106,6 +116,31 @@ function assistantTextIn(frames) {
     }
   }
   return text;
+}
+
+/* Restarts the launchd daemon and waits for /health to report ready again.
+   Returns false when the job isn't loaded (a hand-started daemon, or another
+   machine), which the caller reports as a skip rather than a failure. */
+async function restartDaemon() {
+  if (!ALLOW_RESTART) return false;
+  const uid = process.getuid();
+  try {
+    execFileSync("/bin/launchctl", ["print", `gui/${uid}/${LAUNCHD_LABEL}`], { stdio: "ignore" });
+  } catch {
+    return false;
+  }
+  execFileSync("/bin/launchctl", ["kickstart", "-k", `gui/${uid}/${LAUNCHD_LABEL}`], { stdio: "ignore" });
+  const deadline = Date.now() + 120_000;
+  /* The store lives on iCloud Drive; a cold read has been measured at ~33 s,
+     which is exactly why /health distinguishes "starting" from being down. */
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const h = await api("GET", "/health");
+      if (h.status === 200 && h.json.state === "ready") return true;
+    } catch { /* socket not back yet */ }
+  }
+  throw new Error("daemon did not come back ready within 120s");
 }
 
 async function main() {
@@ -239,6 +274,52 @@ async function main() {
   await c2.close();
   const deleted = await api("DELETE", `/tabs/${tabId}`);
   assert(deleted.status === 200, "DELETE /tabs/:id -> 200");
+
+  /* --- 7. regression: cold tab across a daemon restart ---
+     A tab that was created and never used has a session id and no
+     conversation. Before the fix in engine.ts, restore() marked it
+     sessionEstablished, so its first spawn passed `--resume <uuid>`, the CLI
+     exited 1 with "No conversation found with session ID", and the turn came
+     back as error_during_execution, permanently, since every later spawn
+     repeated it. */
+  log("regression: cold tab, daemon restart, first turn");
+  const cold = await api("POST", "/tabs", { title: "smoke-cold", model: "haiku", permissionMode: "acceptEdits" });
+  assert(cold.status === 200 && cold.json.id, `POST /tabs (cold) -> ${JSON.stringify(cold.json)}`);
+  const coldId = cold.json.id;
+
+  let restarted = false;
+  try {
+    restarted = await restartDaemon();
+  } catch (err) {
+    fail(`daemon restart: ${err.message}`);
+  }
+
+  if (!restarted) {
+    log(`   SKIP restart (launchd job ${LAUNCHD_LABEL} not loaded, or --no-restart)`);
+    await api("DELETE", `/tabs/${coldId}`);
+  } else {
+    log("   daemon restarted, /health ready");
+    const rehydrated = await api("GET", `/tabs/${coldId}`);
+    assert(rehydrated.status === 200, `cold tab survived the restart (GET /tabs/:id -> ${rehydrated.status})`);
+    assert(rehydrated.json?.sessionId === cold.json.sessionId, "rehydrated tab kept its session id");
+
+    const c3 = await connect();
+    const coldTurn = await api("POST", `/tabs/${coldId}/turn`, {
+      blocks: [{ type: "text", text: "Reply with exactly the word PONG." }],
+      clientTurnId: "smoke-cold-1",
+    });
+    assert(coldTurn.status === 202, `POST cold turn -> 202 (got ${coldTurn.status} ${JSON.stringify(coldTurn.json)})`);
+    const coldDone = await c3.waitFor(f => f.tab === coldId && f.t === "turn_done", 180_000, "cold turn_done");
+    assert(
+      coldDone.payload.subtype === "success",
+      `first turn on a rehydrated never-run tab succeeds (subtype ${coldDone.payload.subtype})`,
+    );
+    const coldText = assistantTextIn(c3.frames.filter(f => f.tab === coldId));
+    assert(/PONG/i.test(coldText), `cold tab produced assistant text (${JSON.stringify(coldText.trim().slice(0, 60))})`);
+    await c3.close();
+    const coldDeleted = await api("DELETE", `/tabs/${coldId}`);
+    assert(coldDeleted.status === 200, "DELETE cold tab -> 200");
+  }
 
   console.log("");
   console.log(failures === 0 ? "SMOKE PASSED" : `SMOKE FAILED (${failures} assertion${failures === 1 ? "" : "s"})`);

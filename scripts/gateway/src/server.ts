@@ -300,6 +300,7 @@ export class GatewayServer {
     if (blocks.length === 0) return sendJson(res, 400, { error: "empty_turn" });
     try {
       await this.deps.registry.makeRoomFor(engine);
+      await engine.prepareForTurn();
       const { turnId, seq } = engine.submit(blocks, typeof body?.clientTurnId === "string" ? body.clientTurnId : undefined);
       sendJson(res, 202, { turnId, seq });
     } catch (err) {
@@ -516,6 +517,7 @@ export class GatewayServer {
     }
     try {
       await this.deps.registry.makeRoomFor(engine);
+      await engine.prepareForTurn();
       engine.submit(blocks, typeof msg.clientTurnId === "string" ? msg.clientTurnId : undefined);
     } catch (err) {
       const error = err instanceof BusyError ? "busy" : err instanceof NoCapacityError ? "no_capacity" : "turn_failed";

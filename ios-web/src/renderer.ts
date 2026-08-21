@@ -95,11 +95,27 @@ function wireKeyboardInset(): void {
   const vv = window.visualViewport;
   if (!vv) return;
   const apply = () => {
-    const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    /* WebKit scrolls the layout viewport to reveal a focused input even when
+       the document cannot scroll (html/body are `overflow: hidden` and
+       scrollHeight === clientHeight here). That scroll is pure damage: it
+       drags the sticky header up under the Dynamic Island, and it lands in
+       `vv.offsetTop`, where subtracting it computed a keyboard inset of 0 and
+       left the composer behind the accessory bar. Pin the scroll back to the
+       top and measure the keyboard as the plain layout-vs-visual difference.
+       Measured on iPhone 17 Pro: innerHeight 874, vv.height 806 with the
+       hardware-keyboard accessory bar up, so the inset is 68. */
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    const scroller = document.scrollingElement;
+    if (scroller && scroller.scrollTop !== 0) scroller.scrollTop = 0;
+    const inset = Math.max(0, window.innerHeight - vv.height);
     document.documentElement.style.setProperty("--kb-inset", `${Math.round(inset)}px`);
   };
   vv.addEventListener("resize", apply);
   vv.addEventListener("scroll", apply);
+  /* focusin fires before the keyboard animation, scroll fires during it; both
+     have to re-pin or the header spends the animation off-screen. */
+  window.addEventListener("focusin", apply);
+  window.addEventListener("scroll", apply, { passive: true });
   apply();
 }
 
@@ -132,6 +148,30 @@ function renderBootError(mount: HTMLElement, title: string, detail: string): voi
   wrap.append(h, p);
   mount.append(wrap);
 }
+
+/* A boot that failed because the Mac was unreachable is not permanent: the
+   daemon comes back, the tunnel comes back, and the phone should follow
+   without the user force-quitting the app. Watch both signals, native's
+   /health probe (dispatched as `connectivity`) and our own poll for the case
+   where the page is running without a native banner, then reload once the
+   gateway answers. Installed only on the failure paths, which return
+   immediately after, so it can never race the real handler. */
+function armBootRetry(probe: () => Promise<boolean>): void {
+  let reloading = false;
+  const retry = async () => {
+    if (reloading) return;
+    if (!(await probe())) return;
+    reloading = true;
+    window.location.reload();
+  };
+  installHandler((name, payload) => {
+    if (name === "connectivity" && payload.state === "ok") void retry();
+    if (name === "resume") void retry();
+  });
+  window.setInterval(() => void retry(), BOOT_RETRY_MS);
+}
+
+const BOOT_RETRY_MS = 10_000;
 
 /* ---------------------------------------------------------------------------
    Boot
@@ -186,6 +226,10 @@ async function boot(): Promise<void> {
       "Can't reach the gateway",
       `${health.message ?? health.error ?? "No route to the Mac."} Check Tailscale and that the Mac is awake.`,
     );
+    armBootRetry(async () => {
+      const again = await conn.rpc("GET", "/health");
+      return again.status === 200;
+    });
     return;
   }
   /* `starting` is a WAIT, not a failure: a cold iCloud vault under launchd has

@@ -28,6 +28,7 @@ ios/
     ConnectivityBanner.swift     the native banner view
     SettingsView.swift           host / scheme / port / IP override / token / test
     TurnNotifier.swift           background /wait long-poll → local notifications
+    DebugLaunchEnvironment.swift DEBUG only: VAULTGW_* launch hooks + a JS command channel
     Secrets.example.swift        template for the gitignored Secrets.swift
     Info.plist                   generated from project.yml
     VaultGateway.entitlements    generated from project.yml (App Group)
@@ -70,8 +71,33 @@ xcrun simctl install booted /path/to/VaultGateway.app
 xcrun simctl launch booted dev.henryortega.vaultgateway
 ```
 
-Device: open `VaultGateway.xcodeproj`, pick the phone, ⌘R. Signing is automatic
-against team `SHMR9277Y3`.
+### On a device
+
+Signing is automatic against team `SHMR9277Y3`; the bundle id
+`dev.henryortega.vaultgateway` and the App Group are both declared in
+`project.yml`, so no Xcode inspector work is needed.
+
+From Xcode: open `VaultGateway.xcodeproj`, pick the phone, ⌘R.
+
+From the command line, with the phone unlocked, on the same network and showing
+`available` in `xcrun devicectl list devices`:
+
+```sh
+xcrun devicectl list devices                       # confirm state, copy the identifier
+xcodebuild -project ios/VaultGateway.xcodeproj -scheme VaultGateway \
+  -destination 'platform=iOS,name=Henry’s iPhone 17 Pro' -quiet build
+xcrun devicectl device install app --device <identifier> /path/to/VaultGateway.app
+xcrun devicectl device process launch --device <identifier> dev.henryortega.vaultgateway
+```
+
+A device listed as `unavailable` is paired but not reachable right now (locked,
+asleep, off the network, or Developer Mode off). Unlock or plug it in and
+re-run `devicectl list devices` rather than waiting on the build.
+
+On a real phone use the tailnet FQDN, not the `100.x` IP: see "Networking and
+ATS" below. The `VAULTGW_*` hooks are simulator-oriented (`SIMCTL_CHILD_*` is
+how the values get in); on a device, enroll through Settings or seed
+`Sources/Secrets.swift` before installing.
 
 ## Token enrollment
 
@@ -91,6 +117,56 @@ With no token enrolled the app opens Settings automatically on first launch.
 For repeat installs during development, `Sources/Secrets.swift` (gitignored)
 can seed the host, port, and token so a fresh install lands connected. It only
 seeds once per install; Settings owns every value afterwards.
+
+### DEBUG launch hooks (simulator automation)
+
+`Sources/DebugLaunchEnvironment.swift` is compiled **only into DEBUG builds**,
+so a shipped app cannot be pointed at another gateway by its environment. It reads
+`VAULTGW_*` from the process environment (or `-VAULTGW_NAME value` launch
+arguments, which is what an Xcode scheme produces), and `xcrun simctl` forwards
+anything prefixed `SIMCTL_CHILD_` into the launched app:
+
+```sh
+SIMCTL_CHILD_VAULTGW_TOKEN="$(cat ~/.config/vault-gateway/token)" \
+SIMCTL_CHILD_VAULTGW_HOST=henrys-macbook-pro.tail92466c.ts.net \
+SIMCTL_CHILD_VAULTGW_SCHEME=http \
+SIMCTL_CHILD_VAULTGW_PORT=8788 \
+xcrun simctl launch --terminate-running-process booted dev.henryortega.vaultgateway
+```
+
+| Variable | Effect |
+|---|---|
+| `VAULTGW_TOKEN` | written straight to the Keychain (overwrites) |
+| `VAULTGW_HOST` | App Group `gatewayHost`; also clears a stale IP override |
+| `VAULTGW_SCHEME` | `http` or `https` |
+| `VAULTGW_PORT` | listen port |
+| `VAULTGW_PERMISSION_MODE` | seeds `localStorage["vaultgw.settings"].permissionMode` at document start, so new tabs come up in that mode |
+| `VAULTGW_AUTOSEND` | after the first page load, inserts the text through the same `share` dispatch the iOS share sheet uses, then presses Enter |
+
+Setting any of them also flips the notification request to include
+`.provisional`, which iOS grants without a prompt (quiet delivery, no banner).
+An automated run has nobody to tap **Allow**, and an unanswered system alert
+sits on top of every screenshot taken afterwards.
+
+**Command channel.** While any `VAULTGW_*` is set, the app polls
+`<data container>/Documents/debug-command.js` twice a second, evaluates whatever
+lands there in the page, deletes it, and writes the result to
+`debug-result.txt` beside it:
+
+```sh
+DIR=$(xcrun simctl get_app_container booted dev.henryortega.vaultgateway data)
+echo 'document.querySelector(".claudian-mode-pill").click(); "ok"' > "$DIR/Documents/debug-command.js"
+sleep 1 && cat "$DIR/Documents/debug-result.txt"
+```
+
+It exists because the Simulator app on this Mac can run with no device window:
+AppleScript then finds zero windows and `screencapture` comes back black, while
+`xcrun simctl io booted screenshot` still renders fine. Every surface worth
+exercising (composer, mode chip, model picker, approval card, history) is web UI
+inside the WKWebView, so a file the host can write drives the whole app. Useful
+selectors: `textarea.claudian-input`, `.claudian-model-pill`,
+`.claudian-mode-pill`, `.claudian-popup-row`, `.claudian-approval-btn-allow`,
+`.claudian-tab-badge-new`.
 
 ## Networking and ATS
 
@@ -124,3 +200,17 @@ app actually reaches a connected state.
 
 Which tab gets watched comes from the page's last `setState` call, so a page
 that never calls `setState` gets no background notifications.
+
+The whole path runs while the app is suspended, so there is nothing to watch
+but the log:
+
+```sh
+xcrun simctl spawn booted log show --last 5m --info --debug \
+  --predicate 'subsystem == "dev.henryortega.vaultgateway"' --style compact
+```
+
+`--info` is not optional: every line is `Logger.info`, and `log show` drops
+info-level records without it. Expect `armed /wait …`, then
+`wait delivered t=turn_done …`, then `notification posted: Claude finished`.
+`arm skipped: busy=0` means the turn finished before the app backgrounded,
+which is correct rather than a failure.

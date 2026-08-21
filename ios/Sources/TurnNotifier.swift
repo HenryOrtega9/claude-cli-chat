@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import UIKit
 import UserNotifications
 
@@ -23,6 +24,11 @@ final class TurnNotifier: NSObject {
     private var session: URLSession?
     private var backgroundCompletion: (() -> Void)?
 
+    /// `log stream --predicate 'subsystem == "dev.henryortega.vaultgateway"'`
+    /// is the only way to watch this path: everything interesting happens while
+    /// the app is suspended, where there is no UI to look at.
+    static let log = Logger(subsystem: "dev.henryortega.vaultgateway", category: "turns")
+
     // MARK: - Setup
 
     func registerCategories() {
@@ -44,7 +50,17 @@ final class TurnNotifier: NSObject {
     func requestAuthorizationIfNeeded() {
         guard !didRequestAuthorization else { return }
         didRequestAuthorization = true
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        var options: UNAuthorizationOptions = [.alert, .sound, .badge]
+        #if DEBUG
+        // An automated launch has nobody to tap "Allow", and the simulator on
+        // this machine has no window to tap in. .provisional is granted
+        // without a prompt (quiet delivery, no banner), which is enough to
+        // prove the background /wait -> notification path end to end.
+        if DebugLaunchEnvironment.isActive { options.insert(.provisional) }
+        #endif
+        UNUserNotificationCenter.current().requestAuthorization(options: options) { granted, error in
+            Self.log.info("authorization granted=\(granted, privacy: .public) error=\(error?.localizedDescription ?? "none", privacy: .public)")
+        }
     }
 
     // MARK: - Arming
@@ -55,7 +71,10 @@ final class TurnNotifier: NSObject {
     func armFromPersistedState() -> Bool {
         let suite = GatewayConfig.suite
         let busy = suite.stringArray(forKey: GatewayConfig.Key.busyTabs) ?? []
-        guard !busy.isEmpty, GatewayConfig.hasToken else { return false }
+        guard !busy.isEmpty, GatewayConfig.hasToken else {
+            Self.log.info("arm skipped: busy=\(busy.count, privacy: .public) hasToken=\(GatewayConfig.hasToken, privacy: .public)")
+            return false
+        }
         let active = suite.string(forKey: GatewayConfig.Key.activeTabId) ?? ""
         let tab = busy.contains(active) ? active : (busy.last ?? "")
         guard !tab.isEmpty else { return false }
@@ -75,6 +94,7 @@ final class TurnNotifier: NSObject {
         let task = session.downloadTask(with: request)
         task.taskDescription = tab
         task.resume()
+        Self.log.info("armed /wait tab=\(tab, privacy: .public) since=\(seq, privacy: .public)")
         session.getAllTasks { tasks in
             tasks.filter { $0.taskIdentifier != task.taskIdentifier }.forEach { $0.cancel() }
         }
@@ -137,11 +157,19 @@ final class TurnNotifier: NSObject {
             }
         default:
             // wait_timeout / partial: nothing finished, so say nothing.
+            Self.log.info("no notification for frame t=\(frame["t"] as? String ?? "?", privacy: .public)")
             return
         }
+        let title = content.title
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        )
+        ) { error in
+            if let error {
+                Self.log.error("notification add failed: \(error.localizedDescription, privacy: .public)")
+            } else {
+                Self.log.info("notification posted: \(title, privacy: .public)")
+            }
+        }
     }
 
     private func tabTitle(for tab: String) -> String {
@@ -171,8 +199,19 @@ extension TurnNotifier: URLSessionDownloadDelegate {
         didFinishDownloadingTo location: URL
     ) {
         guard let data = try? Data(contentsOf: location),
-              let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return }
+              let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            Self.log.error("wait finished with an unreadable body")
+            return
+        }
+        /* `GET /wait` answers `{frame, lastSeq}` on 200 and
+           `{partial:true, error:"wait_timeout", lastSeq}` on 202. The frame
+           is nested, unlike the watch bridge this was ported from. Reading `t`
+           off the envelope found nothing and silently posted no notification,
+           which is exactly what a background turn looks like when it fails.
+           Accept a bare frame too, so a future flattening cannot regress it. */
+        let frame = (body["frame"] as? [String: Any]) ?? body
+        Self.log.info("wait delivered t=\(frame["t"] as? String ?? "?", privacy: .public) tab=\(downloadTask.taskDescription ?? "?", privacy: .public)")
         notify(frame: frame, tabHint: downloadTask.taskDescription)
     }
 

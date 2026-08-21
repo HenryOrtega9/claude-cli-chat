@@ -10,6 +10,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         GatewayConfig.seedFromSecretsIfNeeded()
+        #if DEBUG
+        // After the Secrets seed, so an automated launch wins over it.
+        DebugLaunchEnvironment.applyIfPresent()
+        #endif
         UNUserNotificationCenter.current().delegate = TurnNotifier.shared
         TurnNotifier.shared.registerCategories()
         return true
@@ -48,6 +52,12 @@ struct RootView: View {
     private var webInspector = false
     @State private var showSettings = false
     @State private var didFirstLaunchCheck = false
+    /* The banner is a native view drawn OVER the web view. Without reserving
+       its height in the safe-area inset the page gets, it lands on top of the
+       page header and hides the settings / new-tab buttons for as long as the
+       problem lasts. */
+    @State private var bannerHeight: CGFloat = 0
+    @State private var safeInsets = EdgeInsets()
 
     var body: some View {
         ZStack {
@@ -56,6 +66,9 @@ struct RootView: View {
 
             WebHost(bridge: bridge, inspectable: webInspector) {
                 if let state = monitor.state { bridge.dispatchConnectivity(state) }
+                #if DEBUG
+                DebugLaunchEnvironment.autosendIfNeeded(bridge: bridge)
+                #endif
             }
             .ignoresSafeArea()
 
@@ -63,14 +76,20 @@ struct RootView: View {
             // safeArea insets that the page gets come from.
             GeometryReader { proxy in
                 Color.clear
-                    .onAppear { push(insets: proxy.safeAreaInsets) }
-                    .onChange(of: proxy.safeAreaInsets) { _, new in push(insets: new) }
+                    .onAppear { safeInsets = proxy.safeAreaInsets }
+                    .onChange(of: proxy.safeAreaInsets) { _, new in safeInsets = new }
             }
             .allowsHitTesting(false)
 
             VStack(spacing: 0) {
                 if let state = monitor.state, state.isProblem {
                     ConnectivityBanner(state: state) { showSettings = true }
+                        .background(GeometryReader { proxy in
+                            Color.clear
+                                .onAppear { bannerHeight = proxy.size.height }
+                                .onChange(of: proxy.size.height) { _, h in bannerHeight = h }
+                                .onDisappear { bannerHeight = 0 }
+                        })
                 }
                 Spacer(minLength: 0)
             }
@@ -83,6 +102,9 @@ struct RootView: View {
         }
         .onAppear {
             bridge.onOpenSettings = { showSettings = true }
+            #if DEBUG
+            DebugLaunchEnvironment.startCommandChannel(bridge: bridge)
+            #endif
             // Not only on .active: a permission alert at first launch keeps the
             // scene .inactive indefinitely, and the banner still has to work.
             monitor.start()
@@ -99,6 +121,8 @@ struct RootView: View {
             // than throwing an alert at a first launch that cannot connect.
             if state == .ok { TurnNotifier.shared.requestAuthorizationIfNeeded() }
         }
+        .onChange(of: safeInsets) { _, _ in pushInsets() }
+        .onChange(of: bannerHeight) { _, _ in pushInsets() }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
@@ -137,12 +161,12 @@ struct RootView: View {
         }
     }
 
-    private func push(insets: EdgeInsets) {
+    private func pushInsets() {
         bridge.updateSafeArea(SafeAreaInsets(
-            top: insets.top,
-            bottom: insets.bottom,
-            left: insets.leading,
-            right: insets.trailing
+            top: safeInsets.top + bannerHeight,
+            bottom: safeInsets.bottom,
+            left: safeInsets.leading,
+            right: safeInsets.trailing
         ))
     }
 }
