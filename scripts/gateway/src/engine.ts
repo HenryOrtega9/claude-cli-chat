@@ -1,0 +1,629 @@
+/* TabEngine — one chat tab's whole server-side life.
+
+   Owns: the CLI child (via the shared SubprocessManager/TabSession), the tab's
+   status, its monotonic seq counter and replay ring, pending approvals and
+   their deadline timers, the busy flag, and the projection of the event stream
+   into a StoredTab on disk so `GET /tabs/:id` returns something a freshly
+   installed phone can render.
+
+   Two things it deliberately does NOT do: render, and decide policy. Frames go
+   out through the `emit` callback the registry hands it; eviction and the max-
+   children budget are the registry's business.
+
+   Session identity: the id is generated at tab creation and passed as
+   `--session-id` on the FIRST spawn, so a tab has a stable identity before it
+   has ever run. Every later spawn (after an LRU eviction, a crash, or a
+   model/effort change) passes `--resume <sessionId>` instead. That is why
+   there is no transcript-discovery path here, unlike RemoteControlSession. */
+
+import { randomUUID } from "node:crypto";
+
+import { SubprocessManager, type SpawnOptions, type TabSession } from "../../../src/claude/SubprocessManager";
+import type {
+  AssistantEvent,
+  ContentBlock,
+  ControlRequestEvent,
+  ResultEvent,
+  StreamEvent,
+  ToolUseBlock,
+  UsageSnapshot,
+} from "../../../src/claude/Events";
+import type { Persistence } from "../../../src/storage/Persistence";
+import type { ChatMessage, TabState, ToolCall } from "../../../src/view/state";
+import { MODEL_IDS, type ModelKey, type PermissionMode } from "../../../src/settings-data";
+
+import { makeFrame, type Frame, type FrameType } from "./frames";
+import { ReplayRing } from "./replay";
+
+export type TabStatus = "idle" | "starting" | "ready" | "running" | "exited" | "error";
+
+export const APPROVAL_TIMEOUT_MESSAGE = "Client unreachable; denied by gateway timeout";
+
+/* Phone tabs default to acceptEdits: the user is on a 6-inch screen and every
+   approval round-trip costs a push notification, so file edits ride through
+   while genuinely risky tools (Bash, WebFetch, deletes) still prompt.
+   bypassPermissions is never a legal value here — see setConfig(). */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "acceptEdits";
+
+export type TabPatch = {
+  title?: string;
+  model?: string;
+  effort?: string;
+  permissionMode?: string;
+  pinnedFilePaths?: string[];
+};
+
+export type EngineDeps = {
+  vault: string;
+  claudePath: string;
+  approvalTimeoutMs: number;
+  includePartialMessages: boolean;
+  eventsDir: string;
+  subprocess: SubprocessManager;
+  persistence: Persistence;
+  mcpDenyPatterns: () => string[];
+  emit: (frame: Frame) => void;
+  onActivity: (engine: TabEngine) => void;
+  log: (msg: string) => void;
+};
+
+function makeMessageId(): string {
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/* Accepts either a ModelKey from the picker ("opus-5") or a raw CLI model id
+   ("claude-opus-5[1m]", "haiku", "opusplan"). The phone sends keys; a power
+   user poking the HTTP API directly may send an id. */
+function resolveModel(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  if (model in MODEL_IDS) return MODEL_IDS[model as ModelKey];
+  return model;
+}
+
+export class TabEngine {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly incognito: boolean;
+
+  status: TabStatus = "idle";
+  busy = false;
+  lastActivityAt = Date.now();
+
+  private seq = 0;
+  private session: TabSession | null = null;
+  /* True once the CLI has actually created the session on disk, which is what
+     makes `--resume` legal. Set on the first `system/init`. */
+  private sessionEstablished = false;
+  private ring: ReplayRing;
+  private pending = new Map<string, { req: ControlRequestEvent; timer: ReturnType<typeof setTimeout> }>();
+  private state: TabState;
+  private toolToMessage = new Map<string, string>();
+  private currentAssistant: ChatMessage | null = null;
+  private currentTurn: { turnId: string; startedAt: number } | null = null;
+  private stderrTail = "";
+  private disposed = false;
+
+  constructor(
+    private deps: EngineDeps,
+    init: {
+      id: string;
+      sessionId?: string;
+      title?: string;
+      model?: string;
+      effort?: string;
+      permissionMode?: string;
+      incognito?: boolean;
+      restored?: TabState;
+    },
+  ) {
+    this.id = init.id;
+    this.sessionId = init.sessionId ?? init.restored?.sessionId ?? randomUUID();
+    this.incognito = init.incognito ?? false;
+    this.ring = new ReplayRing(`${deps.eventsDir}/${this.id}.ndjson`);
+    const now = Date.now();
+    this.state = init.restored ?? {
+      id: this.id,
+      sessionId: this.sessionId,
+      title: init.title ?? "New chat",
+      createdAt: now,
+      updatedAt: now,
+      messages: [],
+      pendingApprovals: new Map(),
+      busy: false,
+      model: init.model,
+      effort: init.effort,
+      permissionMode: init.permissionMode ?? DEFAULT_PERMISSION_MODE,
+    };
+    /* A restored tab already ran once, so its session exists on disk and the
+       next spawn must resume rather than re-declare the id. */
+    if (init.restored) this.sessionEstablished = true;
+    this.state.sessionId = this.sessionId;
+    if (init.title) this.state.title = init.title;
+    if (init.model) this.state.model = init.model;
+    if (init.effort) this.state.effort = init.effort;
+    if (init.permissionMode) this.state.permissionMode = init.permissionMode;
+  }
+
+  /* ---------- public surface ---------- */
+
+  get title(): string { return this.state.title; }
+  get model(): string | undefined { return this.state.model; }
+  get effort(): string | undefined { return this.state.effort; }
+  get permissionMode(): string { return this.state.permissionMode ?? DEFAULT_PERMISSION_MODE; }
+  get lastSeq(): number { return this.seq; }
+  get pid(): number | undefined { return this.session?.pid; }
+  get hasLiveChild(): boolean { return this.session !== null && !this.session.isTerminal(); }
+  get hasPendingApprovals(): boolean { return this.pending.size > 0; }
+  get evictable(): boolean { return !this.busy && this.pending.size === 0 && this.hasLiveChild; }
+
+  snapshot() {
+    return {
+      id: this.id,
+      status: this.status,
+      busy: this.busy,
+      sessionId: this.sessionId,
+      model: this.state.model ?? null,
+      effort: this.state.effort ?? null,
+      permissionMode: this.permissionMode,
+      pid: this.pid ?? null,
+      lastSeq: this.seq,
+    };
+  }
+
+  storedTab() {
+    return {
+      id: this.state.id,
+      sessionId: this.state.sessionId,
+      title: this.state.title,
+      createdAt: this.state.createdAt,
+      updatedAt: this.state.updatedAt,
+      messages: this.state.messages,
+      messageCount: this.state.messages.length,
+      model: this.state.model,
+      effort: this.state.effort,
+      permissionMode: this.state.permissionMode,
+      pinnedFilePaths: this.state.pinnedFilePaths,
+      busy: this.busy,
+      status: this.status,
+      lastSeq: this.seq,
+    };
+  }
+
+  indexEntry() {
+    return { id: this.id, title: this.state.title, sessionId: this.sessionId };
+  }
+
+  /* Engine-affecting patches (model/effort/permissionMode) do NOT restart a
+     live child — the contract says they take effect on the next turn's
+     respawn, so a patch mid-turn can never orphan a running child. */
+  patch(p: TabPatch): void {
+    if (typeof p.title === "string" && p.title.trim()) this.state.title = p.title.trim();
+    if (typeof p.model === "string") this.state.model = p.model;
+    if (typeof p.effort === "string") this.state.effort = p.effort;
+    if (typeof p.permissionMode === "string" && p.permissionMode !== "bypassPermissions") {
+      this.state.permissionMode = p.permissionMode;
+    }
+    if (Array.isArray(p.pinnedFilePaths)) this.state.pinnedFilePaths = p.pinnedFilePaths;
+    this.state.updatedAt = Date.now();
+    this.save();
+    this.emit("tab_status", this.statusPayload());
+  }
+
+  firstUserMessage(): string | null {
+    const msg = this.state.messages.find(m => m.role === "user");
+    return msg ? msg.content : null;
+  }
+
+  firstAssistantMessage(): string | null {
+    const msg = this.state.messages.find(m => m.role === "assistant");
+    return msg ? msg.content : null;
+  }
+
+  setTitle(title: string): void {
+    this.state.title = title;
+    this.state.updatedAt = Date.now();
+    this.save();
+  }
+
+  async replaySince(since: number, limit?: number) {
+    return this.ring.since(since, limit);
+  }
+
+  /* ---------- turns ---------- */
+
+  submit(blocks: ContentBlock[], clientTurnId?: string): { turnId: string; seq: number } {
+    if (this.busy) throw new BusyError();
+    const turnId = clientTurnId || `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    this.busy = true;
+    this.state.busy = true;
+    this.currentTurn = { turnId, startedAt: Date.now() };
+    this.touch();
+
+    /* Project the user turn immediately rather than waiting for the CLI's
+       echo: if the child dies before it reads stdin, the phone must still see
+       what it sent when it re-fetches the tab. */
+    const text = blocks.filter((b): b is { type: "text"; text: string } => b.type === "text").map(b => b.text).join("\n");
+    const attachmentCount = blocks.length - blocks.filter(b => b.type === "text").length;
+    const userMsg: ChatMessage = {
+      id: makeMessageId(),
+      role: "user",
+      content: text,
+      timestamp: Date.now(),
+      ...(attachmentCount > 0
+        ? { attachments: blocks.filter(b => b.type !== "text").map(b => ({
+            kind: (b.type === "image" ? "image" : "pdf") as ChatMessage["attachments"] extends undefined ? never : "image" | "pdf",
+            mediaType: b.type === "image" || b.type === "document" ? b.source.media_type : "application/octet-stream",
+          })) }
+        : {}),
+    };
+    this.state.messages.push(userMsg);
+    this.currentAssistant = null;
+    this.state.updatedAt = Date.now();
+    this.save();
+
+    const session = this.ensureSession();
+    const seq = this.emit("tab_status", this.statusPayload("running"));
+    try {
+      session.sendUserContent(blocks);
+    } catch (err) {
+      this.busy = false;
+      this.state.busy = false;
+      this.currentTurn = null;
+      throw err;
+    }
+    return { turnId, seq };
+  }
+
+  /* Mirrors TabController.cancelStream: deny every outstanding approval so the
+     CLI isn't left waiting on a response that will never come, then kill the
+     child. The next turn respawns with --resume, so the conversation survives
+     a cancel. */
+  async abort(): Promise<void> {
+    for (const requestId of Array.from(this.pending.keys())) {
+      this.resolveApproval(requestId, false, "User cancelled", undefined, "cancel");
+    }
+    const hadTurn = this.currentTurn;
+    await this.teardownSession();
+    this.busy = false;
+    this.state.busy = false;
+    this.markRunningToolsErrored();
+    if (hadTurn) {
+      this.emit("turn_done", {
+        turnId: hadTurn.turnId,
+        subtype: "aborted",
+        durationMs: Date.now() - hadTurn.startedAt,
+      });
+    }
+    this.currentTurn = null;
+    this.status = "idle";
+    this.emit("tab_status", this.statusPayload());
+    this.save();
+  }
+
+  approve(requestId: string, allowed: boolean, reason?: string, updatedInput?: Record<string, unknown>): boolean {
+    if (!this.pending.has(requestId)) return false;
+    this.resolveApproval(requestId, allowed, reason, updatedInput, "client");
+    return true;
+  }
+
+  pendingApprovalFrames(): Array<Record<string, unknown>> {
+    return Array.from(this.pending.values()).map(p => ({ ...p.req.request, request_id: p.req.request_id }));
+  }
+
+  /* Drop the child but keep the tab: LRU eviction, and the shutdown path.
+     sessionId survives, so the next turn resumes the same conversation. */
+  async evict(reason: "lru" | "shutdown" | "delete"): Promise<void> {
+    for (const requestId of Array.from(this.pending.keys())) {
+      this.resolveApproval(requestId, false, APPROVAL_TIMEOUT_MESSAGE, undefined, "restart");
+    }
+    await this.teardownSession();
+    if (reason !== "delete") {
+      this.status = "idle";
+      this.emit("tab_status", this.statusPayload());
+    }
+    this.deps.log(`tab ${this.id}: child released (${reason})`);
+  }
+
+  async destroy(): Promise<void> {
+    this.disposed = true;
+    await this.evict("delete");
+    await this.ring.destroy();
+  }
+
+  async flush(): Promise<void> {
+    await this.ring.flush();
+  }
+
+  /* ---------- internals ---------- */
+
+  private touch(): void {
+    this.lastActivityAt = Date.now();
+    this.deps.onActivity(this);
+  }
+
+  private emit(t: FrameType, payload: Record<string, unknown>): number {
+    this.seq += 1;
+    const frame = makeFrame(t, this.id, this.seq, payload);
+    this.ring.push(frame);
+    this.deps.emit(frame);
+    return this.seq;
+  }
+
+  private statusPayload(override?: TabStatus): Record<string, unknown> {
+    if (override) this.status = override;
+    return {
+      status: this.status,
+      sessionId: this.sessionId,
+      pid: this.pid ?? null,
+      model: this.state.model ?? null,
+      effort: this.state.effort ?? null,
+      permissionMode: this.permissionMode,
+      ...(this.stderrTail ? { stderrTail: this.stderrTail.slice(-2000) } : {}),
+    };
+  }
+
+  private save(): void {
+    if (this.incognito) return;
+    this.deps.persistence.scheduleSaveTab(this.state);
+  }
+
+  private spawnOptions(): SpawnOptions {
+    const extraArgs = ["--replay-user-messages"];
+    /* First spawn declares the id; every later one resumes it. Passing both
+       makes the CLI reject the invocation. */
+    if (!this.sessionEstablished) extraArgs.push("--session-id", this.sessionId);
+    return {
+      cwd: this.deps.vault,
+      sessionId: this.sessionEstablished ? this.sessionId : undefined,
+      model: resolveModel(this.state.model),
+      effort: this.state.effort,
+      claudePath: this.deps.claudePath,
+      permissionMode: this.permissionMode as SpawnOptions["permissionMode"],
+      includePartialMessages: this.deps.includePartialMessages,
+      noSessionPersistence: this.incognito,
+      mcpDenyPatterns: this.deps.mcpDenyPatterns(),
+      extraArgs,
+    };
+  }
+
+  private ensureSession(): TabSession {
+    if (this.session && !this.session.isTerminal()) return this.session;
+    this.status = "starting";
+    this.stderrTail = "";
+    const session = this.deps.subprocess.spawn(this.id, this.spawnOptions());
+    this.session = session;
+    session.onEvent(e => this.handleEvent(e));
+    session.onStderr(chunk => { this.stderrTail = (this.stderrTail + chunk).slice(-4000); });
+    session.onError(err => this.handleFatal(`spawn failed: ${err.message}`));
+    session.onExit((code, signal) => this.handleExit(code, signal));
+    return session;
+  }
+
+  private async teardownSession(): Promise<void> {
+    const session = this.session;
+    this.session = null;
+    if (!session) return;
+    try { await session.dispose(); } catch { /* already gone */ }
+  }
+
+  private handleEvent(event: StreamEvent): void {
+    /* Every event goes out raw, exactly as StreamJsonParser yielded it. The
+       phone's renderer is the same code the desktop UI runs, so it wants the
+       unmodified wire shape — the typed frames below are additive. */
+    this.emit("event", event as unknown as Record<string, unknown>);
+
+    try {
+      switch (event.type) {
+        case "system":
+          if ((event as { subtype?: string }).subtype === "init") {
+            this.sessionEstablished = true;
+            this.status = this.busy ? "running" : "ready";
+            this.emit("tab_status", this.statusPayload());
+          }
+          return;
+        case "control_request":
+          this.handleControlRequest(event as ControlRequestEvent);
+          return;
+        case "assistant":
+          this.projectAssistant(event as AssistantEvent);
+          return;
+        case "user":
+          this.projectToolResults(event as { message?: { content?: unknown } });
+          return;
+        case "result":
+          this.handleResult(event as ResultEvent);
+          return;
+        default:
+          return;
+      }
+    } catch (err) {
+      /* Wire data is unvalidated JSON. A shape we've never seen must not take
+         the daemon down or wedge the tab's busy flag. */
+      this.deps.log(`tab ${this.id}: event projection failed (${event.type}): ${String(err)}`);
+    }
+  }
+
+  private handleControlRequest(req: ControlRequestEvent): void {
+    if (this.pending.has(req.request_id)) return;
+    const timer = setTimeout(() => {
+      this.deps.log(`tab ${this.id}: approval ${req.request_id} timed out after ${this.deps.approvalTimeoutMs}ms`);
+      this.resolveApproval(req.request_id, false, APPROVAL_TIMEOUT_MESSAGE, undefined, "timeout");
+    }, this.deps.approvalTimeoutMs);
+    /* unref so a tab sitting on an approval doesn't hold the event loop open
+       past a shutdown request. */
+    timer.unref?.();
+    this.pending.set(req.request_id, { req, timer });
+    this.touch();
+    this.emit("approval_request", { ...req.request, request_id: req.request_id });
+  }
+
+  private resolveApproval(
+    requestId: string,
+    allowed: boolean,
+    reason: string | undefined,
+    updatedInput: Record<string, unknown> | undefined,
+    by: "client" | "timeout" | "restart" | "cancel",
+  ): void {
+    const entry = this.pending.get(requestId);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    this.pending.delete(requestId);
+    const session = this.session;
+    if (session && !session.isTerminal()) {
+      /* Wire gotcha #4: the control_response schema is exactly
+         {behavior:"allow", updatedInput} or {behavior:"deny", message}.
+         TabSession.approve/deny build both; never hand-roll them here. */
+      if (allowed) session.approve(requestId, updatedInput ?? entry.req.request.input ?? {});
+      else session.deny(requestId, reason ?? "Denied");
+    }
+    this.touch();
+    this.emit("approval_resolved", { request_id: requestId, allowed, by });
+  }
+
+  private projectAssistant(event: AssistantEvent): void {
+    const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
+    for (const block of blocks) {
+      if (block.type === "text") {
+        const msg = this.ensureAssistantMessage();
+        msg.content += block.text;
+      } else if (block.type === "thinking") {
+        const msg = this.ensureAssistantMessage();
+        msg.thinking = (msg.thinking ?? "") + block.thinking;
+      } else if (block.type === "tool_use") {
+        /* Wire gotcha #2: tool_use blocks live INSIDE the assistant message's
+           content array, never as top-level events. Filtering to text here
+           would drop every tool row silently. */
+        const tu = block as ToolUseBlock;
+        const msg = this.ensureAssistantMessage();
+        if (!msg.toolCalls) msg.toolCalls = [];
+        if (!msg.toolCalls.some(t => t.id === tu.id)) {
+          const call: ToolCall = { id: tu.id, name: tu.name, input: tu.input ?? {}, status: "running" };
+          msg.toolCalls.push(call);
+          this.toolToMessage.set(tu.id, msg.id);
+        }
+      }
+    }
+    this.state.updatedAt = Date.now();
+    this.save();
+  }
+
+  /* Wire gotcha #3: tool_result blocks arrive inside synthetic `user` events.
+     Missing this leaves every tool row stuck on RUNNING forever. Plain user
+     echoes (which `--replay-user-messages` also produces) are ignored — the
+     turn was already projected at submit time. */
+  private projectToolResults(event: { message?: { content?: unknown } }): void {
+    const content = event.message?.content;
+    if (!Array.isArray(content)) return;
+    let touched = false;
+    for (const raw of content) {
+      const block = raw as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
+      if (block.type !== "tool_result" || !block.tool_use_id) continue;
+      const msgId = this.toolToMessage.get(block.tool_use_id);
+      const msg = msgId ? this.state.messages.find(m => m.id === msgId) : undefined;
+      const call = msg?.toolCalls?.find(t => t.id === block.tool_use_id);
+      if (!call) continue;
+      call.status = block.is_error ? "errored" : "completed";
+      call.isError = block.is_error === true;
+      call.result = typeof block.content === "string"
+        ? block.content
+        : JSON.stringify(block.content ?? "");
+      touched = true;
+    }
+    if (touched) {
+      this.state.updatedAt = Date.now();
+      this.save();
+    }
+  }
+
+  private handleResult(event: ResultEvent): void {
+    const turn = this.currentTurn;
+    this.busy = false;
+    this.state.busy = false;
+    this.status = "ready";
+    if (this.currentAssistant) {
+      this.currentAssistant.streaming = false;
+      if (turn) this.currentAssistant.durationMs = Date.now() - turn.startedAt;
+    }
+    this.currentAssistant = null;
+    this.currentTurn = null;
+    this.state.updatedAt = Date.now();
+    this.save();
+    this.touch();
+    const usage: UsageSnapshot | undefined = event.usage;
+    this.emit("turn_done", {
+      turnId: turn?.turnId ?? null,
+      subtype: event.subtype ?? (event.is_error ? "error" : "success"),
+      durationMs: event.duration_ms ?? (turn ? Date.now() - turn.startedAt : 0),
+      ...(usage ? { usage } : {}),
+      ...(typeof event.total_cost_usd === "number" ? { costUsd: event.total_cost_usd } : {}),
+    });
+    this.emit("tab_status", this.statusPayload());
+  }
+
+  private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.disposed) return;
+    this.session = null;
+    for (const requestId of Array.from(this.pending.keys())) {
+      this.resolveApproval(requestId, false, "Subprocess exited", undefined, "restart");
+    }
+    this.markRunningToolsErrored();
+    const turn = this.currentTurn;
+    if (this.busy && turn) {
+      /* The child died mid-turn. Release busy and tell the client the turn is
+         over, otherwise the composer stays locked until the app restarts. */
+      this.busy = false;
+      this.state.busy = false;
+      this.currentTurn = null;
+      this.emit("turn_done", {
+        turnId: turn.turnId,
+        subtype: "error_during_execution",
+        durationMs: Date.now() - turn.startedAt,
+      });
+    }
+    this.status = code === 0 || signal === "SIGTERM" ? "idle" : "exited";
+    this.emit("tab_status", { ...this.statusPayload(), exitCode: code });
+    this.save();
+  }
+
+  private handleFatal(message: string): void {
+    this.status = "error";
+    this.busy = false;
+    this.state.busy = false;
+    this.currentTurn = null;
+    this.deps.log(`tab ${this.id}: ${message}`);
+    this.emit("tab_status", { ...this.statusPayload(), error: message });
+  }
+
+  private markRunningToolsErrored(): void {
+    for (const m of this.state.messages) {
+      if (!m.toolCalls) continue;
+      for (const t of m.toolCalls) {
+        if (t.status === "running" || t.status === "pending") {
+          t.status = "errored";
+          t.isError = true;
+        }
+      }
+    }
+  }
+
+  private ensureAssistantMessage(): ChatMessage {
+    if (this.currentAssistant) return this.currentAssistant;
+    const msg: ChatMessage = {
+      id: makeMessageId(),
+      role: "assistant",
+      content: "",
+      timestamp: Date.now(),
+      streaming: true,
+    };
+    this.state.messages.push(msg);
+    this.currentAssistant = msg;
+    return msg;
+  }
+}
+
+export class BusyError extends Error {
+  constructor() {
+    super("busy");
+    this.name = "BusyError";
+  }
+}

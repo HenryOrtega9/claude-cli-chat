@@ -1,0 +1,3 @@
+# Build output. Rebuild with `node scripts/gateway/build.mjs`; the launchd
+# plist runs dist/gateway.js, so a fresh clone must build before bootstrapping.
+dist/

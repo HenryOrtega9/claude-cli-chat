@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the Vault Gateway daemon (iOS app backend).
+
+  Runs the bundled daemon at scripts/gateway/dist/gateway.js, which serves the
+  HTTP + WebSocket API the iPhone app talks to. Contract:
+  docs/ios-gateway/CONTRACTS.md.
+
+  Prerequisites:
+    - Build once:  node ~/Developer/claude-cli-chat/scripts/gateway/build.mjs
+    - Tailscale installed and running (the daemon binds the tailnet IPv4 and
+      refuses to bind 0.0.0.0)
+    - Bearer token: generated automatically at ~/.config/vault-gateway/token
+      (mode 600) on first run. The token is printed to /tmp/vault-gateway.log
+      exactly once, on generation. To rotate: delete the file and restart.
+    - Consider `sudo pmset -c sleep 0` so the Mac stays reachable on AC power.
+
+  Install:
+    cp ~/Developer/claude-cli-chat/scripts/gateway/dev.claude-cli-chat.vault-gateway.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/dev.claude-cli-chat.vault-gateway.plist
+
+  Reload after a rebuild:
+    launchctl kickstart -k gui/$(id -u)/dev.claude-cli-chat.vault-gateway
+
+  Stop / unload:
+    launchctl bootout gui/$(id -u)/dev.claude-cli-chat.vault-gateway
+
+  Logs:
+    tail -f /tmp/vault-gateway.log /tmp/vault-gateway.err
+
+  NODE PATH: this machine's node lives at /usr/local/bin/node (v24). There is
+  no /opt/homebrew/bin/node here — check `which node` before changing it, and
+  keep it absolute: launchd agents do not inherit a login shell PATH.
+
+  Optional overrides (add to EnvironmentVariables):
+    VAULT_GATEWAY_PORT              default 8788
+    VAULT_GATEWAY_BIND              default: auto-resolve Tailscale IPv4;
+                                    set 127.0.0.1 when fronting with
+                                    `tailscale serve`
+    VAULT_GATEWAY_TOKEN_FILE        default ~/.config/vault-gateway/token
+    VAULT_GATEWAY_MAX_CHILDREN      default 4
+    VAULT_GATEWAY_APPROVAL_TIMEOUT_S default 600
+    VAULT_GATEWAY_CLAUDE            default: autodetected claude binary
+    VAULT_GATEWAY_PARTIAL           "0" disables --include-partial-messages
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.claude-cli-chat.vault-gateway</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/henryortega/Developer/claude-cli-chat/scripts/gateway/dist/gateway.js</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VAULT_GATEWAY_VAULT</key>
+        <string>/Users/henryortega/Library/Mobile Documents/iCloud~md~obsidian/Documents/Henry Ortega's Second Brain</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/vault-gateway.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/vault-gateway.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

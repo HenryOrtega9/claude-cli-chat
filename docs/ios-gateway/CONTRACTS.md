@@ -21,34 +21,36 @@ Git: all work on `main`, commit per agent with a clear scope prefix (`shared-ui:
 - Env: `VAULT_GATEWAY_VAULT` (cwd, required), `VAULT_GATEWAY_PORT` (8788), `VAULT_GATEWAY_BIND`, `VAULT_GATEWAY_TOKEN_FILE` (default `~/.config/vault-gateway/token`, mode 600, auto-generated 48 hex on first run).
 - Auth: `Authorization: Bearer <token>` on every HTTP request, constant-time compare. WebSocket: `POST /ws-ticket` (Bearer) → `{ticket, expiresIn:60}`; connect to `/ws/<ticket>` (ticket in the PATH, not the query string). Single use.
 - Tab store: `<vault>/.claude-cli-chat/ios/` via `new Persistence(null, ".claude-cli-chat/ios")`. Event replay ring spilled to `<vault>/.claude-cli-chat/ios/events/<tabId>.ndjson`.
-- Spawn flags: everything `SubprocessManager` already passes, plus `--session-id <uuid>` (generated server-side at tab creation; no transcript discovery) and `--replay-user-messages`. Default `permissionMode: "acceptEdits"` for phone tabs; never `bypassPermissions`.
+- Spawn flags: everything `SubprocessManager` already passes, plus `--session-id <uuid>` (generated server-side at tab creation; no transcript discovery) and `--replay-user-messages`. Default `permissionMode: "acceptEdits"` for phone tabs; never `bypassPermissions`. `--session-id` and `--resume` are mutually exclusive at the CLI, so the FIRST spawn of a tab passes `--session-id` and every later one passes `--resume`. Both extra flags reach `TabSession` through `SpawnOptions.extraArgs`, a field this work added to `src/claude/SubprocessManager.ts` — optional, appended just before `--resume`, and absent for every existing caller, so plugin and desktop spawns are byte-for-byte unchanged.
 - Concurrency: max 4 live children (`VAULT_GATEWAY_MAX_CHILDREN`), LRU-evict idle tabs (dispose, keep sessionId, respawn with `--resume` on next turn). Never evict a busy tab or one with a pending approval.
 - Approval deadline: `VAULT_GATEWAY_APPROVAL_TIMEOUT_S` (default 600). On expiry: deny with message "Client unreachable; denied by gateway timeout", emit `approval_resolved{by:"timeout"}`.
 - State mirror: write `/tmp/claude_state.ios` in the same `"<epoch> <state>\n"` format as `StateEmitter`. Do NOT write `/tmp/claude_state` or `~/.claude/settings.json`.
-- launchd: `scripts/gateway/dev.claude-cli-chat.vault-gateway.plist`, label `dev.claude-cli-chat.vault-gateway`, absolute node path, logs `/tmp/vault-gateway.log` / `.err`.
+- launchd: `scripts/gateway/dev.claude-cli-chat.vault-gateway.plist`, label `dev.claude-cli-chat.vault-gateway`, absolute node path (`/usr/local/bin/node` on this machine — there is no `/opt/homebrew/bin/node`), logs `/tmp/vault-gateway.log` / `.err`.
+- Verified through `tailscale serve --bg --http=8790 http://127.0.0.1:8788`: the WebSocket upgrade passes through intact, so the SSE fallback is not needed. Serve routes on the `Host` header — the MagicDNS name works, the raw `100.x` IP 404s.
+- WebSocket client caveat: Node 24.14's built-in `WebSocket` (undici) fails EVERY plaintext `ws://` handshake on this machine, including against a byte-for-byte copy of a public server's response it accepts over `wss://`. `curl -i` confirms the daemon's 101 and `Sec-WebSocket-Accept` are correct. The smoke test therefore ships its own client (`scripts/gateway/test/ws-client.mjs`). WKWebView is a normal browser stack and is unaffected, but do not use node's global `WebSocket` to test this daemon.
 
 ### HTTP (all JSON, all Bearer)
 
 | Method | Path | Body → Response |
 |---|---|---|
-| GET | `/health` | `{state:"ready", version, cwd, uptime_s, liveChildren, maxChildren, tabs:[{id,status,busy,sessionId,model,effort,permissionMode,pid,lastSeq}]}` (no auth required for `/health`? NO: auth required; return 401 otherwise) |
-| GET | `/catalog` | `{skills, commands, subagents, models:[{key,id,label,efforts}], permissionModes, mcpServers:[{name,enabled}], userName}` |
+| GET | `/health` | `{state:"starting"\|"ready", version, cwd, uptime_s, liveChildren, maxChildren, tabs:[{id,status,busy,sessionId,model,effort,permissionMode,pid,lastSeq}]}` (no auth required for `/health`? NO: auth required; return 401 otherwise). `starting` until the token is loaded and the vault store has been read; on a cold iCloud vault under launchd that has been measured at ~33 s, so the client must treat `starting` as "wait", not "down". |
+| GET | `/catalog` | `{skills, commands, subagents, models:[{key,id,label,efforts,group}], efforts:[...], permissionModes:[{key,label}], mcpServers:[{name,enabled,status}], userName, hash}` — `hash` is the `catalogHash` the `hello` frame carries. `permissionModes` omits `bypassPermissions` entirely (a phone tab may never run in it). 5-minute server cache; `?refresh=1` forces a rescan. |
 | GET | `/tabs` | `TabIndex` (`src/storage/Persistence.ts` shape: `{activeTabId, tabs:[{id,title,sessionId}]}`) |
 | POST | `/tabs` | `{title?, model?, effort?, permissionMode?, incognito?}` → `{id, sessionId}` (no spawn) |
-| GET | `/tabs/:id` | `StoredTab` |
+| GET | `/tabs/:id` | `StoredTab`, plus the live `{busy, status, lastSeq}` so a cold client can render and resume from one call |
 | PATCH | `/tabs/:id` | `{title?, model?, effort?, permissionMode?, pinnedFilePaths?, active?:true}` → `{ok}`; engine-affecting changes take effect via respawn `--resume` on next turn |
 | DELETE | `/tabs/:id` | → `{ok}` |
-| POST | `/tabs/:id/turn` | `{blocks: ContentBlock[], clientTurnId}` → 202 `{turnId, seq}`; 409 `{error:"busy"}` |
+| POST | `/tabs/:id/turn` | `{blocks: ContentBlock[], clientTurnId}` → 202 `{turnId, seq}`; 409 `{error:"busy"}`; 503 `{error:"no_capacity"}` when the child budget is full and every live tab is busy or holding an approval (nothing is evictable). `blocks` also accepts a bare string, or an array of strings, as shorthand for one text block. |
 | POST | `/tabs/:id/abort` | → `{ok}` |
 | POST | `/tabs/:id/approve` | `{request_id, allowed, reason?, updatedInput?}` → `{ok}` |
 | POST | `/tabs/:id/title` | → `{title}` |
 | GET | `/tabs/:id/events?since=N&limit=M` | `{events:[Frame], lastSeq, evicted:boolean}` |
-| GET | `/wait?tab=ID&since=SEQ&timeout=S` | long-poll; returns first `turn_done` or `approval_request` frame with `seq>=since`; 202 `{partial:true, error:"wait_timeout"}` |
-| GET / POST | `/permissions`, `/permissions/allow` | `{allow:[...], recommended:[...]}` / `{patterns:[...]}` |
-| GET | `/files?q=&limit=` | `{files:[{path, name, mtime}]}` (markdown + common attachments under the vault, excluding dot-dirs) |
-| GET | `/file?path=` | `{path, text}` (text files only, 512 KB cap) |
+| GET | `/wait?tab=ID&since=SEQ&timeout=S` | long-poll; 200 `{frame, lastSeq}` with the first `turn_done` or `approval_request` frame at `seq>=since`; 202 `{partial:true, error:"wait_timeout", lastSeq}`. `timeout` is clamped to 300 s |
+| GET / POST | `/permissions`, `/permissions/allow` | `{allow:[...], recommended:[...]}` / `{patterns:[...]}` → `{ok, added}` |
+| GET | `/files?q=&limit=` | `{files:[{path, name, mtime}]}` (markdown + common attachments under the vault, excluding dot-dirs). Empty `q` returns most-recently-modified. 30 s index cache |
+| GET | `/file?path=` | `{path, text}` (text files only, 512 KB cap). 400 `path_outside_vault`, 403 `dot_path_excluded` (same dot-dir rule as `/files`), 413 `file_too_large`, 415 `not_a_text_file` |
 | GET | `/usage` | port of bridge.py `UsageFetcher` payload (same JSON), 60 s cache |
-| POST | `/mcp/disable` | `{servers:[...]}` → `{ok}` |
+| POST | `/mcp/disable` | `{servers:[...]}` → `{ok, disabled:[...]}`. The list is absolute: names absent from it are re-enabled. Invalidates the `/catalog` cache |
 | POST | `/ws-ticket` | → `{ticket, expiresIn}` |
 
 Errors: `{error:"<snake_case>", message?}` with proper status (400/401/404/409/500).
@@ -68,6 +70,7 @@ Server → client frame: `{"v":1,"seq":<int per tab, monotonic from 1>,"tab":"<i
 | `catalog` | full `/catalog` payload |
 | `resync` | `{reason:"buffer_evicted"}` (client must GET `/tabs/:id` then subscribe with `since: lastSeq`) |
 | `pong` | `{}` |
+| `error` | `{error, message?}` — a client→server message the server could not act on (`bad_json`, `unknown_message`, `no_such_tab`, `empty_turn`, `busy`, `no_capacity`). Carries `seq: 0`; `tab` is set when the message named one |
 
 Client → server: `{"t":..., ...}`
 
