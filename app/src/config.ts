@@ -24,10 +24,9 @@ import {
   EFFORT_ORDER,
   MODEL_IDS,
   PERMISSION_MODE_ORDER,
-  autodetectClaudePath,
-  autodetectUserName,
   type ClaudeChatSettings,
 } from "../../src/settings-data";
+import { autodetectClaudePath, autodetectUserName } from "../../src/settings-autodetect";
 
 export type AppConfig = {
   /* Absolute directory every storage path resolves against. Shared code

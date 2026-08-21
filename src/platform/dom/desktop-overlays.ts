@@ -20,7 +20,7 @@ import type {
   ModalHost,
   SuggestModalDelegate,
   SuggestModalHost,
-} from "../../src/platform/types";
+} from "../types";
 import { renderIcon } from "./desktop-icons";
 
 const DEFAULT_TOAST_MS = 4000;

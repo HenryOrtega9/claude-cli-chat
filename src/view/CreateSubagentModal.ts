@@ -1,7 +1,4 @@
 import { platform, PlatformModal, type AppHandle } from "../platform";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import type { PluginHost } from "../platform/host";
 
 /* Captures the fields needed to write a subagent definition (.md with YAML
@@ -133,19 +130,6 @@ export class CreateSubagentModal extends PlatformModal {
     this.saveBtn.disabled = !(validName && desc.length > 0 && body.length > 0);
   }
 
-  private resolveLocation(): { dir: string; label: string } | null {
-    const choice = this.locationSelect.value as SaveLocation;
-    if (choice === "user") {
-      return { dir: join(homedir(), ".claude", "agents"), label: "user" };
-    }
-    const vault = this.plugin.getVaultPath();
-    if (!vault) {
-      platform.notify("Couldn't resolve the vault path for project-scoped save. Pick User instead.");
-      return null;
-    }
-    return { dir: join(vault, ".claude", "agents"), label: "project" };
-  }
-
   private handleSave(): void {
     const name = this.nameInput.value.trim();
     const desc = this.descInput.value.trim();
@@ -154,32 +138,35 @@ export class CreateSubagentModal extends PlatformModal {
       platform.notify("Name must start with a letter or number; use letters, digits, _ or -.");
       return;
     }
-    const location = this.resolveLocation();
-    if (!location) return;
-    const filePath = join(location.dir, `${name}.md`);
+    const scope = this.locationSelect.value as SaveLocation;
+    /* YAML frontmatter quote-escape: descriptions often contain colons
+       (e.g. "Use when: …") which would break a bare YAML scalar. Wrap in
+       double quotes and escape embedded double quotes + backslashes. */
+    const safeDesc = `"${desc.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    const fileContents =
+      `---\n` +
+      `description: ${safeDesc}\n` +
+      `---\n` +
+      `${body}\n`;
 
-    /* Refuse to clobber. If the user really wants to overwrite they can
-       delete or rename the existing file first. */
-    if (existsSync(filePath)) {
-      platform.notify(`A ${location.label} subagent named "${name}" already exists. Pick a different name.`);
+    /* The write itself is the host's job — this modal renders in the browser
+       client too, where there is no local agents dir. */
+    const write = this.plugin.createSubagentFile;
+    if (!write) {
+      platform.notify("Creating subagents isn't available in this app.");
       return;
     }
-
-    try {
-      mkdirSync(location.dir, { recursive: true });
-      /* YAML frontmatter quote-escape: descriptions often contain colons
-         (e.g. "Use when: …") which would break a bare YAML scalar. Wrap in
-         double quotes and escape embedded double quotes + backslashes. */
-      const safeDesc = `"${desc.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-      const fileContents =
-        `---\n` +
-        `description: ${safeDesc}\n` +
-        `---\n` +
-        `${body}\n`;
-      writeFileSync(filePath, fileContents, "utf8");
-    } catch (err) {
-      console.error("[claude-cli-chat] failed to write subagent file", err);
-      platform.notify(`Couldn't create subagent: ${err instanceof Error ? err.message : String(err)}`);
+    const result = write.call(this.plugin, { scope, name, contents: fileContents });
+    if (!result.ok) {
+      if (result.kind === "no_vault") {
+        platform.notify("Couldn't resolve the vault path for project-scoped save. Pick User instead.");
+      } else if (result.kind === "exists") {
+        /* Refuse to clobber. If the user really wants to overwrite they can
+           delete or rename the existing file first. */
+        platform.notify(`A ${scope} subagent named "${name}" already exists. Pick a different name.`);
+      } else {
+        platform.notify(`Couldn't create subagent: ${result.message}`);
+      }
       return;
     }
 
@@ -189,7 +176,7 @@ export class CreateSubagentModal extends PlatformModal {
        Refresh button in the manager modal uses. */
     this.plugin.refreshSubagentCatalog();
     this.onCreated();
-    platform.notify(`Created ${location.label} subagent "${name}".`);
+    platform.notify(`Created ${scope} subagent "${name}".`);
     this.close();
   }
 }

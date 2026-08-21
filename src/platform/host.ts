@@ -23,11 +23,15 @@
 
 import type { ClaudeChatSettings } from "../settings-data";
 import type { SpeechController } from "../voice/SpeechController";
-import type { SubprocessManager } from "../claude/SubprocessManager";
+import type { SubprocessManagerLike, RemoteControlSessionLike } from "./engine";
 import type { PermissionsConfigStore } from "../permissions/PermissionsConfig";
 import type { DiscoveryResult } from "../claude/SkillDiscovery";
 import type { SubagentCatalog } from "../claude/SubagentDiscovery";
 import type { ParsedMcpServer } from "../mcp/McpServerList";
+import type { StreamEvent } from "../claude/Events";
+import type { DisplayState } from "../claude/StateEmitter";
+import type { SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
+import type { TitleGenOptions } from "../claude/TitleGenerator";
 
 /* Mirror of SelectionTracker's ActiveSelection. Canonical shared shape —
    after migration, SelectionTracker and InputBox both reference this type
@@ -57,10 +61,65 @@ export interface SelectionTrackerHandle {
   destroy(): void;
 }
 
+/* ---------------------------------------------------------------------------
+   Node-backed capabilities.
+
+   Everything below is OPTIONAL. Shared code calls each through `?.` and has a
+   defined no-op / neutral fallback, because the browser build (iOS client)
+   has no node: the on-disk session transcript, the auto-title subprocess, the
+   TC001 state file and the Remote Control PTY all live on the machine the
+   gateway daemon runs on, not in the WKWebView. Under Obsidian and the
+   Electron shell every one of these is supplied by the real implementation in
+   ./node-capabilities.ts, so behavior there is unchanged.
+   ------------------------------------------------------------------------ */
+
+/* StateEmitter's write surface (the TC001 status display). */
+export interface StateEmitterLike {
+  setState(state: DisplayState): void;
+}
+
+/* The member surface of JsonlTailer that TabController uses. */
+export interface JsonlTailerHandle {
+  onEvent(cb: (e: StreamEvent) => void): void;
+  onError(cb: (err: Error) => void): void;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+/* The member surface of SubagentSessionTracker that TabController uses. */
+export interface SubagentTrackerHandle {
+  start(): void;
+  stop(): void;
+}
+
+/* SubagentSessionTrackerOpts minus `subprocessManager` — the host owns the
+   engine handle and injects its own. */
+export type SubagentTrackerRequest = {
+  cwd: string;
+  parentSessionId: string;
+  parentToolUseId: string;
+  parentPrompt: string;
+  onUpdate: (update: SubagentTrackerUpdate) => void;
+};
+
+/* RemoteControlOptions minus the session-file claim adapter (the host wires
+   that to its own manager). */
+export type RemoteControlRequest = {
+  cwd: string;
+  sessionName?: string;
+  claudePath?: string;
+};
+
+/* Outcome of writing a subagent definition file. The caller owns every
+   user-facing message, so this only reports which case was hit. */
+export type SubagentFileResult =
+  | { ok: true }
+  | { ok: false; kind: "no_vault" | "exists" | "write_failed"; message?: string };
+
 export interface PluginHost {
   settings: ClaudeChatSettings;
   speech: SpeechController;
-  subprocessManager: SubprocessManager;
+  subprocessManager: SubprocessManagerLike;
   permissionsStore: PermissionsConfigStore;
   skillCatalog: DiscoveryResult;
   subagentCatalog: SubagentCatalog;
@@ -87,4 +146,38 @@ export interface PluginHost {
   createSelectionTracker(
     onChange: (sel: ActiveSelection | null) => void,
   ): SelectionTrackerHandle;
+
+  /* --- optional node-backed capabilities (see the block above) --- */
+
+  /* TC001 status display. Absent => the UI simply emits no display states. */
+  stateEmitter?: StateEmitterLike;
+
+  /* Incognito teardown: delete `<projectDir>/<id>.jsonl` and `<projectDir>/<id>/`
+     for every id, best-effort and idempotent. Absent => nothing to delete
+     (a remote engine cleans up its own disk). */
+  removeSessionFiles?(cwd: string, sessionIds: string[]): Promise<void>;
+
+  /* Remote Control mode: tails the session JSONL the interactive CLI writes.
+     Absent => Remote Control surfaces no conversation events. */
+  createJsonlTailer?(path: string): JsonlTailerHandle;
+
+  /* Nested subagent (Task tool) transcript tracking. Absent => tool rows show
+     no nested events, which is the same degradation as a match failure. */
+  createSubagentTracker?(opts: SubagentTrackerRequest): SubagentTrackerHandle;
+
+  /* One-shot `claude --print` auto-title pass. Absent => the tab keeps its
+     placeholder title. */
+  generateTitle?(opts: TitleGenOptions): Promise<string | null>;
+
+  /* `claude remote-control` in a PTY. Absent => the mode toggle has nothing
+     to start. */
+  createRemoteControlSession?(opts: RemoteControlRequest): RemoteControlSessionLike;
+
+  /* Writes a subagent definition to the user-global or project agents dir.
+     Absent => the create-subagent form cannot save. */
+  createSubagentFile?(opts: { scope: "user" | "project"; name: string; contents: string }): SubagentFileResult;
+
+  /* macOS `open <path>` / `open -R <path>`. Throws on failure so the caller
+     can surface its own message. Absent => the open/reveal buttons no-op. */
+  openPathExternally?(path: string, mode: "open" | "reveal"): void;
 }

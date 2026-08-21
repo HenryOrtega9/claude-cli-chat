@@ -4,7 +4,8 @@ import { StreamJsonParser } from "./StreamJsonParser";
 import { InputWriter } from "./InputWriter";
 import type { StreamEvent, ControlRequestEvent, ContentBlock } from "./Events";
 import { RemoteControlSession } from "./RemoteControlSession";
-import { autodetectClaudePath, resolveModelId, type ClaudeChatSettings } from "../settings-data";
+import type { ClaudeChatSettings } from "../settings-data";
+import { autodetectClaudePath } from "../settings-autodetect";
 
 /* Returns PIDs of every running Remote Control process. Used by the settings
    UI to count live remote sessions and by killAllRemoteAndOrphans() to sweep
@@ -79,6 +80,15 @@ export type SpawnOptions = {
       the user's other Claude Code instances. Each pattern removes that
       server's tools from the model's advertised tool list. */
   mcpDenyPatterns?: string[];
+  /** Extra argv appended verbatim, just before the `--resume` pair. Added for
+      the iOS gateway daemon (`scripts/gateway/`), which needs flags the chat
+      UI has no use for: `--session-id <uuid>` (server-generated session id so
+      a tab has an identity before its first spawn) and
+      `--replay-user-messages` (the CLI echoes stdin user messages back on
+      stdout so every connected client sees the same ordered stream).
+      Undefined for every existing caller, so spawns are byte-for-byte
+      unchanged unless a caller opts in. */
+  extraArgs?: string[];
 };
 
 export type TabSessionStatus = "starting" | "ready" | "running" | "exited" | "error";
@@ -282,6 +292,7 @@ export class TabSession {
     if (opts.mcpDenyPatterns && opts.mcpDenyPatterns.length > 0) {
       args.push("--settings", JSON.stringify({ permissions: { deny: opts.mcpDenyPatterns } }));
     }
+    if (opts.extraArgs && opts.extraArgs.length > 0) args.push(...opts.extraArgs);
     if (opts.sessionId) args.push("--resume", opts.sessionId);
     return args;
   }
@@ -600,30 +611,9 @@ export class SubprocessManager {
   }
 }
 
-/* Convenience helper to translate plugin settings into SpawnOptions. */
-export function spawnOptionsFromSettings(
-  settings: ClaudeChatSettings,
-  cwd: string,
-  sessionId?: string,
-  overrides?: {
-    model?: string;
-    effort?: string;
-    permissionMode?: ClaudeChatSettings["permissionMode"];
-    appendSystemPrompt?: string;
-    noSessionPersistence?: boolean;
-    mcpDenyPatterns?: string[];
-  }
-): SpawnOptions {
-  return {
-    cwd,
-    sessionId,
-    model: overrides?.model ?? resolveModelId(settings.defaultModel),
-    effort: overrides?.effort ?? settings.defaultEffort,
-    claudePath: settings.claudePath,
-    permissionMode: overrides?.permissionMode ?? settings.permissionMode,
-    includePartialMessages: settings.includePartialMessages,
-    appendSystemPrompt: overrides?.appendSystemPrompt,
-    noSessionPersistence: overrides?.noSessionPersistence,
-    mcpDenyPatterns: overrides?.mcpDenyPatterns,
-  };
-}
+/* Re-exported for compatibility: spawnOptionsFromSettings is a pure mapping
+   from settings to SpawnOptions, so it lives in ./spawn-options.ts where the
+   browser bundle can import it without dragging this module (and node's
+   child_process) along. Existing `from "../claude/SubprocessManager"` imports
+   keep resolving it. */
+export { spawnOptionsFromSettings } from "./spawn-options";

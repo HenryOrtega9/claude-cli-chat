@@ -17,12 +17,12 @@ import {
   PERMISSION_MODE_LABELS,
   PERMISSION_MODE_DESCRIPTIONS,
   makeSnippetId,
-  autodetectClaudePath,
   type ModelKey,
   type EffortLevel,
   type PermissionMode,
   type EnvSnippet,
 } from "./settings-data";
+import { autodetectClaudePath } from "./settings-autodetect";
 
 /* The settings DATA MODEL (model/effort/mode catalogs, persisted shape,
    defaults, pure helpers, autodetect) lives in ./settings-data.ts, which is
@@ -30,6 +30,7 @@ import {
    verbatim so every existing `../settings` import keeps resolving the same
    symbols. This file keeps only the Obsidian settings-tab UI. */
 export * from "./settings-data";
+export * from "./settings-autodetect";
 
 /* Per-control debounce helper used to coalesce rapid text-input keystrokes
    into a single saveSettings() call. The synchronous in-memory state is

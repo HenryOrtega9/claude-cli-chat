@@ -6,13 +6,13 @@
    set, identical markup and class names, identical "(none)" clear sentinel —
    so the styles in styles.css apply unchanged. Keep the two in sync. */
 
-import { PlatformSuggestModal } from "../../src/platform";
+import { PlatformSuggestModal } from "../index";
 import {
   EFFORT_LABELS,
   MODEL_LABELS,
   PERMISSION_MODE_LABELS,
   type EnvSnippet,
-} from "../../src/settings-data";
+} from "../../settings-data";
 
 export type SnippetChoice = EnvSnippet | "__clear__";
 

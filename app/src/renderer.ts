@@ -22,13 +22,15 @@
 
 import { ipcRenderer } from "electron";
 import { stat } from "node:fs/promises";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { installDomHelpers } from "./dom-polyfill";
+import { installDomHelpers } from "../../src/platform/dom/dom-polyfill";
 import { DesktopPlatform } from "./desktop-platform";
 import { initializePlatform } from "../../src/platform";
 import { StateEmitter } from "../../src/claude/StateEmitter";
 import { loadAppConfig, loadDesktopSettings } from "./config";
-import { setOverlayFocusFallback } from "./desktop-overlays";
+import { setOverlayFocusFallback } from "../../src/platform/dom/desktop-overlays";
+import { setSyncFileWriter } from "../../src/storage/Persistence";
 import { DesktopHost } from "./host";
 import { DesktopChatShell } from "./shell";
 import { openSettingsModal } from "./settings-modal";
@@ -289,6 +291,9 @@ async function boot(): Promise<void> {
     const baseDir = workingDirOk ? config.workingDir : homedir();
 
     initializePlatform(new DesktopPlatform({ baseDir }));
+    /* Persistence's quit-time flushSync() needs a synchronous file API; it no
+       longer imports node itself so the shared bundle stays browser-safe. */
+    setSyncFileWriter({ mkdirSync, renameSync, writeFileSync });
 
     const settings = await loadDesktopSettings({ seed: workingDirOk });
     const host = new DesktopHost(baseDir, settings);

@@ -3,11 +3,13 @@
    This file must stay free of `obsidian` imports (and of imports from any
    Obsidian-only file) so a standalone shell can compile it as-is; the
    Obsidian settings-tab UI lives in ./settings.ts, which re-exports
-   everything here so existing `../settings` imports keep working. Node
-   builtins are fine (the autodetect helpers shell out). */
+   everything here so existing `../settings` imports keep working.
 
-import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+   This file must ALSO stay free of node builtins so the browser bundle
+   (iOS gateway client) can compile it as-is. The two helpers that shell out
+   -- autodetectClaudePath / autodetectUserName -- live in
+   ./settings-autodetect.ts, which ./settings.ts re-exports alongside this
+   module so existing `../settings` imports still resolve them. */
 
 /* Model IDs use the `[1m]` suffix to enable Claude's 1M-context window
    for Opus and Sonnet, matching Claudian's `enableOpus1M`/`enableSonnet1M`
@@ -257,60 +259,4 @@ export function makeSnippetId(): string {
 
 export function resolveModelId(key: ModelKey): string {
   return MODEL_IDS[key];
-}
-
-/* Module-scoped caches so the settings tab's display() call (re-run on
-   every render) doesn't re-fork a child process for the autodetect helpers
-   on every paint. Reset implicitly on plugin reload via module re-eval. */
-let cachedClaudePath: string | null = null;
-let cachedUserName: string | null = null;
-
-export function autodetectClaudePath(force = false): string {
-  /* A failed detection caches "" so passive callers (placeholder text on
-     every display() paint) stay cheap, but the Autodetect button passes
-     force=true — otherwise installing the CLI after the first settings
-     open would never be noticed until a full plugin reload. */
-  if (cachedClaudePath !== null && !force) return cachedClaudePath;
-  const candidates = [
-    `${process.env.HOME}/.local/bin/claude`,
-    "/usr/local/bin/claude",
-    "/opt/homebrew/bin/claude",
-    `${process.env.HOME}/.npm-global/bin/claude`,
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) {
-      cachedClaudePath = p;
-      return p;
-    }
-  }
-  try {
-    /* 3s timeout matches autodetectUserName's bound so a stuck PATH lookup
-       can't freeze the settings tab. */
-    cachedClaudePath = execSync("command -v claude", { encoding: "utf8", timeout: 3000 }).trim();
-  } catch {
-    cachedClaudePath = "";
-  }
-  return cachedClaudePath;
-}
-
-/* Autodetect the user's display name on first install. macOS `dscl` returns
-   the RealName attribute from Directory Services ("Henry Ortega"). If that
-   fails, fall back to capitalizing the shell username. The user can override
-   anytime in plugin settings. */
-export function autodetectUserName(): string {
-  if (cachedUserName !== null) return cachedUserName;
-  try {
-    const out = execSync("dscl . -read /Users/$USER RealName 2>/dev/null | sed -n 's/^ //p' | tail -1", {
-      encoding: "utf8",
-      timeout: 1000,
-      shell: "/bin/sh",
-    }).trim();
-    if (out) {
-      cachedUserName = out;
-      return out;
-    }
-  } catch { /* ignore */ }
-  const u = process.env.USER ?? "";
-  cachedUserName = u ? u.charAt(0).toUpperCase() + u.slice(1) : "";
-  return cachedUserName;
 }

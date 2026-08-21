@@ -31,7 +31,7 @@ import { HistoryModal } from "../../src/view/HistoryModal";
 import { MCPManagerModal } from "../../src/view/MCPManagerModal";
 import { makeTabState, type TabState } from "../../src/view/state";
 import { DESKTOP_SETTINGS_PATH } from "./config";
-import { DesktopSnippetPicker } from "./snippet-picker";
+import { DesktopSnippetPicker } from "../../src/platform/dom/snippet-picker";
 import type { DesktopHost } from "./host";
 
 /* Working-dir-relative path for the multi-window lock file. Each shell writes

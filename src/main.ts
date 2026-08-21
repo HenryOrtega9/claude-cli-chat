@@ -1,11 +1,12 @@
 import { FileSystemAdapter, Plugin, WorkspaceLeaf, addIcon, getFrontMatterInfo, type Editor } from "obsidian";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { ClaudeChatView, VIEW_TYPE_CLAUDE_CHAT } from "./view/ClaudeChatView";
 import { ClaudeChatSettingTab, DEFAULT_SETTINGS, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, autodetectClaudePath, autodetectUserName, type ClaudeChatSettings } from "./settings";
 import { SubprocessManager, spawnOptionsFromSettings } from "./claude/SubprocessManager";
 import { MCPConfigStore } from "./mcp/MCPConfig";
 import { listMcpServersViaCli, type ParsedMcpServer } from "./mcp/McpServerList";
 import type { AssistantEvent, ResultEvent, StreamEvent } from "./claude/Events";
-import { Persistence } from "./storage/Persistence";
+import { Persistence, setSyncFileWriter } from "./storage/Persistence";
 import { CLAUDE_ASTERISK_ICON_SVG } from "./view/Welcome";
 import { discoverSkillsAndCommands, type DiscoveryResult } from "./claude/SkillDiscovery";
 import { discoverSubagents, type SubagentCatalog } from "./claude/SubagentDiscovery";
@@ -15,6 +16,20 @@ import { SpeechController } from "./voice/SpeechController";
 import { initializePlatform } from "./platform";
 import { ObsidianPlatform } from "./platform/obsidian";
 import type { ActiveFileIndicatorHandle, ActiveSelection, SelectionTrackerHandle } from "./platform/host";
+import {
+  createJsonlTailer as createJsonlTailerImpl,
+  createRemoteControlSession as createRemoteControlSessionImpl,
+  createSubagentTracker as createSubagentTrackerImpl,
+  openPathExternally as openPathExternallyImpl,
+  removeSessionFiles as removeSessionFilesImpl,
+  writeSubagentFile as writeSubagentFileImpl,
+} from "./platform/node-capabilities";
+import { generateTitle as generateTitleImpl } from "./claude/TitleGenerator";
+import type {
+  SubagentFileResult,
+  SubagentTrackerHandle,
+  SubagentTrackerRequest,
+} from "./platform/host";
 import { ActiveFileIndicator } from "./view/ActiveFileIndicator";
 import { SelectionTracker } from "./view/SelectionTracker";
 
@@ -22,6 +37,9 @@ import { SelectionTracker } from "./view/SelectionTracker";
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
    the Claude asterisk. */
 export const CLAUDE_ICON_ID = "claude-asterisk";
+
+/* The three sync calls Persistence.flushSync() needs, handed over at boot. */
+const nodeFs = { mkdirSync, renameSync, writeFileSync };
 
 export default class ClaudeChatPlugin extends Plugin {
   settings: ClaudeChatSettings = DEFAULT_SETTINGS;
@@ -77,6 +95,9 @@ export default class ClaudeChatPlugin extends Plugin {
        hidden from the very first turn. Best-effort: a read failure just
        leaves every server enabled. */
     await this.refreshMcpDenyPatterns();
+    /* Persistence's quit-time flushSync() needs a synchronous file API; it no
+       longer imports node itself so the shared bundle stays browser-safe. */
+    setSyncFileWriter(nodeFs);
     this.persistence = new Persistence(this.app);
     this.refreshSkillCatalog();
     this.refreshSubagentCatalog();
@@ -237,6 +258,26 @@ export default class ClaudeChatPlugin extends Plugin {
     onChange: (sel: ActiveSelection | null) => void,
   ): SelectionTrackerHandle {
     return new SelectionTracker(this.app, onChange);
+  }
+
+  /* PluginHost node-backed capabilities (src/platform/host.ts). Shared code
+     reaches every one of these through `?.` so the same view layer can run in
+     a browser; here they are the real thing, so behavior is unchanged.
+     Implementations live in src/platform/node-capabilities.ts and are shared
+     verbatim with the other host — keep the two wirings identical. */
+  stateEmitter = StateEmitter;
+  removeSessionFiles = removeSessionFilesImpl;
+  createJsonlTailer = createJsonlTailerImpl;
+  createRemoteControlSession = createRemoteControlSessionImpl;
+  generateTitle = generateTitleImpl;
+  openPathExternally = openPathExternallyImpl;
+
+  createSubagentTracker(opts: SubagentTrackerRequest): SubagentTrackerHandle {
+    return createSubagentTrackerImpl(this.subprocessManager, opts);
+  }
+
+  createSubagentFile(opts: { scope: "user" | "project"; name: string; contents: string }): SubagentFileResult {
+    return writeSubagentFileImpl(this.getVaultPath(), opts);
   }
 
   /* Recompute the cached per-vault MCP deny patterns from the on-disk

@@ -13,7 +13,7 @@
    fill instead of stroke. */
 
 import { icons } from "lucide";
-import { CLAUDE_ASTERISK_ICON_SVG } from "../../src/view/Welcome";
+import { CLAUDE_ASTERISK_ICON_SVG } from "../../view/Welcome";
 
 /* lucide types `icons` as a namespace object of named exports, so a runtime
    lookup by id needs the index signature its own internal `Icons` type has

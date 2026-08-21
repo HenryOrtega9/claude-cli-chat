@@ -19,12 +19,27 @@ import { listMcpServersViaCli, type ParsedMcpServer } from "../../src/mcp/McpSer
 import { discoverSkillsAndCommands, type DiscoveryResult } from "../../src/claude/SkillDiscovery";
 import { discoverSubagents, type SubagentCatalog } from "../../src/claude/SubagentDiscovery";
 import { StateEmitter } from "../../src/claude/StateEmitter";
-import { autodetectClaudePath, type ClaudeChatSettings } from "../../src/settings-data";
+import type { ClaudeChatSettings } from "../../src/settings-data";
+import { autodetectClaudePath } from "../../src/settings-autodetect";
 import type {
   ActiveFileIndicatorHandle,
   ActiveSelection,
   PluginHost,
   SelectionTrackerHandle,
+} from "../../src/platform/host";
+import {
+  createJsonlTailer as createJsonlTailerImpl,
+  createRemoteControlSession as createRemoteControlSessionImpl,
+  createSubagentTracker as createSubagentTrackerImpl,
+  openPathExternally as openPathExternallyImpl,
+  removeSessionFiles as removeSessionFilesImpl,
+  writeSubagentFile as writeSubagentFileImpl,
+} from "../../src/platform/node-capabilities";
+import { generateTitle as generateTitleImpl } from "../../src/claude/TitleGenerator";
+import type {
+  SubagentFileResult,
+  SubagentTrackerHandle,
+  SubagentTrackerRequest,
 } from "../../src/platform/host";
 import { saveDesktopSettings } from "./config";
 
@@ -198,6 +213,26 @@ export class DesktopHost implements PluginHost {
     _onChange: (sel: ActiveSelection | null) => void,
   ): SelectionTrackerHandle {
     return new InertSelectionTracker();
+  }
+
+  /* PluginHost node-backed capabilities (src/platform/host.ts). Shared code
+     reaches every one of these through `?.` so the same view layer can run in
+     a browser; here they are the real thing, so behavior is unchanged.
+     Implementations live in src/platform/node-capabilities.ts and are shared
+     verbatim with the other host — keep the two wirings identical. */
+  stateEmitter = StateEmitter;
+  removeSessionFiles = removeSessionFilesImpl;
+  createJsonlTailer = createJsonlTailerImpl;
+  createRemoteControlSession = createRemoteControlSessionImpl;
+  generateTitle = generateTitleImpl;
+  openPathExternally = openPathExternallyImpl;
+
+  createSubagentTracker(opts: SubagentTrackerRequest): SubagentTrackerHandle {
+    return createSubagentTrackerImpl(this.subprocessManager, opts);
+  }
+
+  createSubagentFile(opts: { scope: "user" | "project"; name: string; contents: string }): SubagentFileResult {
+    return writeSubagentFileImpl(this.getVaultPath(), opts);
   }
 
   /* Teardown mirroring ClaudeChatPlugin.onunload. Reached from the quit

@@ -1,8 +1,45 @@
 import { platform, type AppHandle } from "../platform";
-import { mkdirSync, renameSync, writeFileSync } from "fs";
 import type { Attachment, ChatMessage, TabState, ToolCall } from "../view/state";
 import { truncateToolResult } from "../view/state";
 import { writeJsonAtomic } from "../mcp/MCPConfig";
+
+/* Synchronous file API used by flushSync() — the quit-time path, where
+   nothing async can be awaited. Node's `fs` used to be a top-level import,
+   which made this module unresolvable in a browser bundle even though the
+   rest of it goes through `platform.storage`. It is now injected: both node
+   hosts call setSyncFileWriter(require("fs")) during boot, and a lazy
+   `globalThis.require` probe covers any node embedder that forgets to.
+   Absent => flushSync() degrades to a no-op. */
+export type SyncFileWriter = {
+  mkdirSync(path: string, opts: { recursive: boolean }): void;
+  renameSync(from: string, to: string): void;
+  writeFileSync(path: string, data: string, encoding: "utf8"): void;
+};
+
+/* undefined = never injected; null = injected as deliberately absent. */
+let injectedSyncWriter: SyncFileWriter | null | undefined = undefined;
+/* undefined = not probed yet, null = probed and unavailable. */
+let probedSyncWriter: SyncFileWriter | null | undefined = undefined;
+
+export function setSyncFileWriter(writer: SyncFileWriter | null): void {
+  injectedSyncWriter = writer;
+}
+
+function syncFileWriter(): SyncFileWriter | null {
+  if (injectedSyncWriter !== undefined) return injectedSyncWriter;
+  if (probedSyncWriter === undefined) {
+    probedSyncWriter = null;
+    try {
+      /* Property access, not a bare `require(...)` call, so a browser bundler
+         never tries to resolve "fs" at build time. */
+      const req = (globalThis as { require?: (id: string) => unknown }).require;
+      if (typeof req === "function") probedSyncWriter = req("fs") as SyncFileWriter;
+    } catch {
+      /* no node here */
+    }
+  }
+  return probedSyncWriter;
+}
 
 /* Persisted shape of a tab. Excludes runtime-only state (pendingApprovals,
    busy) since those are bound to a live subprocess and cannot survive a
@@ -330,17 +367,22 @@ export class Persistence {
   flushSync(): void {
     const base = platform.storage.basePath();
     if (base === null) return;
+    const fs = syncFileWriter();
+    /* No synchronous file API on this host (browser client). The async
+       debounced path still runs; only the quit-time last-write-wins pass is
+       unavailable, which is the same degradation as a null basePath. */
+    if (fs === null) return;
     const writeSync = (relPath: string, payload: string) => {
       const abs = `${base}/${relPath}`;
       const tmp = `${abs}.${Date.now().toString(36)}.tmp`;
-      writeFileSync(tmp, payload, "utf8");
-      renameSync(tmp, abs);
+      fs.writeFileSync(tmp, payload, "utf8");
+      fs.renameSync(tmp, abs);
     };
     const pending = Array.from(this.pendingWrites.values());
     this.pendingWrites.clear();
     if (pending.length > 0) {
       try {
-        mkdirSync(`${base}/${this.convDir}`, { recursive: true });
+        fs.mkdirSync(`${base}/${this.convDir}`, { recursive: true });
       } catch (err) {
         console.warn("[claude-cli-chat] sync flush mkdir failed", err);
         return;

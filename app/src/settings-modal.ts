@@ -22,7 +22,7 @@
 import { ipcRenderer } from "electron";
 import { stat } from "node:fs/promises";
 import { PlatformModal } from "../../src/platform";
-import { autodetectClaudePath } from "../../src/settings-data";
+import { autodetectClaudePath } from "../../src/settings-autodetect";
 import { DEFAULT_HOTKEY, loadAppConfig, saveWorkingDir } from "./config";
 import type { DesktopHost } from "./host";
 

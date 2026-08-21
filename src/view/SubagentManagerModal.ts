@@ -1,5 +1,4 @@
 import { platform, PlatformModal, type AppHandle } from "../platform";
-import { spawn } from "node:child_process";
 import type { PluginHost } from "../platform/host";
 import type { SubagentEntry } from "../claude/SubagentDiscovery";
 
@@ -118,7 +117,7 @@ export class SubagentManagerModal extends PlatformModal {
      markdown editor. Plugin is macOS-only so the bare `open` is safe. */
   private openFile(filePath: string) {
     try {
-      spawn("open", [filePath], { stdio: "ignore", detached: true }).unref();
+      this.plugin.openPathExternally?.(filePath, "open");
     } catch (err) {
       platform.notify(`Failed to open file: ${(err as Error).message}`);
     }
@@ -126,7 +125,7 @@ export class SubagentManagerModal extends PlatformModal {
 
   private revealInFinder(filePath: string) {
     try {
-      spawn("open", ["-R", filePath], { stdio: "ignore", detached: true }).unref();
+      this.plugin.openPathExternally?.(filePath, "reveal");
     } catch (err) {
       platform.notify(`Failed to reveal file: ${(err as Error).message}`);
     }

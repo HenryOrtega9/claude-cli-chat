@@ -6,21 +6,24 @@ import { renderWelcome, setWelcomeVisible } from "./Welcome";
 import { RemotePairingCard } from "./RemotePairingCard";
 import { StatusIndicator } from "./StatusIndicator";
 import { SearchBar } from "./SearchBar";
-import type { PluginHost, ActiveSelection, ActiveFileIndicatorHandle, SelectionTrackerHandle } from "../platform/host";
+import type {
+  PluginHost,
+  ActiveSelection,
+  ActiveFileIndicatorHandle,
+  SelectionTrackerHandle,
+  JsonlTailerHandle,
+  SubagentTrackerHandle,
+} from "../platform/host";
+import type { TabSessionLike, RemoteControlSessionLike } from "../platform/engine";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
-import { spawnOptionsFromSettings, type TabSession } from "../claude/SubprocessManager";
+import { spawnOptionsFromSettings } from "../claude/spawn-options";
 import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings-data";
 import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
-import { RemoteControlSession, sessionFilePathFor, projectDirFor } from "../claude/RemoteControlSession";
-import { rm } from "node:fs/promises";
-import { JsonlTailer } from "../claude/JsonlTailer";
-import { SubagentSessionTracker, type SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
-import { generateTitle } from "../claude/TitleGenerator";
+import type { SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
 import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
 import { SubagentPicker } from "./SubagentPicker";
 import { CreateSubagentModal } from "./CreateSubagentModal";
 import type { SubagentEntry } from "../claude/SubagentDiscovery";
-import { StateEmitter } from "../claude/StateEmitter";
 import { extractOfficeText, isExtractableOffice } from "../util/officeExtract";
 import type {
   StreamEvent,
@@ -56,8 +59,8 @@ export class TabController {
 
   private plugin: PluginHost;
   private component: RenderLifecycle;
-  private session: TabSession | null = null;
-  private remoteSession: RemoteControlSession | null = null;
+  private session: TabSessionLike | null = null;
+  private remoteSession: RemoteControlSessionLike | null = null;
   /* Session ids this tab has used while incognito. `--no-session-persistence`
      suppresses the transcript but the CLI still writes a one-line `ai-title`
      record (and any subagent session files) keyed by session id. We delete
@@ -68,7 +71,7 @@ export class TabController {
   /* Set true at the start of cancelStream() so the SIGTERM-driven exit event
      gets handled as a clean cancel (italic prompt) instead of an error. */
   private userCancelInitiated = false;
-  private jsonlTailer: JsonlTailer | null = null;
+  private jsonlTailer: JsonlTailerHandle | null = null;
   private pairingCard: RemotePairingCard;
 
   private messagesWrapperEl: HTMLElement;
@@ -93,7 +96,7 @@ export class TabController {
      tool's input finalizes (content_block_stop or assistant event) and
      disposed when the matching tool_result arrives or the session is torn
      down. The map's keys are tool_use_ids. */
-  private subagentTrackers = new Map<string, SubagentSessionTracker>();
+  private subagentTrackers = new Map<string, SubagentTrackerHandle>();
   /* Spawn timestamps per Task tool call, used to compute nestedDurationMs
      when the tool_result arrives. */
   private subagentSpawnTimes = new Map<string, number>();
@@ -475,7 +478,7 @@ export class TabController {
            phantom pending approval indefinitely, since the card that would
            let the user act on it is already gone. */
         this.state.pendingApprovals.clear();
-        StateEmitter.setState("ready");
+        this.plugin.stateEmitter?.setState("ready");
       }
     } else {
       if (this.remoteSession) {
@@ -576,12 +579,7 @@ export class TabController {
     const cwd = this.plugin.getVaultPath();
     const ids = Array.from(this.incognitoSessionIds);
     this.incognitoSessionIds.clear();
-    const work: Promise<unknown>[] = [];
-    for (const id of ids) {
-      work.push(rm(sessionFilePathFor(cwd, id), { force: true }).catch(() => {}));
-      work.push(rm(`${projectDirFor(cwd)}/${id}`, { force: true, recursive: true }).catch(() => {}));
-    }
-    await Promise.all(work);
+    await this.plugin.removeSessionFiles?.(cwd, ids);
   }
 
   /* Reload the cost-surface pill: count pinned files for this tab and read
@@ -665,11 +663,18 @@ export class TabController {
     this.pairingCard.setStatus("starting");
     this.pairingCard.setUrl("");
 
-    this.remoteSession = new RemoteControlSession({
+    const remote = this.plugin.createRemoteControlSession?.({
       cwd,
       sessionName,
       claudePath: this.plugin.settings.claudePath || undefined,
     });
+    if (!remote) {
+      /* No PTY on this host (browser client). Nothing to start. */
+      this.pairingCard.setStatus("error");
+      platform.notify("Remote Control isn't available in this app.");
+      return;
+    }
+    this.remoteSession = remote;
     /* Register with the central manager so it gets reaped on plugin
        unload even if this TabController's destroy() never runs (e.g.
        Obsidian quits hard, plugin disabled while view is gone). */
@@ -693,7 +698,9 @@ export class TabController {
 
   private attachJsonlTailer(path: string) {
     if (this.jsonlTailer) return;
-    this.jsonlTailer = new JsonlTailer(path);
+    const tailer = this.plugin.createJsonlTailer?.(path);
+    if (!tailer) return;
+    this.jsonlTailer = tailer;
     this.jsonlTailer.onEvent(e => void this.onEvent(e));
     /* Surface start failures (file missing, EACCES, etc.) into the chat
        instead of letting them die as an unhandled promise rejection. */
@@ -914,7 +921,7 @@ export class TabController {
     /* Reset the TC001 to "ready" so it doesn't sit on whatever state the
        cancelled turn left it in (thinking / needs_permission). Animator's
        60s timeout will flip ready → idle if no follow-up turn arrives. */
-    StateEmitter.setState("ready");
+    this.plugin.stateEmitter?.setState("ready");
   }
 
   /* Esc-cancel: kill the in-flight subprocess so streaming stops, but keep
@@ -958,7 +965,7 @@ export class TabController {
     /* Cancel leaves the last emitted device state as a held one (thinking /
        needs_permission), whose 5s heartbeat would otherwise re-assert that app
        on the TC001 forever. Drop back to ready, mirroring clearConversation. */
-    StateEmitter.setState("ready");
+    this.plugin.stateEmitter?.setState("ready");
     platform.notify("Stopped Claude.");
     this.onStateChangeCb();
   }
@@ -973,7 +980,7 @@ export class TabController {
     setWelcomeVisible(this.welcomeEl, this.state.messages.length === 0);
   }
 
-  private async ensureSession(): Promise<TabSession> {
+  private async ensureSession(): Promise<TabSessionLike> {
     /* Treat "error" as terminal alongside "exited": a spawn-level failure
        (ENOENT/EACCES) leaves the session in status "error" with no 'exit'
        event ever firing, so reusing it here would permanently brick the tab.
@@ -1340,7 +1347,7 @@ export class TabController {
     this.renderer.forceStickToBottom();
     this.inputBox.setBusy(true);
     this.statusIndicator.setThinking();
-    StateEmitter.setState("thinking");
+    this.plugin.stateEmitter?.setState("thinking");
     this.passStartedAt = Date.now();
     this.onStateChangeCb();
 
@@ -1392,7 +1399,7 @@ export class TabController {
       this.state.busy = false;
       this.inputBox.setBusy(false);
       this.statusIndicator.hide();
-      StateEmitter.setState("ready");
+      this.plugin.stateEmitter?.setState("ready");
       this.onStateChangeCb();
       return;
     }
@@ -1940,18 +1947,22 @@ export class TabController {
     const promptVal = (tool.input as { prompt?: unknown })?.prompt;
     const parentPrompt = typeof promptVal === "string" ? promptVal : "";
 
-    tool.nestedStatus = "spawning";
-    tool.nestedEvents = tool.nestedEvents ?? [];
-    this.subagentSpawnTimes.set(tool.id, Date.now());
-
-    const tracker = new SubagentSessionTracker({
+    /* Constructing the tracker has no side effects (start() does the work),
+       so building it first lets an absent capability bail before any of the
+       tool's nested-state fields are touched. */
+    const tracker = this.plugin.createSubagentTracker?.({
       cwd,
       parentSessionId: this.state.sessionId,
       parentToolUseId: tool.id,
       parentPrompt,
       onUpdate: (update) => this.applySubagentUpdate(tool.id, update),
-      subprocessManager: this.plugin.subprocessManager,
     });
+    if (!tracker) return;
+
+    tool.nestedStatus = "spawning";
+    tool.nestedEvents = tool.nestedEvents ?? [];
+    this.subagentSpawnTimes.set(tool.id, Date.now());
+
     this.subagentTrackers.set(tool.id, tracker);
     tracker.start();
   }
@@ -2027,7 +2038,7 @@ export class TabController {
        approval even though nothing is wedged. Suspend it; the allow branch of
        handleApproval re-arms it via setThinking() when the turn resumes. */
     this.statusIndicator.suspendWatchdog();
-    StateEmitter.setState("needs_permission");
+    this.plugin.stateEmitter?.setState("needs_permission");
   }
 
   private handleResult(event: ResultEvent) {
@@ -2118,7 +2129,7 @@ export class TabController {
        so without this sweep they'd accumulate for the plugin's lifetime.
        Audio is untouched; queued chunks keep playing. */
     this.plugin.speech.forgetChannel(this.state.id);
-    StateEmitter.setState(turnFailed ? "ready" : "complete");
+    this.plugin.stateEmitter?.setState(turnFailed ? "ready" : "complete");
     /* Do NOT use event.usage here — it sums across every API call in the
        turn (each tool round-trip counts the shared context again), inflating
        the displayed token count. handleAssistant updates the indicator
@@ -2165,13 +2176,13 @@ export class TabController {
        Opus. Locking the model here (rather than reading a setting) means
        the cheap path can't drift back to Sonnet/Opus through a stale
        settings file or a user typo. */
-    const generated = await generateTitle({
+    const generated = (await this.plugin.generateTitle?.({
       userMessage: firstUser.content,
       assistantResponse: firstAssistant?.content,
       claudePath: this.plugin.settings.claudePath || undefined,
       model: "claude-haiku-4-5-20251001",
       cwd: this.plugin.getVaultPath(),
-    });
+    })) ?? null;
     if (generated) {
       /* The title-gen subprocess is independent and outlives teardownSession()/clear(),
          which neither kill it. If the tab was closed during the multi-second
@@ -2254,7 +2265,7 @@ export class TabController {
        to the TC001 forever. clear()/cancelStream()/handleResult already reset;
        mirror them so an errored-out turn the user walks away from doesn't leak
        the interval. */
-    StateEmitter.setState("ready");
+    this.plugin.stateEmitter?.setState("ready");
     await this.renderer.upsertMessage(errorMsg);
   }
 
@@ -2281,7 +2292,7 @@ export class TabController {
          that handleControlRequest suspended for the approval wait, and
          restores the pill if that wait outlasted the ceiling and hid it. */
       this.statusIndicator.setThinking();
-      StateEmitter.setState("thinking");
+      this.plugin.stateEmitter?.setState("thinking");
     } else {
       this.session.deny(requestId, decision.reason);
     }
@@ -2356,7 +2367,7 @@ export class TabController {
     /* A crashed turn leaves the last held device state (thinking /
        needs_permission) running its 5s heartbeat; drop to ready like the other
        turn-end paths so it doesn't keep POSTing to the TC001. */
-    StateEmitter.setState("ready");
+    this.plugin.stateEmitter?.setState("ready");
     this.clearStreamingPointer();
     this.onStateChangeCb();
   }

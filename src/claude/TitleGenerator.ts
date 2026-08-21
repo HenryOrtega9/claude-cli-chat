@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { autodetectClaudePath } from "../settings-data";
+import { autodetectClaudePath } from "../settings-autodetect";
 
 /* Spawns a one-off `claude --print` call with a small fast model (Haiku by
    default) and a focused prompt asking for a short conversation title.
