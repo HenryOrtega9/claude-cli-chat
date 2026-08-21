@@ -210,6 +210,19 @@ def resolve_bind():
     sys.exit(1)
 
 
+def session_index_for(pid):
+    """Authoritative pid -> session metadata from ~/.claude/sessions/<pid>.json,
+    written by claude >= 2.1.178 for every live session. Returns the parsed
+    dict only when it describes this pid (guards a stale file from a reused
+    pid); None when absent."""
+    try:
+        with open(f"{HOME}/.claude/sessions/{pid}.json") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if data.get("pid") == pid else None
+
+
 def project_dir_for(cwd):
     slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
     return f"{HOME}/.claude/projects/{slug}"
@@ -393,11 +406,25 @@ class ClaudeSession:
         concurrent plugin session's file in the same project slug."""
         proj = project_dir_for(VAULT)
         while gen == self._gen:
+            # Prefer the CLI's own pid -> sessionId index over any guessing.
+            # Without it, the birthtime fallback below adopted a concurrent
+            # plugin/desktop transcript in the same project slug (seen live
+            # 2026-08-20: /health pointed at a 20-day-old plugin chat).
+            if not self.session_id and self.pid > 0:
+                idx = session_index_for(self.pid)
+                sid = idx.get("sessionId") if idx else None
+                if sid:
+                    self.session_id = sid
+                    log(f"session id from ~/.claude/sessions/{self.pid}.json: {sid}")
             if self.session_id:
                 candidate = os.path.join(proj, f"{self.session_id}.jsonl")
                 if os.path.exists(candidate):
                     self._adopt(candidate)
                     return
+                # Known id, file not written yet (idle session): keep waiting
+                # rather than falling through to the heuristic.
+                time.sleep(0.5)
+                continue
             floor = (
                 self.first_send_epoch - 0.5
                 if self.first_send_epoch is not None
@@ -926,19 +953,8 @@ class SessionDirectory:
             return None
 
     def _session_index(self, pid):
-        """Authoritative pid -> session metadata from
-        ~/.claude/sessions/<pid>.json, which claude (>= 2.1.178) writes for
-        every live session: {pid, sessionId, cwd, kind, entrypoint, status}.
-        The sessionId is the transcript's basename, so this resolves a process
-        to its EXACT JSONL with no birthtime guessing. Returns the parsed dict
-        only when it actually describes this pid (guards a stale file left by a
-        reused pid); None when no index exists (older sessions predate it)."""
-        try:
-            with open(f"{HOME}/.claude/sessions/{pid}.json") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            return None
-        return data if data.get("pid") == pid else None
+        """See module-level session_index_for()."""
+        return session_index_for(pid)
 
     def _session_file_for(self, cwd, start_epoch, exclude=None):
         """Fallback mapping for sessions with no ~/.claude/sessions/<pid>.json
