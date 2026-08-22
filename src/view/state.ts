@@ -156,6 +156,15 @@ export type TabState = {
      toggles a pin's sticky state. Legacy state (field undefined) treats
      all existing pins as sticky to preserve old behavior on upgrade. */
   stickyPinnedFilePaths?: string[];
+  /* Unsent composer text for this tab. InputBox publishes it here (debounced
+     ~500ms while typing, flushed immediately on blur/visibilitychange/tab
+     switch) so a plugin reload, a desktop relaunch, or an iOS background-kill
+     doesn't lose what the user was mid-typing before they hit Send. Cleared
+     on successful submit and on /clear. No incognito guard needed here —
+     incognito tabs already skip the whole persisted-write path upstream
+     (onStateChangeCb's callers, and the gateway's TabEngine.save()), so this
+     field simply never reaches disk or the wire for those tabs. */
+  draft?: string;
   /* Discovered slash commands + skills from the most recent system/init
      event. Refreshed on every (re)spawn. Used to populate the slash-command
      suggestion popup. Not persisted — re-derived on next subprocess spawn. */

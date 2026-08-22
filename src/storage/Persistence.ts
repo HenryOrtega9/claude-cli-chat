@@ -66,6 +66,11 @@ type StoredTab = {
      treats undefined as "all pins sticky" so behavior is preserved. */
   stickyPinnedFilePaths?: string[];
   voiceEnabled?: boolean;
+  /* Unsent composer text — see TabState.draft's own comment for the full
+     contract. Round-tripped like any other per-tab field on this path; the
+     gateway's own StoredTab-shaped projection (scripts/gateway/src/engine.ts
+     storedTab()) carries it separately for the remote client. */
+  draft?: string;
 };
 
 /* Lightweight stand-in for a sent attachment — filename/kind/mediaType only,
@@ -201,6 +206,7 @@ export class Persistence {
       pinnedFilePaths: Array.isArray(stored.pinnedFilePaths) ? stored.pinnedFilePaths : undefined,
       stickyPinnedFilePaths: Array.isArray(stored.stickyPinnedFilePaths) ? stored.stickyPinnedFilePaths : undefined,
       voiceEnabled: typeof stored.voiceEnabled === "boolean" ? stored.voiceEnabled : undefined,
+      draft: typeof stored.draft === "string" ? stored.draft : undefined,
     };
   }
 
@@ -272,6 +278,7 @@ export class Persistence {
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths ? [...state.pinnedFilePaths] : undefined,
       stickyPinnedFilePaths: state.stickyPinnedFilePaths ? [...state.stickyPinnedFilePaths] : undefined,
+      draft: state.draft,
     };
   }
 
@@ -332,6 +339,13 @@ export class Persistence {
       pinnedFilePaths: state.pinnedFilePaths,
       stickyPinnedFilePaths: state.stickyPinnedFilePaths,
       voiceEnabled: state.voiceEnabled,
+      /* `|| undefined` is defense in depth: every real writer (TabController's
+         `draft || undefined` in handleDraftChange/clear(), the gateway's
+         identical guard in engine.ts patch()) already normalizes "" away
+         before it reaches here, but this is the actual serialization
+         boundary, so an empty string must not become permanent noise in the
+         JSON on disk regardless of what a future caller passes in. */
+      draft: state.draft || undefined,
     };
     const meta: TabMeta = {
       title: stored.title,

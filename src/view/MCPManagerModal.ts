@@ -3,6 +3,16 @@ import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
 import type { ParsedMcpServer } from "../mcp/McpServerList";
 import type { PluginHost } from "../platform/host";
 
+/* Same local check as TabBar.ts / MessageRenderer.ts (each file keeps its own
+   rather than sharing one, per the existing convention) — gates touch-only
+   behavior so the plugin/desktop build (mouse, hover available) is unchanged. */
+function isTouchHost(): boolean {
+  try {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+    return window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+  } catch { return false; }
+}
+
 /* Modal for per-vault MCP server control. Lists every server the Claude Code
    CLI actually loads (via `claude mcp list` — the authoritative source, since
    the CLI ignores our vault-local .claude/mcp.json), each with a checkbox.
@@ -175,6 +185,21 @@ export class MCPManagerModal extends PlatformModal {
     const checkbox = head.createEl("input", { attr: { type: "checkbox" }, cls: "claudian-mcp-server-toggle" });
     checkbox.checked = enabled;
     checkbox.addEventListener("change", () => void this.toggle(server.name, checkbox.checked, checkbox));
+
+    /* The checkbox itself is a bare 16x16 native control — far under a 44pt
+       target. On a coarse pointer, forward a tap anywhere on the row (name,
+       type badge, status, endpoint line) to the checkbox rather than only the
+       tiny box, mirroring what ApprovalModal's <label>-wrapped askuser rows
+       get for free from the browser. Kept to a manual forward instead of a
+       <label> wrap so desktop/plugin behavior — where only the checkbox is
+       clickable today — is untouched. */
+    if (isTouchHost()) {
+      row.addClass("claudian-mcp-server-row-touch");
+      row.addEventListener("click", (e) => {
+        if (e.target === checkbox) return;
+        checkbox.click();
+      });
+    }
 
     head.createSpan({ cls: "claudian-mcp-server-name", text: server.name });
     const typeBadge = head.createSpan({ cls: "claudian-mcp-server-type" });

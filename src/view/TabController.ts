@@ -14,7 +14,7 @@ import type {
   JsonlTailerHandle,
   SubagentTrackerHandle,
 } from "../platform/host";
-import type { TabSessionLike, RemoteControlSessionLike } from "../platform/engine";
+import type { TabSessionLike, RemoteControlSessionLike, SubprocessManagerLike } from "../platform/engine";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings } from "../claude/spawn-options";
 import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings-data";
@@ -82,6 +82,8 @@ export class TabController {
   private renderer: MessageListRenderer;
   private approvalArea: ApprovalArea;
   private inputBox: InputBox;
+  /** Host access to the composer (iOS share intake); plugin/desktop do not use it. */
+  getInputBox(): InputBox { return this.inputBox; }
   private statusIndicator: StatusIndicator;
   private searchBar: SearchBar;
   private activeFileIndicator: ActiveFileIndicatorHandle;
@@ -227,6 +229,7 @@ export class TabController {
         onIncognitoChange: incognito => this.handleIncognitoChange(incognito),
         onVoiceChange: voice => this.handleVoiceChange(voice),
         onVoicePauseToggle: () => this.handleVoicePauseToggle(),
+        onDraftChange: draft => this.handleDraftChange(draft),
         onMentionQuery: query => this.queryFileSuggestions(query),
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
@@ -253,6 +256,7 @@ export class TabController {
         /* Undefined = tab predates voice mode or is brand new; seed from the
            plugin default. Written back so pill and state can't disagree. */
         voice: this.state.voiceEnabled ?? this.plugin.settings.voiceDefaultOn,
+        draft: this.state.draft,
       }
     );
     /* Symmetric write-back: pin the seeded value (true OR false) so a later
@@ -385,10 +389,24 @@ export class TabController {
       this.refreshRunningAgentCount();
     });
     this.updateWelcomeVisibility();
+    /* Reconciliation for a gap that only the remote (iOS gateway) engine
+       has: an approval card is normally created ONLY from a live
+       control_request event, so a tab that mounts fresh — a cold app
+       relaunch, or a resync remount after the replay ring rolled over —
+       starts with no memory of a still-pending approval the daemon is
+       sitting on from before this TabController existed. See
+       RemoteSubprocessManager.fetchPendingApprovals's header for the
+       server-side gap this depends on (the field it reads does not exist on
+       the wire yet) and reconcilePendingApprovals below for why this is a
+       structural/optional no-op on desktop and plugin hosts. */
+    void this.reconcilePendingApprovals();
   }
 
   show() { this.root.style.display = ""; }
-  hide() { this.root.style.display = "none"; }
+  /* Switching away is one of the moments a relaunch or an iOS background-kill
+     can follow soon after — flush any debounced draft before the tab goes
+     dark rather than trusting the composer's own 500ms timer. */
+  hide() { this.inputBox.flushDraft(); this.root.style.display = "none"; }
   /* True once destroy() has started. Late async continuations (title-gen
      resolving, a submit suspended on a restart teardown) check this so they
      don't resurrect a deleted conversation on disk or spawn a subprocess for
@@ -916,6 +934,10 @@ export class TabController {
     this.statusIndicator.hide();
     this.inputBox.setUsage(undefined);
     this.inputBox.setActiveSubModel(undefined);
+    /* "New chat" resets the composer too — whatever was mid-typed belonged
+       to the discarded conversation. */
+    this.state.draft = undefined;
+    this.inputBox.clearDraftUi();
     this.updateWelcomeVisibility();
     this.onStateChangeCb();
     /* Reset the TC001 to "ready" so it doesn't sit on whatever state the
@@ -1101,6 +1123,23 @@ export class TabController {
       if (this.session !== s) return;
       this.lastStderr = (this.lastStderr + chunk).slice(-2000);
     });
+    /* Structural/optional: only RemoteTabSession has this member (see its
+       header comment). A desktop/plugin TabSession lacks it, so this is a
+       no-op there — every resolution on that host already goes through
+       handleApproval() directly. Called as `remote.onApprovalResolved(...)`
+       (a method call on `remote`, which IS `s`) rather than through a
+       detached variable — extracting the method as a bare reference first
+       and invoking THAT loses its `this` binding (the class method reads
+       `this.approvalResolvedListeners`), throwing when called. */
+    const remote = s as TabSessionLike & {
+      onApprovalResolved?: (cb: (requestId: string, allowed: boolean) => void) => () => void;
+    };
+    if (typeof remote.onApprovalResolved === "function") {
+      remote.onApprovalResolved((requestId, allowed) => {
+        if (this.session !== s) return;
+        this.dismissResolvedApproval(requestId, allowed);
+      });
+    }
     return this.session;
   }
 
@@ -1173,6 +1212,19 @@ export class TabController {
       this.plugin.speech.stop(this.state.id);
       this.plugin.speech.forgetChannel(this.state.id);
     }
+    this.onStateChangeCb();
+  }
+
+  /* Composer text is client-owned state with no signal in the CLI's event
+     stream, unlike model/effort/mode — it never needs a subprocess restart.
+     Just fold it into the normal state-change path: debounced write on
+     desktop/plugin (Persistence.scheduleSaveTab), and on the gateway PATCH
+     /tabs/:id -> engine.patch() via RemoteFileStorage's write() mapping. */
+  private handleDraftChange(draft: string): void {
+    const next = draft || undefined;
+    if (this.state.draft === next) return;
+    this.state.draft = next;
+    this.state.updatedAt = Date.now();
     this.onStateChangeCb();
   }
 
@@ -2010,6 +2062,68 @@ export class TabController {
     }
 
     void this.renderer.upsertMessage(msg);
+    this.onStateChangeCb();
+  }
+
+  /* `plugin.subprocessManager.fetchPendingApprovals` is not part of
+     `SubprocessManagerLike` — it exists only on `RemoteSubprocessManager`
+     (see that file's header). Reached for structurally, the same pattern
+     `PluginHost`'s own optional members use elsewhere in this file, so a
+     desktop/plugin host that has no such method makes this a no-op: nothing
+     here can regress local behavior, because `fetcher` is simply undefined
+     there and every call this class makes below is on already-null work. */
+  private async reconcilePendingApprovals(): Promise<void> {
+    const manager = this.plugin.subprocessManager as SubprocessManagerLike & {
+      fetchPendingApprovals?: (tabId: string) => Promise<ControlRequestEvent[]>;
+    };
+    const fetcher = manager.fetchPendingApprovals;
+    if (!fetcher) return;
+    let approvals: ControlRequestEvent[];
+    try {
+      approvals = await fetcher.call(manager, this.state.id);
+    } catch {
+      return;
+    }
+    if (this.destroyed || approvals.length === 0) return;
+    /* A pending approval means the daemon already has a live, busy child for
+       this tab. Without this, the reconciled card would render but Allow/Deny
+       would silently no-op — handleApproval() bails whenever `this.session`
+       is null, and ensureSession() is normally lazy (fires only from
+       submit()). ensureSession() is cheap and side-effect-free to call early
+       for the remote engine specifically: RemoteSubprocessManager.spawn()
+       only constructs a RemoteTabSession wrapper and PATCHes tab config — it
+       never starts a child, the daemon already has one. */
+    const session = await this.ensureSession();
+    if (this.destroyed || session !== this.session) return;
+    for (const event of approvals) {
+      if (this.state.pendingApprovals.has(event.request_id)) continue;
+      this.handleControlRequest(event);
+    }
+  }
+
+  /* The counterpart gap: a pending approval resolved on the gateway WITHOUT
+     going through handleApproval() here — TurnNotifier.resolve() (iOS)
+     posts an Allow/Deny straight to `POST /tabs/:id/approve` from a
+     notification action while the app may be backgrounded, entirely
+     bypassing this client. The live decision path (handleApproval) already
+     removes its own card optimistically before the frame round-trips back;
+     this is the ONLY path that clears a card resolved out from under a
+     foregrounded UI (e.g. the user backgrounded the app with a card showing,
+     tapped Allow on the notification, then came back to the same tab).
+     Wired from ensureSession() via RemoteTabSession.onApprovalResolved,
+     itself structural/optional for the same reason reconcilePendingApprovals
+     is. */
+  private dismissResolvedApproval(requestId: string, allowed: boolean): void {
+    if (!this.state.pendingApprovals.has(requestId)) return;
+    this.state.pendingApprovals.delete(requestId);
+    this.approvalArea.dismiss(requestId);
+    if (allowed) {
+      /* Mirror handleApproval's own allow branch: the assistant is about to
+         resume running the tool, so flip the display back to thinking and
+         re-arm the inactivity watchdog handleControlRequest suspended. */
+      this.statusIndicator.setThinking();
+      this.plugin.stateEmitter?.setState("thinking");
+    }
     this.onStateChangeCb();
   }
 

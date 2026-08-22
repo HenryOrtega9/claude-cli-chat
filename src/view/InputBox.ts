@@ -196,6 +196,13 @@ export type InputBoxCallbacks = {
      active voice pill. Caller (TabController) toggles the speech
      controller's pause state and reports it back via setVoicePaused. */
   onVoicePauseToggle: () => void;
+  /* Fired with the composer's current text so the caller can persist it as
+     TabState.draft. Debounced ~500ms while typing (see scheduleDraftPublish)
+     and flushed immediately on blur, visibilitychange, and TabController.hide
+     (tab switch) via the public flushDraft(). Also fired with "" immediately
+     on a successful submit. Optional — without it drafts simply aren't
+     persisted, which is how this behaved before draft persistence existed. */
+  onDraftChange?: (draft: string) => void;
   /* Return vault file matches for an @-mention query. Caller (TabController)
      reads from app.vault and ranks. Limit to ~20 results. */
   onMentionQuery: (query: string) => Suggestion[];
@@ -385,12 +392,26 @@ export class InputBox {
   /* destroy() flips this so late-firing callbacks (FileReader.onload after a
      tab close, deferred setTimeout handlers, etc.) can no-op safely. */
   private destroyed = false;
+  /* Debounce timer for onDraftChange — see scheduleDraftPublish(). 500ms,
+     matching Persistence's own per-tab save debounce downstream. */
+  private draftDebounceTimer: number | null = null;
+  /* Last draft value actually handed to onDraftChange (or restored from),
+     so publishDraft() can skip a redundant call — e.g. the debounce firing
+     after a blur-triggered flushDraft() already sent the same text. */
+  private lastPublishedDraft = "";
+  /* Bound once so add/removeEventListener in the constructor/destroy() refer
+     to the same function. Flushes the draft the moment the app backgrounds —
+     the moment a relaunch or an iOS background-kill can follow before the
+     500ms debounce would otherwise have fired. */
+  private readonly onVisibilityChange = () => {
+    if (document.visibilityState === "hidden") this.flushDraft();
+  };
 
   constructor(
     container: HTMLElement,
     settings: ClaudeChatSettings,
     callbacks: InputBoxCallbacks,
-    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode; incognito?: boolean; voice?: boolean }
+    initial?: { model?: ModelKey; effort?: EffortLevel; permissionMode?: PermissionMode; incognito?: boolean; voice?: boolean; draft?: string }
   ) {
     this.callbacks = callbacks;
     this.currentModel = initial?.model ?? settings.defaultModel;
@@ -417,13 +438,22 @@ export class InputBox {
     this.textarea.addEventListener("input", () => {
       this.autoResize();
       this.updateSuggestion();
+      this.scheduleDraftPublish();
     });
     this.textarea.addEventListener("click", () => this.updateSuggestion());
     this.textarea.addEventListener("blur", () => {
+      /* A blur is exactly the moment the user might switch apps next —
+         flush immediately rather than trusting the 500ms debounce. */
+      this.flushDraft();
       /* Defer so a click on a suggestion row can still register. */
       window.setTimeout(() => this.hideSuggestion(), 150);
     });
     this.textarea.addEventListener("paste", e => this.handlePaste(e));
+
+    /* Backgrounding (app switch, iOS home button, tab-away in a browser host)
+       can be followed by the OS killing the process before any timer fires.
+       Torn down in destroy(). */
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
 
     /* Drop handler on the wrapper covers both the textarea and the chip row.
        Adds a `.is-drop-target` class during a file drag so the user gets
@@ -787,6 +817,18 @@ export class InputBox {
       if (this.sendBtnIsStop) this.callbacks.onCancel();
       else this.submit();
     });
+
+    /* Restore whatever draft this tab had when it was last torn down (app
+       relaunch, plugin reload, iOS background-kill). Seed lastPublishedDraft
+       to the same value so the debounce's first tick is a no-op instead of
+       re-publishing the exact text it was just read back from. Placed at the
+       very end of the constructor so autoResize() sees the fully-laid-out
+       wrapper rather than a partially-built one. */
+    if (initial?.draft) {
+      this.textarea.value = initial.draft;
+      this.autoResize();
+    }
+    this.lastPublishedDraft = initial?.draft ?? "";
   }
 
   setBusy(busy: boolean) {
@@ -1068,6 +1110,11 @@ export class InputBox {
       window.clearTimeout(this.costPopupHideTimer);
       this.costPopupHideTimer = null;
     }
+    if (this.draftDebounceTimer !== null) {
+      window.clearTimeout(this.draftDebounceTimer);
+      this.draftDebounceTimer = null;
+    }
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
   }
 
   /* Mounts an external element (e.g. the active-file pill bar) just
@@ -1942,6 +1989,37 @@ export class InputBox {
     if (files.length > 0) void this.addFiles(files);
   }
 
+  /* Public entry for images that already arrive pre-encoded as data: URIs —
+     today only the iOS Share Extension (ShareInbox.swift's payload, routed
+     through `ios-web/src/shell.ts`'s `share` dispatch handler), which has
+     already downscaled and JPEG-encoded on the native side, so there is
+     nothing left to read off disk or a clipboard. Distinct from
+     addFiles/handlePaste (File-object driven, needs an ArrayBuffer read):
+     this just strips the `data:...;base64,` prefix and pushes straight onto
+     the same `attachments` array, so the resulting chip and the outgoing
+     ImageBlock are identical to any other attachment path. Synchronous (no
+     File/Blob decode step), so — unlike addFiles/handlePaste — there is no
+     mid-decode submit() race to guard against with an array-identity
+     snapshot. */
+  addImageAttachments(items: { mediaType: string; dataUri: string }[]): void {
+    if (this.destroyed || items.length === 0) return;
+    let added = 0;
+    for (const item of items) {
+      const data = item.dataUri.replace(/^data:[^,]*,/, "");
+      if (!data) continue;
+      /* Base64 inflates 3 bytes to 4 chars; estimate decoded size without
+         actually decoding, same cap addFiles/handlePaste enforce so a huge
+         shared image can't blow up the stream-json stdin line either. */
+      if (data.length * 0.75 > MAX_ATTACHMENT_BYTES) {
+        platform.notify(`Shared image is too large (max 10MB)`);
+        continue;
+      }
+      this.attachments.push({ kind: "image", mediaType: item.mediaType, data });
+      added += 1;
+    }
+    if (added > 0) this.renderAttachmentChips();
+  }
+
   /* Shared ingest path for both the + button and Finder drops. Decides per
      file whether it rides as an image block, a PDF document block, or as
      inlined text. Anything that fails the size cap or can't be decoded
@@ -2099,12 +2177,70 @@ export class InputBox {
     if (!text && this.attachments.length === 0 && !this.currentSelection) return;
     this.textarea.value = "";
     this.autoResize();
+    /* A successful submit definitively ends this draft. Cancel any pending
+       debounce (it would otherwise republish the just-cleared text a moment
+       later) and publish the clear immediately rather than waiting. */
+    if (this.draftDebounceTimer !== null) {
+      window.clearTimeout(this.draftDebounceTimer);
+      this.draftDebounceTimer = null;
+    }
+    if (this.lastPublishedDraft !== "") {
+      this.lastPublishedDraft = "";
+      this.callbacks.onDraftChange?.("");
+    }
     const attachments = this.attachments;
     const selection = this.currentSelection ?? undefined;
     this.attachments = [];
     this.currentSelection = null;
     this.renderContextRow();
     this.callbacks.onSubmit({ text, attachments, selection });
+  }
+
+  /* Debounce the composer's current text out to onDraftChange. Called on
+     every `input` event; the 500ms window means a burst of keystrokes yields
+     one call after typing pauses rather than one per character. */
+  private scheduleDraftPublish(): void {
+    if (this.draftDebounceTimer !== null) window.clearTimeout(this.draftDebounceTimer);
+    this.draftDebounceTimer = window.setTimeout(() => {
+      this.draftDebounceTimer = null;
+      this.publishDraft();
+    }, 500);
+  }
+
+  private publishDraft(): void {
+    if (this.destroyed) return;
+    const value = this.textarea.value;
+    if (value === this.lastPublishedDraft) return;
+    this.lastPublishedDraft = value;
+    this.callbacks.onDraftChange?.(value);
+  }
+
+  /* Force any pending debounced draft out right now, bypassing the 500ms
+     window. Called on blur, visibilitychange (backgrounding), and
+     TabController.hide() (switching to another tab) — the moments a
+     relaunch or an iOS background-kill can follow before the debounce would
+     otherwise have fired. Public so TabController can call it from hide(). */
+  public flushDraft(): void {
+    if (this.draftDebounceTimer !== null) {
+      window.clearTimeout(this.draftDebounceTimer);
+      this.draftDebounceTimer = null;
+    }
+    this.publishDraft();
+  }
+
+  /* Wipe the composer for a `/clear` or the header's "New chat" reset.
+     Cancels any pending debounce and resets the textarea; does NOT call
+     onDraftChange — TabController.clear() already owns state.draft directly
+     for this path and persists the clear itself via its own
+     onStateChangeCb() call. */
+  public clearDraftUi(): void {
+    if (this.draftDebounceTimer !== null) {
+      window.clearTimeout(this.draftDebounceTimer);
+      this.draftDebounceTimer = null;
+    }
+    this.lastPublishedDraft = "";
+    this.textarea.value = "";
+    this.autoResize();
   }
 
   private autoResize() {
