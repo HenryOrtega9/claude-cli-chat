@@ -48,6 +48,19 @@ function resolveElectronFilePath(file: File): string {
   return "";
 }
 
+/* True on hosts whose primary input is a finger (the iOS app), false in
+   Obsidian on the desktop. Used only to decide whether a control needs a
+   touch-reachable equivalent of a keyboard-only affordance; evaluated once
+   because the answer cannot change for the lifetime of a window. Guarded for
+   the non-browser environments that import this module's siblings. */
+const TOUCH_PRIMARY: boolean = (() => {
+  try {
+    return window.matchMedia?.("(hover: none) and (pointer: coarse)").matches === true;
+  } catch {
+    return false;
+  }
+})();
+
 /* btoa() needs a binary string. Building one with String.fromCharCode(...arr)
    blows the call stack on large images, so feed it in chunks. */
 function bytesToBase64(bytes: Uint8Array): string {
@@ -337,6 +350,10 @@ export class InputBox {
      re-render itself when shown without needing a fresh data load. */
   private costPayload: CostSurfacePayload | null = null;
   private sendBtn: HTMLElement;
+  /* True while the send button is showing its stop affordance (touch hosts
+     only — see setBusy). Kept so the icon swap runs on transitions rather
+     than on every setBusy call. */
+  private sendBtnIsStop = false;
   /* Floating "+" button at the bottom-left of the textarea — opens the native
      OS file picker. Pairs with the Finder drop handler so both ingest paths
      land in the same addFiles() pipeline. */
@@ -759,15 +776,34 @@ export class InputBox {
 
     this.sendBtn = this.bottomToolbar.createSpan({
       cls: "claudian-send-button",
-      attr: { "aria-label": "Send", title: "Send (Enter)" },
+      /* "(Enter)" is only true on a pointer host — see handleKeydown, where
+         a touch host leaves Enter as a plain newline. VoiceOver reads the
+         title along with the label, so a phone gets the plain word rather
+         than a hint that no longer describes what the key does. */
+      attr: { "aria-label": "Send", title: TOUCH_PRIMARY ? "Send" : "Send (Enter)" },
     });
     platform.setIcon(this.sendBtn, "send");
-    this.sendBtn.addEventListener("click", () => this.submit());
+    this.sendBtn.addEventListener("click", () => {
+      if (this.sendBtnIsStop) this.callbacks.onCancel();
+      else this.submit();
+    });
   }
 
   setBusy(busy: boolean) {
     this.busy = busy;
-    this.sendBtn.toggleClass("is-disabled", busy);
+    /* On a touch host the send button doubles as the stop control while a
+       turn runs, because cancelling is otherwise Escape-only and a phone has
+       no Escape key. On a pointer host nothing changes: the button greys out
+       exactly as before and Escape stays the way to cancel. */
+    const asStop = busy && TOUCH_PRIMARY;
+    this.sendBtn.toggleClass("is-disabled", busy && !asStop);
+    if (asStop !== this.sendBtnIsStop) {
+      this.sendBtnIsStop = asStop;
+      this.sendBtn.toggleClass("is-stop", asStop);
+      platform.setIcon(this.sendBtn, asStop ? "square" : "send");
+      this.sendBtn.setAttr("aria-label", asStop ? "Stop" : "Send");
+      this.sendBtn.setAttr("title", asStop ? "Stop this turn" : (TOUCH_PRIMARY ? "Send" : "Send (Enter)"));
+    }
   }
 
   /* Update the cost-surface pill and refresh the hover popup. Caller
@@ -795,8 +831,15 @@ export class InputBox {
     if (pinCount > 0) parts.push(`Pinned ${pinCount}`);
     if (payload.mcpServers.length > 0) {
       /* "MCP 2 (5 tools)" once we know tool counts; just "MCP 2" before
-         the first init lands. Singular tool stays "tool". */
-      const mcpLabel = toolCount > 0
+         the first init lands. Singular tool stays "tool".
+
+         On a touch host the suffix is dropped: the bottom toolbar (effort,
+         this pill, agents, attach, usage, send) is a single unwrapped row at
+         390px, and "(103 tools)" alone is wider than the send button needs to
+         stay reachable. The count still lives one tap away — the popup header
+         and every card in it repeat it — so nothing is actually lost, only
+         moved off the row that has no room for it. */
+      const mcpLabel = toolCount > 0 && !TOUCH_PRIMARY
         ? `MCP ${mcpCount} (${toolCount} tool${toolCount === 1 ? "" : "s"})`
         : `MCP ${mcpCount}`;
       parts.push(mcpLabel);
@@ -892,7 +935,8 @@ export class InputBox {
     this.costPopup.style.position = "absolute";
     const wrapperMidX = (wrapperRect.left + wrapperRect.right) / 2;
     const pillMidX = (pillRect.left + pillRect.right) / 2;
-    if (pillMidX > wrapperMidX) {
+    const costPinRight = pillMidX > wrapperMidX;
+    if (costPinRight) {
       this.costPopup.style.right = `${wrapperRect.right - pillRect.right}px`;
       this.costPopup.style.left = "";
     } else {
@@ -910,6 +954,11 @@ export class InputBox {
        server list (.claudian-cost-popup-server-list) is the scroll region. */
     const available = pillRect.top - 6 - 8;
     this.costPopup.style.maxHeight = `${Math.max(160, available)}px`;
+    this.publishPopupHeadroom(
+      this.costPopup,
+      pillRect.top,
+      costPinRight ? pillRect.right - 8 : window.innerWidth - pillRect.left - 8,
+    );
   }
 
   private scheduleCostPopupClose() {
@@ -1452,6 +1501,35 @@ export class InputBox {
     });
   }
 
+  /* Publish, as a CSS custom property on the popup, how much room actually
+     exists between its bottom anchor and the top of the nearest CLIPPING
+     ancestor (.claudian-tab-content-container is `overflow: hidden`).
+
+     Every popup here grows upward from a bottom anchor, so a tall one runs
+     under the header / tab bar and gets cut off with no way to scroll to the
+     hidden rows. On a phone that is the common case rather than the edge one:
+     the model list alone is taller than the space above the composer, and its
+     first entry ends up under the tab bar where a tap hits a tab badge.
+
+     Only a custom property is written, never a max-height, because the
+     desktop stylesheet does not reference the variable — the plugin's popups
+     keep behaving exactly as before, and ios.css turns the value into a
+     max-height plus a scroll region. */
+  private publishPopupHeadroom(popup: HTMLElement, anchorTop: number, availWidth?: number) {
+    const clip = this.wrapper.closest(".claudian-tab-content-container");
+    const clipTop = clip ? clip.getBoundingClientRect().top : 0;
+    /* 8px keeps the popup off the clip edge; the 160px floor stops it
+       collapsing to nothing in a very short viewport. */
+    const available = Math.max(160, Math.round(anchorTop - clipTop - 8));
+    popup.style.setProperty("--claudian-popup-avail", `${available}px`);
+    /* Same idea horizontally: a popup wider than the gap between its pinned
+       edge and the far side of the screen hangs off it. The attach popup's
+       280px minimum does exactly that when pinned to the + button. */
+    if (availWidth !== undefined) {
+      popup.style.setProperty("--claudian-popup-avail-width", `${Math.max(160, Math.round(availWidth))}px`);
+    }
+  }
+
   private createPopup(extraClass: string): HTMLElement {
     const popup = this.wrapper.createDiv({ cls: `claudian-popup ${extraClass}` });
     /* Stop clicks inside the popup from being treated as "outside" clicks. */
@@ -1480,7 +1558,8 @@ export class InputBox {
 
     const wrapperMidX = (wrapperRect.left + wrapperRect.right) / 2;
     const triggerMidX = (triggerRect.left + triggerRect.right) / 2;
-    if (triggerMidX > wrapperMidX) {
+    const pinRight = triggerMidX > wrapperMidX;
+    if (pinRight) {
       popup.style.right = `${wrapperRect.right - triggerRect.right}px`;
       popup.style.left = "";
     } else {
@@ -1490,6 +1569,11 @@ export class InputBox {
 
     popup.style.bottom = `${wrapperRect.bottom - triggerRect.top + 4}px`;
     popup.style.top = "";
+    this.publishPopupHeadroom(
+      popup,
+      triggerRect.top,
+      pinRight ? triggerRect.right - 8 : window.innerWidth - triggerRect.left - 8,
+    );
 
     /* outsideHandler closes the popup when the user clicks anywhere else
        on the page — EXCEPT on a toolbar pill or the attach + button, which
@@ -1593,6 +1677,15 @@ export class InputBox {
     if (e.key !== "Enter") return;
     if (e.isComposing) return;
     if (e.shiftKey) return;
+    /* On a touch host there is no Shift key riding along with the software
+       keyboard's return key, so "Enter submits, Shift+Enter newlines" — the
+       desktop convention this handler otherwise implements — would make
+       every return keystroke send the message, with no way to type a second
+       line short of pasting one in. Phones instead get the opposite default,
+       matching every other iOS chat app: return inserts a newline (the
+       textarea's native behavior, so nothing here needs to run) and the send
+       button in the toolbar is the only way to submit. */
+    if (TOUCH_PRIMARY) return;
     e.preventDefault();
     e.stopPropagation();
     this.submit();
@@ -1654,6 +1747,11 @@ export class InputBox {
   private renderSuggestionRows() {
     if (!this.suggestion) return;
     const { el, items, activeIndex } = this.suggestion;
+    /* The @ / slash list is CSS-anchored to the wrapper's top edge and grows
+       upward, so it needs the same headroom hint as the click-driven popups.
+       Recomputed on every render because the wrapper moves as the textarea
+       grows. */
+    this.publishPopupHeadroom(el, this.wrapper.getBoundingClientRect().top);
     el.empty();
     let activeRow: HTMLElement | null = null;
     items.forEach((item, i) => {

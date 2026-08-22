@@ -8,6 +8,25 @@ export type MessageActionCallbacks = {
   onFork: (messageId: string) => void;
 };
 
+/* True on a touch-primary host (the iOS app). Mirrors the same check in
+   TabBar.ts / InputBox.ts (each file keeps its own copy rather than sharing
+   an import — it's five lines and none of these files otherwise depend on
+   each other). Used only to gate the floating scroll-to-bottom button below:
+   on a desktop pointer, scroll wheel/trackpad already reach the bottom in
+   one gesture and a mouse can grab the scrollbar, so the button would be a
+   new, un-asked-for permanent fixture over the transcript. On a phone,
+   scrolling away from a long streaming reply to re-read earlier text is
+   common, and swiping back down through everything that streamed in the
+   meantime is not a reasonable way to return to it. */
+function isTouchHost(): boolean {
+  try {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+    return window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+  } catch {
+    return false;
+  }
+}
+
 /* MessageRenderer manages DOM for the message list. It caches per-message
    elements in `liveEls` so streaming partial updates can mutate the existing
    bubble in place without re-rendering the entire list.
@@ -61,6 +80,12 @@ export class MessageListRenderer {
      every layout pass — used to trail the status pill at the end of the
      visible message stream. Reference survives reset() so we can re-attach. */
   private tailEl: HTMLElement | null = null;
+  /* Touch-only floating "jump to latest" button — see isTouchHost(). Null on
+     every other host, including when the container has no scrollable parent
+     yet (defensive; TabController always appends messagesEl to the wrapper
+     before constructing this class, but nothing here should hard-depend on
+     that ordering). */
+  private scrollBottomBtn: HTMLElement | null = null;
 
   constructor(app: AppHandle, component: RenderLifecycle, container: HTMLElement) {
     this.app = app;
@@ -76,6 +101,37 @@ export class MessageListRenderer {
        counts as being at the bottom. Margin of 80px lets the user be
        slightly off-bottom and still trigger stickiness. */
     this.observeSentinel();
+
+    if (isTouchHost()) {
+      /* Mounted on the scrolling wrapper (container's parent), not on
+         `container` itself — container is the flex content that grows with
+         every message, and an absolutely-positioned child of a growing flex
+         item is positioned relative to ITS box, not the visible viewport, so
+         the button would drift down the page instead of staying pinned in
+         the corner. The wrapper's box is the stable, viewport-sized one. */
+      const anchor = this.container.parentElement ?? this.container;
+      this.scrollBottomBtn = anchor.createDiv({
+        cls: "claudian-scroll-bottom-btn",
+        attr: { "aria-label": "Scroll to latest message", title: "Scroll to latest", role: "button", tabindex: "0" },
+      });
+      platform.setIcon(this.scrollBottomBtn, "chevron-down");
+      this.scrollBottomBtn.style.display = "none";
+      const jump = () => {
+        /* Hide immediately rather than waiting on the IntersectionObserver
+           round-trip — scrollIntoView's own scroll re-triggers the observer
+           a frame later and confirms the state, but a same-frame hide is
+           what makes the tap feel like it did something. */
+        if (this.scrollBottomBtn) this.scrollBottomBtn.style.display = "none";
+        this.forceStickToBottom();
+      };
+      this.scrollBottomBtn.addEventListener("click", jump);
+      this.scrollBottomBtn.addEventListener("keydown", e => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          jump();
+        }
+      });
+    }
   }
 
   /* One observer definition for both the constructor and reset(). */
@@ -91,6 +147,9 @@ export class MessageListRenderer {
         if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
         for (const entry of entries) {
           this.stickToBottom = entry.isIntersecting;
+          if (this.scrollBottomBtn) {
+            this.scrollBottomBtn.style.display = entry.isIntersecting ? "none" : "";
+          }
         }
       },
       { root: null, rootMargin: "0px 0px 80px 0px", threshold: 0.01 }
@@ -103,6 +162,10 @@ export class MessageListRenderer {
     this.resizeObserver = null;
     this.intersectionObserver?.disconnect();
     this.intersectionObserver = null;
+    /* Lives outside `container`, so container.empty()/detach() elsewhere in
+       the teardown path never reaches it. */
+    this.scrollBottomBtn?.detach();
+    this.scrollBottomBtn = null;
   }
 
   setActionCallbacks(cb: MessageActionCallbacks) {
@@ -114,6 +177,10 @@ export class MessageListRenderer {
     this.bottomSentinel = this.container.createDiv({ cls: "claudian-bottom-sentinel" });
     this.intersectionObserver?.disconnect();
     this.observeSentinel();
+    /* Lives on the wrapper, not `container`, so the empty() above left it
+       standing — but a fresh/cleared conversation has nothing above the fold
+       to jump back to. */
+    if (this.scrollBottomBtn) this.scrollBottomBtn.style.display = "none";
     this.liveEls.clear();
     this.toolEls.clear();
     this.thinkingOpenOverride.clear();

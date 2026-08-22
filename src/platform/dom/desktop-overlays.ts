@@ -197,9 +197,16 @@ export class DomModalHost implements ModalHost {
 
     this.modalEl = containerEl.createDiv({ cls: "modal" });
     /* Focusable so keystrokes land on the modal rather than whatever the
-       panel had focused; -1 keeps it out of the tab order. */
+       panel had focused; -1 keeps it out of the tab order. role/aria-modal
+       are what tell VoiceOver (or any other screen reader) this is a modal
+       layer at all — without them a rotor swipe walks straight through to
+       the dimmed page behind it, which reads as the app doing nothing. */
     this.modalEl.setAttr("tabindex", "-1");
+    this.modalEl.setAttr("role", "dialog");
+    this.modalEl.setAttr("aria-modal", "true");
     const closeEl = this.modalEl.createDiv({ cls: "modal-close-button" });
+    closeEl.setAttr("role", "button");
+    closeEl.setAttr("aria-label", "Close");
     closeEl.addEventListener("click", () => this.close());
     this.titleEl = this.modalEl.createDiv({ cls: "modal-title" });
     this.contentEl = this.modalEl.createDiv({ cls: "modal-content" });
