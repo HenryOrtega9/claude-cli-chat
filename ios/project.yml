@@ -45,11 +45,11 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
-        CFBundleDisplayName: Vault Gateway
+        CFBundleDisplayName: "Claude & Second Brain"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen:
-          UIColorName: ""
+          UIColorName: LaunchBackground
         UIUserInterfaceStyle: Dark
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -63,7 +63,7 @@ targets:
         # iOS prompts for the raw-IP override path, so the copy has to be true
         # for both.
         NSLocalNetworkUsageDescription: >-
-          Vault Gateway connects to the Claude gateway running on your Mac.
+          Claude & Second Brain connects to the Claude gateway running on your Mac.
           If your Mac is on the same Wi-Fi instead of Tailscale, iOS needs
           local network access to reach it.
         # Scoped ATS exception, NOT NSAllowsArbitraryLoads. The gateway speaks
@@ -79,6 +79,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.henryortega.vaultgateway
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: 1
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: NO
         ENABLE_USER_SCRIPT_SANDBOXING: YES

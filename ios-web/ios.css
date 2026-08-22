@@ -51,6 +51,19 @@ body {
   height: 100%;
   margin: 0;
   overscroll-behavior: none;
+  /* Belt-and-suspenders alongside the viewport meta's user-scalable=no: this
+     is what actually tells WebKit a double-tap on plain chrome (a pill, a
+     header button, empty space between messages) is not a zoom gesture, so
+     it dispatches the second tap immediately instead of waiting out the
+     zoom-detection window. `manipulation` (not `pan-y`) deliberately: the
+     used touch-action for a gesture is the INTERSECTION of every ancestor's
+     value down to the touched element, so pan-y here would have silently
+     killed horizontal panning everywhere — the tab strip, the bottom
+     toolbar, code blocks and tables, all of which scroll sideways.
+     `manipulation` keeps panning open in both axes and only drops
+     pinch-zoom/double-tap-zoom, which is the one gesture actually unwanted
+     here. */
+  touch-action: manipulation;
 }
 
 /* The dev browser has no native gradient behind it, so paint one
@@ -133,6 +146,63 @@ body {
 
 #app .claudian-tab-badges {
   flex-wrap: nowrap;
+}
+
+/* ---- Closing a tab on a touch screen -----------------------
+   Desktop closes a tab with middle-click or right-click, neither
+   of which a finger can produce, so TabBar adds two touch-only
+   affordances (both gated on `(hover: none) and (pointer: coarse)`
+   in TS, so the plugin build never grows them):
+
+     - press-and-hold any badge -> the shared one-item close menu
+     - the ACTIVE badge carries an x, sized as its own 40px target
+
+   The badge is `inline-flex`, so the x is simply the second flex
+   item next to the index number. iOS also wants the long press
+   itself neutralized: without the callout/selection suppression
+   below, holding a badge raises the system text-selection loupe
+   over the menu we just opened. */
+#app .claudian-tab-badge {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app .claudian-tab-badge-close {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  /* 14px of lead-in keeps the index optically centred in the space
+     left of the x; the badge itself stays 40px tall, so the pair
+     reads as one control rather than two buttons. */
+  #app .claudian-tab-badge-active {
+    padding-left: 14px;
+    padding-right: 0;
+  }
+
+  #app .claudian-tab-badge-active .claudian-tab-badge-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    margin-left: 2px;
+    flex: 0 0 auto;
+    border-radius: 0 4px 4px 0;
+    color: var(--text-muted);
+  }
+
+  #app .claudian-tab-badge-close svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* No hover on a phone, so :active is the only press feedback there is. */
+  #app .claudian-tab-badge-close:active {
+    background: rgba(255, 255, 255, 0.12);
+    color: var(--text-normal);
+  }
 }
 
 /* ---- Connectivity strip ------------------------------------
@@ -241,29 +311,55 @@ body {
      simply be un-hidden either: the toolbar is an absolutely
      positioned pill anchored at `top: 100%`, so with nothing to
      hide it it lands on top of whatever follows the message.
-     Keep the desktop geometry — it is what puts the pill under
-     the right bubble — and reserve the space it occupies, so the
-     pill has somewhere to sit instead of covering the next
-     message. Dimmed until touched.
+     Reserving a fixed margin under every message for it to land
+     in looked heavy and still collided with the next row.
 
-     The reserve has to match the pill's real height, which on a
-     coarse pointer is the 40px minimum touch target below plus
-     its 3px padding either side = 46px; 52px leaves a 6px gap so
-     the next row does not sit flush against it. 30px was not
-     enough and the pill crossed the following tool row. */
-  #app .claudian-message {
-    margin-bottom: 52px;
-  }
-
+     Instead the toolbar joins the flow: it is the last child of
+     the bubble, so `position: static` drops it right under the
+     content as a quiet, right-aligned row of two glyphs with no
+     card chrome. The row is exactly as tall as its 40px targets
+     and pushes whatever follows down by that much, so nothing
+     can overlap. Dimmed until touched. */
   #app .claudian-message-actions {
-    opacity: 0.45;
+    position: static;
+    display: flex;
+    justify-content: flex-end;
+    gap: 4px;
+    /* Pull the row up into the bubble's bottom padding so it
+       reads as a footer of the message, not a spacer after it. */
+    margin: 0 -6px -6px 0;
+    padding: 0;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    opacity: 0.5;
     visibility: visible;
     transition: opacity 120ms ease;
+  }
+
+  /* Assistant bubbles have zero padding (styles.css), so there
+     is nothing to pull into. */
+  #app .claudian-message-assistant .claudian-message-actions {
+    margin: 0;
   }
 
   #app .claudian-message-actions:active,
   #app .claudian-message-actions:focus-within {
     opacity: 1;
+  }
+
+  /* A tool-only pass renders an assistant bubble whose content is
+     one empty text block (the tool row itself is a sibling of the
+     bubble). Desktop never reveals its toolbar because there is
+     nothing to hover; in-flow it would be a stray row of glyphs
+     with nothing to copy or fork, stacked under the real one. */
+  #app .claudian-message-assistant:not(:has(> .claudian-message-content > :not(:empty))) .claudian-message-actions {
+    display: none;
+  }
+
+  #app .claudian-message-action svg {
+    width: 16px;
+    height: 16px;
   }
 
   /* The donut's "Nk / Mk" chip is toggled by the delegated tap
@@ -325,15 +421,31 @@ body {
 /* ---- Narrow-viewport fits ----------------------------------
    Desktop minimums that overflow a 390px screen. */
 
-/* The bottom toolbar (effort, MCP, agents, attach, usage, send)
-   is an unwrapped flex row sized for a sidebar. At 390px the MCP
-   pill's "(103 tools)" suffix forces a line break inside the
-   pill and pushes the send button off the right edge. Wrapping
-   the ROW instead keeps every pill whole and the send button
-   reachable. */
+/* The bottom toolbar (effort, MCP, agents, attach, usage, send) is an
+   unwrapped flex row sized for a sidebar. At 390px the MCP pill's full
+   "(103 tools)" suffix alone was wider than the slack left once every other
+   pill took its share, which forced a line break and pushed the send button
+   onto its own row under everything else — reachable, but a second row of
+   chrome eating vertical space on every tab, every time.
+
+   InputBox.setCostSurface drops that suffix on a touch host (TOUCH_PRIMARY),
+   which is the fix that actually buys back the width; this stays a single
+   nowrap row and gets that width back rather than wrapping around a label
+   that no longer needs the room. Pills keep flex-shrink: 0 so none of them
+   crush their text to fit — if a still-longer label shows up later
+   (many-digit tool/agent counts, a long custom model name) the row scrolls
+   horizontally instead of wrapping or clipping, same pattern as the tab
+   strip above it. */
 #app .claudian-input-toolbar-bottom {
-  flex-wrap: wrap;
-  row-gap: 6px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+#app .claudian-input-toolbar-bottom::-webkit-scrollbar {
+  display: none;
 }
 
 #app .claudian-input-toolbar-bottom .claudian-toolbar-pill {
@@ -341,19 +453,185 @@ body {
   white-space: nowrap;
 }
 
-#app .claudian-send-button {
+#app .claudian-send-button,
+#app .claudian-attach-button {
   flex-shrink: 0;
-  margin-left: auto;
-}
-#app .claudian-popup,
-#app .claudian-popup-attach {
-  max-width: calc(100vw - 24px);
 }
 
-#app .claudian-cost-popup {
-  max-width: calc(100vw - 24px);
-  max-height: 60vh;
+#app .claudian-send-button {
+  margin-left: auto;
+}
+
+/* ---- Top toolbar row (mode, incognito, voice, model) --------
+   styles.css wraps this row, which at sidebar widths is the right
+   call; at 390px it always wraps, dropping the model pill onto a
+   second line under the chips. The row fits on one line once the
+   two binary toggles collapse to icon-only chips (their aria-labels
+   still carry the words), and the model pill is the one thing
+   allowed to shrink, with an ellipsis, so an active voice cluster
+   (pause + speaking bars) can never push it off the row either. */
+#app .claudian-input-toolbar-top {
+  flex-wrap: nowrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* "ACCEPT EDITS Mode" is the widest thing on the row, and the word
+   Mode adds nothing a phone user needs: the value is the mode. With
+   it gone, "Opus Plan → Sonnet" (the longest model readout, via
+   badge included) fits beside the chips without an ellipsis. */
+#app .claudian-mode-pill .claudian-toolbar-pill-label {
+  display: none;
+}
+
+#app .claudian-input-toolbar-top .claudian-model-pill {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#app .claudian-model-pill .claudian-toolbar-pill-value {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The incognito and voice chips carry their icon as an emoji text
+   node (🕶 / 🔊). WKWebView in the simulator draws both as a "?"
+   placeholder glyph, and an emoji in a chip does not match the
+   lucide line icons everywhere else in the UI anyway. Replace the
+   glyph with a lucide icon drawn through a mask so it inherits the
+   chip's colour in every state (muted off, tinted on, dimmed
+   locked) with no change to the shared markup. The text node stays
+   in the DOM at zero size so copy/paste and the grayscale filter
+   rules in styles.css keep working untouched. */
+#app .claudian-incognito-pill,
+#app .claudian-voice-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  padding: 3px 8px;
+}
+
+#app .claudian-incognito-pill .claudian-toolbar-pill-value,
+#app .claudian-voice-pill .claudian-toolbar-pill-value {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: 0;
+  line-height: 0;
+  color: var(--text-muted);
+}
+
+#app .claudian-incognito-pill .claudian-toolbar-pill-value::before,
+#app .claudian-voice-pill .claudian-toolbar-pill-value::before {
+  content: "";
+  display: block;
+  width: 18px;
+  height: 18px;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+/* lucide "venetian-mask" */
+#app .claudian-incognito-pill .claudian-toolbar-pill-value::before {
+  -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M18 11c-1.5 0-2.5.5-3 2'/><path d='M4 6a2 2 0 0 0-2 2v4a5 5 0 0 0 5 5 8 8 0 0 1 5 2 8 8 0 0 1 5-2 5 5 0 0 0 5-5V8a2 2 0 0 0-2-2h-3a8 8 0 0 0-5 2 8 8 0 0 0-5-2z'/><path d='M6 11c1.5 0 2.5.5 3 2'/></svg>");
+  mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M18 11c-1.5 0-2.5.5-3 2'/><path d='M4 6a2 2 0 0 0-2 2v4a5 5 0 0 0 5 5 8 8 0 0 1 5 2 8 8 0 0 1 5-2 5 5 0 0 0 5-5V8a2 2 0 0 0-2-2h-3a8 8 0 0 0-5 2 8 8 0 0 0-5-2z'/><path d='M6 11c1.5 0 2.5.5 3 2'/></svg>");
+}
+
+/* lucide "volume-2": the voice pill is text-to-speech OUT (the
+   plugin never listens), so a speaker is the honest glyph, matching
+   the 🔊 it replaces. */
+#app .claudian-voice-pill .claudian-toolbar-pill-value::before {
+  -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z'/><path d='M16 9a5 5 0 0 1 0 6'/><path d='M19.364 18.364a9 9 0 0 0 0-12.728'/></svg>");
+  mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z'/><path d='M16 9a5 5 0 0 1 0 6'/><path d='M19.364 18.364a9 9 0 0 0 0-12.728'/></svg>");
+}
+
+/* Tinted-on states: styles.css colours the LABEL and un-greys the
+   emoji; with the label hidden the icon has to carry the tint. */
+#app .claudian-incognito-pill.is-active .claudian-toolbar-pill-value { color: #a78bfa; }
+#app .claudian-voice-pill.is-active .claudian-toolbar-pill-value { color: #2dd4bf; }
+
+/* Icon-only on the phone. */
+#app .claudian-incognito-pill .claudian-toolbar-pill-label,
+#app .claudian-voice-pill .claudian-toolbar-pill-label {
+  display: none;
+}
+/* Every composer popup anchors to a bottom edge and grows UPWARD, into a
+   region that on a phone is only ~500px tall and is clipped by
+   .claudian-tab-content-container (overflow: hidden) below the header and
+   tab bar. Unclamped, the model list's first entry sits under the tab bar:
+   invisible, and a tap on it hits a tab badge instead. InputBox publishes
+   the real headroom above the anchor as --claudian-popup-avail on each
+   popup; capping to it and scrolling the overflow keeps every row both
+   visible and tappable. The 60vh fallback only applies if a popup is ever
+   shown without the anchor pass running. */
+#app .claudian-popup,
+#app .claudian-popup-attach,
+#app .claudian-suggestion-popup {
+  max-width: min(calc(100vw - 24px), var(--claudian-popup-avail-width, 100vw));
+  max-height: var(--claudian-popup-avail, 60vh);
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* The cost popup sets its own inline max-height from the VIEWPORT top, which
+   overshoots by the height of the header + tab bar; the headroom variable is
+   measured from the clip edge instead, so it has to win over the inline
+   style. */
+#app .claudian-cost-popup {
+  max-width: min(calc(100vw - 24px), var(--claudian-popup-avail-width, 100vw));
+  max-height: var(--claudian-popup-avail, 60vh) !important;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* "Add folder…" and the trusted-folder list it feeds cannot work here: the
+   row opens the iOS document picker, whose files live on the phone, and the
+   handler needs an absolute path from Electron's File.path / webUtils, which
+   no browser exposes — so every attempt ends in "Couldn't read the folder
+   path". Even a successful pick would name a path the Mac-side gateway
+   cannot resolve. "Pick a file…" (first child) stays: it reads the file's
+   BYTES, so a phone-local file attaches fine. */
+/* min-width beats max-width in CSS, so the attach popup's 280px desktop
+   floor would defeat the clamp above and keep hanging off the left edge when
+   pinned to the + button. The other popups keep their 140px floor, which is
+   always under the 160px minimum the clamp can report. */
+#app .claudian-popup-attach {
+  min-width: 0;
+}
+
+#app .claudian-popup-attach > .claudian-popup-row-action:not(:first-child) {
+  display: none;
+}
+
+/* With the only way to ADD one gone, an empty trusted-folder section is just
+   a header over nothing, and its empty-state copy points at a button that is
+   no longer there. Folders added from the desktop plugin still list here, and
+   stay toggleable. */
+#app .claudian-popup-attach:not(:has(.claudian-popup-row-folder)) > .claudian-popup-divider,
+#app .claudian-popup-attach:not(:has(.claudian-popup-row-folder)) > .claudian-popup-section-header,
+#app .claudian-popup-attach > .claudian-popup-section-empty {
+  display: none;
+}
+
+/* While a turn is running the send button becomes the stop control (see
+   InputBox.setBusy) — a phone has no Escape key, which is the only other way
+   to cancel. Red so it reads as an interrupt rather than a disabled send. */
+#app .claudian-send-button.is-stop {
+  background: #b3261e;
+  opacity: 1;
 }
 
 .modal {
@@ -362,10 +640,37 @@ body {
   max-height: calc(100vh - var(--vgw-safe-top) - var(--vgw-safe-bottom) - 32px);
 }
 
+/* app/desktop.css sizes the close × at 24x24, fine for a mouse pointer but
+   under the ~40px floor a fingertip needs. The glyph itself (flex-centered
+   inside the button) should not visibly grow, so the box is enlarged and
+   pulled back by half the delta on each side rather than just bumping
+   width/height, which would also shove it further from the modal's corner. */
+@media (pointer: coarse) {
+  .modal-close-button {
+    width: 40px;
+    height: 40px;
+    top: 2px;
+    right: 4px;
+  }
+}
+
 .modal-container,
 .prompt {
   padding-top: var(--vgw-safe-top);
   padding-bottom: var(--vgw-safe-bottom);
+}
+
+/* MCP manager / subagent list / history rows can run long enough to scroll.
+   Modern WebKit already does momentum scrolling on a plain `overflow-y:auto`
+   region, but without `overscroll-behavior: contain` a fast flick that hits
+   the top or bottom of the list chains into whatever is behind the modal —
+   here that's the fixed, non-scrolling page, so the visible symptom is the
+   list momentarily rubber-banding against nothing. Containing the scroll to
+   the region it started in fixes that with no behavior change once the list
+   is shorter than the modal. */
+.modal-content {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .prompt {
@@ -396,6 +701,46 @@ body {
 #app .claudian-diff {
   max-width: 100%;
   overflow-x: auto;
+}
+
+/* ---- Scroll-to-latest ----------------------------------------
+   Created only on a touch host (MessageListRenderer, isTouchHost()) — a
+   mouse/trackpad already reaches the bottom of a long transcript in one
+   scroll-wheel flick or a scrollbar grab, so this would be unwanted chrome
+   on the plugin/desktop build. On a phone, scrolling up mid-stream to
+   re-read something is common and swiping back down through everything
+   that streamed in the meantime is not a reasonable way back. */
+#app .claudian-messages-wrapper {
+  position: relative;
+}
+
+#app .claudian-scroll-bottom-btn {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 4;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--vgw-glass-bg);
+  -webkit-backdrop-filter: var(--vgw-blur);
+  backdrop-filter: var(--vgw-blur);
+  border: 1px solid var(--vgw-glass-border);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), inset 0 1px 0 0 var(--vgw-glass-highlight);
+  color: var(--text-normal);
+  cursor: pointer;
+}
+
+#app .claudian-scroll-bottom-btn:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+#app .claudian-scroll-bottom-btn svg {
+  width: 18px;
+  height: 18px;
 }
 
 /* ---- Welcome ------------------------------------------------

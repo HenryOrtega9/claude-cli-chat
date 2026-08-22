@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Vault Gateway</string>
+	<string>Claude &amp; Second Brain</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -40,11 +40,11 @@
 		</dict>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Vault Gateway connects to the Claude gateway running on your Mac. If your Mac is on the same Wi-Fi instead of Tailscale, iOS needs local network access to reach it.</string>
+	<string>Claude &amp; Second Brain connects to the Claude gateway running on your Mac. If your Mac is on the same Wi-Fi instead of Tailscale, iOS needs local network access to reach it.</string>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>
-		<string></string>
+		<string>LaunchBackground</string>
 	</dict>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>

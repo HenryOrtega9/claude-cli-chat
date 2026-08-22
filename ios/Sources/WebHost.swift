@@ -42,6 +42,7 @@ struct WebHost: UIViewRepresentable {
         config.userContentController = controller
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        context.coordinator.bridge = bridge
         context.coordinator.onPageLoad = onPageLoad
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
@@ -66,6 +67,7 @@ struct WebHost: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
+        context.coordinator.bridge = bridge
         context.coordinator.onPageLoad = onPageLoad
         applyInspectable(webView)
     }
@@ -92,15 +94,24 @@ struct WebHost: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         weak var webView: WKWebView?
+        weak var bridge: NativeBridge?
         var onPageLoad: () -> Void = {}
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Before onPageLoad: it dispatches `connectivity` (and the DEBUG
+            // autosend hook dispatches `share`), both of which must land on a
+            // page that can actually receive them.
+            bridge?.markPageReady()
             onPageLoad()
         }
 
         /// The content process can be jetsammed while the app sits in the
         /// background; without this the user comes back to a white void.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            // The reload's page hasn't re-run its module script yet, so any
+            // dispatch issued before the next didFinish must queue rather than
+            // evaluate into a `window.__vaultgw` that no longer exists.
+            bridge?.markPageNotReady()
             webView.load(URLRequest(url: WebSchemeHandler.indexURL))
         }
 

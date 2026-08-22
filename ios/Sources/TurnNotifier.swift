@@ -211,8 +211,36 @@ extension TurnNotifier: URLSessionDownloadDelegate {
            which is exactly what a background turn looks like when it fails.
            Accept a bare frame too, so a future flattening cannot regress it. */
         let frame = (body["frame"] as? [String: Any]) ?? body
-        Self.log.info("wait delivered t=\(frame["t"] as? String ?? "?", privacy: .public) tab=\(downloadTask.taskDescription ?? "?", privacy: .public)")
-        notify(frame: frame, tabHint: downloadTask.taskDescription)
+        let tab = downloadTask.taskDescription ?? ""
+        Self.log.info("wait delivered t=\(frame["t"] as? String ?? "?", privacy: .public) tab=\(tab, privacy: .public)")
+        switch frame["t"] as? String {
+        case "turn_done", "approval_request":
+            notify(frame: frame, tabHint: tab)
+        default:
+            /* The server clamps `timeout` to WAIT_MAX_S (300 s; see
+               scripts/gateway/src/server.ts) regardless of the 600 s this
+               client asks for, and there is no re-arm anywhere else — a turn
+               that legitimately runs longer than 5 minutes used to go
+               completely silent the moment the first poll timed out, because
+               `wait_timeout` fell into this same "nothing finished, say
+               nothing" branch with no follow-up. Re-arm from the lastSeq the
+               gateway just reported so the wait keeps spanning the turn
+               across as many 300 s polls as it takes.
+
+               Only do this for the documented `partial: true` timeout shape.
+               A malformed/error body (401 after the token was revoked while
+               backgrounded, 404 if the tab was deleted, an unreadable frame)
+               must not re-arm, or a bad token turns into a tight poll loop
+               against the gateway for as long as the OS keeps scheduling the
+               background session. */
+            guard body["partial"] as? Bool == true, !tab.isEmpty else {
+                Self.log.info("no notification, no re-arm for frame t=\(frame["t"] as? String ?? "?", privacy: .public) tab=\(tab, privacy: .public)")
+                return
+            }
+            let lastSeq = (body["lastSeq"] as? Int) ?? 0
+            Self.log.info("wait re-arming after timeout tab=\(tab, privacy: .public) since=\(lastSeq, privacy: .public)")
+            arm(tab: tab, since: lastSeq)
+        }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

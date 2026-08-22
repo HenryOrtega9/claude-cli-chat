@@ -69,9 +69,21 @@ enum GatewayConfig {
     }
 
     static func url(_ path: String) -> URL? {
+        // `URLComponents.port`'s setter traps (Fatal error, not a thrown error
+        // or a nil result) on a negative value. Settings' port field is a bare
+        // numeric TextField with no range clamp, so typing e.g. "-1" persists
+        // straight into AppStorage; the very next call here — the foreground
+        // health probe fires within moments of every launch — would then crash
+        // the app on startup, every time, with no in-app way to fix it. Reject
+        // out-of-range values (and an empty host, which otherwise builds a
+        // technically-valid but useless "scheme://:port" URL) before they ever
+        // reach the setter, so a bad stored value degrades to the existing
+        // "Bad gateway URL. Check Settings." failure instead of a crash loop.
+        let host = effectiveHost
+        guard !host.isEmpty, (1...65535).contains(port) else { return nil }
         var components = URLComponents()
         components.scheme = scheme == "https" ? "https" : "http"
-        components.host = effectiveHost
+        components.host = host
         components.port = port
         guard let base = components.url else { return nil }
         return URL(string: path, relativeTo: base)?.absoluteURL

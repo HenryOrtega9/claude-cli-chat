@@ -48,7 +48,15 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
         queue.async { [weak self] in
             guard let self else { return }
             let resolved = self.resolve(url)
-            guard !self.isStopped(key) else { return }
+            // `stop` may have landed while `resolve` was running; either way,
+            // the ObjectIdentifier it inserted must not linger in `stopped`
+            // forever, or a reload that cancels a batch of in-flight tasks
+            // (webViewWebContentProcessDidTerminate) leaks one entry per task
+            // for the life of the WKWebView.
+            guard !self.isStopped(key) else {
+                self.clearStopped(key)
+                return
+            }
             guard let resolved, let data = try? Data(contentsOf: resolved.file) else {
                 self.finish(urlSchemeTask, key: key, status: 404,
                             data: Data("Not found".utf8), mime: "text/plain; charset=utf-8",
@@ -72,6 +80,12 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
         return stopped.contains(key)
     }
 
+    private func clearStopped(_ key: ObjectIdentifier) {
+        lock.lock()
+        stopped.remove(key)
+        lock.unlock()
+    }
+
     private func finish(
         _ task: any WKURLSchemeTask, key: ObjectIdentifier,
         status: Int, data: Data, mime: String, url: URL
@@ -87,7 +101,11 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
             url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers
         ) else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self, !self.isStopped(key) else { return }
+            guard let self else { return }
+            guard !self.isStopped(key) else {
+                self.clearStopped(key)
+                return
+            }
             task.didReceive(response)
             task.didReceive(data)
             task.didFinish()

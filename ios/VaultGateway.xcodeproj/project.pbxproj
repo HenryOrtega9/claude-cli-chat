@@ -16,6 +16,7 @@
 		55447A040EB86A1F8234EE15 /* NativeBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */; };
 		5A0BA34A95404F6D3333DFFB /* GatewayConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */; };
 		64463D6ED640DC5ECE5665E2 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */; };
+		679BCC6B623837AB82963D0B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2648DC2BCD105AD42D1B031B /* Assets.xcassets */; };
 		6AECBC61B45F0AC194E5B99F /* Secrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7113B675BCE7B8D5B0CA854 /* Secrets.swift */; };
 		719887B024880E7B5AAD2BE8 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */; };
 		80DE10F676FB711FAE44D05B /* ConnectivityMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */; };
@@ -26,6 +27,7 @@
 /* Begin PBXFileReference section */
 		0FDF4E4B00D8A1CBB0695CF4 /* Web */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Web; sourceTree = SOURCE_ROOT; };
 		222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		2648DC2BCD105AD42D1B031B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		289B9DC854FA17A849B935DA /* VaultGatewayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultGatewayApp.swift; sourceTree = "<group>"; };
 		4041BF1C59EF00F173A0256D /* TurnNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnNotifier.swift; sourceTree = "<group>"; };
 		487B5693410A068B4A5E21CE /* WebHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebHost.swift; sourceTree = "<group>"; };
@@ -64,6 +66,7 @@
 		CDF5C9ECE8D5E4B7660399BA /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				2648DC2BCD105AD42D1B031B /* Assets.xcassets */,
 				974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */,
 				FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */,
 				5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */,
@@ -143,6 +146,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				679BCC6B623837AB82963D0B /* Assets.xcassets in Resources */,
 				47DD83B146FE7DF3ED8C6806 /* Web in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

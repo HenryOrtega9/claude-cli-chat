@@ -27,6 +27,18 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
 
     @Published private(set) var safeArea = SafeAreaInsets()
 
+    /// Whether the page has finished loading at least once since the last
+    /// (re)navigation. `evaluateJavaScript("window.__vaultgw && …")` is a
+    /// no-op, not a queued call, when `__vaultgw` isn't defined yet — so a
+    /// `dispatch` fired before the page's deferred script has run (the
+    /// GeometryReader's very first safe-area push can beat page load; a
+    /// content-process crash resets this to false until the reload's
+    /// `didFinish` fires again) would otherwise vanish silently instead of
+    /// reaching the page once it comes up. WebHost's Coordinator drives this
+    /// via `markPageReady()` / `markPageNotReady()`.
+    private var pageReady = false
+    private var pendingDispatches: [(name: String, payload: [String: Any])] = []
+
     private let synthesizer = AVSpeechSynthesizer()
     private let impactLight = UIImpactFeedbackGenerator(style: .light)
     private let impactMedium = UIImpactFeedbackGenerator(style: .medium)
@@ -185,6 +197,17 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
     // MARK: - Native → page
 
     func dispatch(_ name: String, _ payload: [String: Any] = [:]) {
+        guard pageReady else {
+            // Bounded for the same reason the JS-side queue in renderer.ts is:
+            // native never sends a burst, so an unbounded queue during a
+            // stuck/failed load would be a leak with no reader.
+            if pendingDispatches.count < 32 { pendingDispatches.append((name, payload)) }
+            return
+        }
+        rawDispatch(name, payload)
+    }
+
+    private func rawDispatch(_ name: String, _ payload: [String: Any]) {
         guard let webView,
               let nameData = try? JSONSerialization.data(
                   withJSONObject: name, options: [.fragmentsAllowed]),
@@ -194,6 +217,26 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
         else { return }
         let script = "window.__vaultgw && window.__vaultgw.dispatch(\(nameJSON), \(payloadJSON))"
         webView.evaluateJavaScript(script)
+    }
+
+    /// Called once the page has actually loaded (WebHost's `didFinish`, which
+    /// per the contract is after `renderer.js`'s deferred script has run and
+    /// `window.__vaultgw` is guaranteed to exist). Flushes anything queued
+    /// while the page was loading, in order.
+    func markPageReady() {
+        pageReady = true
+        let pending = pendingDispatches
+        pendingDispatches.removeAll()
+        for item in pending { rawDispatch(item.name, item.payload) }
+    }
+
+    /// Called when the page is about to go away and come back with fresh JS
+    /// state (a content-process crash reload): the WKWebView instance is
+    /// reused but `window.__vaultgw` has to be redefined from scratch, so
+    /// dispatches between now and the next `markPageReady()` must queue again
+    /// rather than firing into a page that hasn't re-run its module script.
+    func markPageNotReady() {
+        pageReady = false
     }
 
     /// Raw `evaluateJavaScript`. Only the DEBUG automation hook uses it; the

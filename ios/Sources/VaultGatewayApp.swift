@@ -58,6 +58,18 @@ struct RootView: View {
        problem lasts. */
     @State private var bannerHeight: CGFloat = 0
     @State private var safeInsets = EdgeInsets()
+    /// `scenePhase` transitions .active -> .inactive -> .background as two
+    /// separate `onChange` firings on a backgrounding event, and both used to
+    /// be caught by `case .inactive, .background:` — arming the background
+    /// `/wait` twice per backgrounding. The two live `URLSessionDownloadTask`s
+    /// that produced are reconciled down to one by `arm`'s own
+    /// `getAllTasks`-based cleanup, but that cleanup is asynchronous, so
+    /// there is a real window where both are in flight and a delivered frame
+    /// can post two local notifications for the same turn. Gate the actual
+    /// arm to once per backgrounding; keep dispatching `suspend` on both
+    /// transitions since `.inactive` fires first and gives the page the most
+    /// time to flush `setState` before the arm reads it.
+    @State private var armedForBackground = false
 
     var body: some View {
         ZStack {
@@ -126,6 +138,7 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
+                armedForBackground = false
                 TurnNotifier.shared.cancelAll()
                 TurnNotifier.shared.clearDeliveredNotifications()
                 monitor.start()
@@ -134,9 +147,18 @@ struct RootView: View {
             case .inactive, .background:
                 // The page closes its socket and flushes setState; the
                 // persisted busyTabs from that call is what arms the wait.
+                // This case fires once for .inactive and again for
+                // .background on the same backgrounding event — dispatch
+                // suspend both times (idempotent: GatewayConnection.suspend
+                // just closes an already-closed socket the second time), but
+                // only arm the background wait once, or two /wait downloads
+                // can race and double-notify.
                 bridge.dispatch("suspend")
                 monitor.stop()
-                TurnNotifier.shared.armFromPersistedState()
+                if !armedForBackground {
+                    armedForBackground = true
+                    TurnNotifier.shared.armFromPersistedState()
+                }
             @unknown default:
                 break
             }

@@ -36,11 +36,36 @@ import { Persistence } from "../../src/storage/Persistence";
 import { GatewayConnection } from "../../src/platform/remote/GatewayConnection";
 import { RemoteFileStorage, IOS_STORE_DIR } from "../../src/platform/remote/RemoteFileStorage";
 import { RemoteHost } from "../../src/platform/remote/RemoteHost";
+import { DEFAULT_SETTINGS, type ModelKey } from "../../src/settings-data";
 import type { GatewayConfig } from "../../src/platform/remote/transport";
 import { nativeTransport } from "./native";
 import { IosPlatform } from "./platform";
 import { RemoteVaultFeatures } from "./vault";
 import { IosChatShell, type ConnectivityPayload } from "./shell";
+
+/* The shared DEFAULT_SETTINGS.defaultModel is "sonnet-1m" (Sonnet 4.6 1M),
+   which the CLI rejects on this account with "Usage credits required for 1M
+   context": a 1M-context request is metered outside the subscription caps, so
+   a fresh phone tab would fail on its very first send. The phone build prefers
+   Opus Plan, the one ModelKey whose underlying run stays inside the plan
+   (there is no non-1M Sonnet key to fall back to). Only the SEED changes: a
+   model the user picked on this device (RemoteHost.loadDeviceSettings reads it
+   from localStorage) always wins, and the plugin/desktop default is untouched. */
+const IOS_DEFAULT_MODEL: ModelKey = "opus-plan";
+
+function applyIosDefaultModel(host: RemoteHost): void {
+  let chosen: unknown;
+  try {
+    const raw = window.localStorage.getItem("vaultgw.settings");
+    chosen = raw ? (JSON.parse(raw) as { defaultModel?: unknown }).defaultModel : undefined;
+  } catch {
+    chosen = undefined;
+  }
+  if (typeof chosen === "string") return;
+  if (host.settings.defaultModel === DEFAULT_SETTINGS.defaultModel) {
+    host.settings.defaultModel = IOS_DEFAULT_MODEL;
+  }
+}
 
 type DispatchName = "suspend" | "resume" | "connectivity" | "theme" | "safeArea" | "share";
 type DispatchPayload = Record<string, unknown>;
@@ -241,6 +266,7 @@ async function boot(): Promise<void> {
   }
 
   const host = new RemoteHost(conn, transport, storage);
+  applyIosDefaultModel(host);
   await host.prime();
   vaultFeatures.start();
 

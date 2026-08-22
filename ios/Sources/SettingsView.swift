@@ -26,10 +26,19 @@ struct SettingsView: View {
     @State private var status = ""
     @State private var testing = false
 
+    /// Mirrors the range `GatewayConfig.url(_:)` now enforces. A port outside
+    /// it (in particular a negative one, which used to crash the app the
+    /// instant the next health probe built a URL from it — `URLComponents`'s
+    /// port setter traps rather than failing gracefully) must never leave
+    /// this screen silently accepted.
+    private var isPortValid: Bool { (1...65535).contains(port) }
+    private var isHostValid: Bool { !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var isConfigValid: Bool { isPortValid && isHostValid }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("Gateway") {
+                Section {
                     LabeledContent("Host") {
                         TextField("host.tailnet.ts.net", text: $host)
                             .textInputAutocapitalization(.never)
@@ -44,6 +53,15 @@ struct SettingsView: View {
                         TextField("8788", value: $port, format: .number.grouping(.never))
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
+                            .foregroundStyle(isPortValid ? Color.primary : Color.red)
+                    }
+                } header: {
+                    Text("Gateway")
+                } footer: {
+                    if !isHostValid {
+                        Text("Host can't be empty.").foregroundStyle(.red)
+                    } else if !isPortValid {
+                        Text("Port must be between 1 and 65535.").foregroundStyle(.red)
                     }
                 }
 
@@ -85,7 +103,7 @@ struct SettingsView: View {
 
                 Section {
                     Button(testing ? "Testing…" : "Test connection", action: testConnection)
-                        .disabled(testing)
+                        .disabled(testing || !isConfigValid)
                     if !status.isEmpty {
                         Text(status)
                             .font(.footnote)
