@@ -78,6 +78,29 @@ export class GatewayConnection {
   /* Set while connect() is in flight so a burst of resume/visibility events
      cannot open three sockets against three tickets. */
   private connecting = false;
+  /* Bumped by every connect() call and by suspend(). connect() is not
+     synchronous end-to-end -- it awaits transport.wsUrl() (the /ws-ticket
+     POST), and on a phone that POST can take arbitrarily long: the app can
+     background mid-request (iOS suspends the network task, or it just
+     completes slowly over a marginal tailnet link) before it resolves.
+     `connecting` alone only stops a SECOND connect() from starting while one
+     is in flight; it does nothing once the in-flight one's await settles,
+     because by then `suspend()` has already reset it to false to let the
+     next resume() proceed. Without this token, that stale connect() picks
+     up its now-unwanted ticket, opens a fresh WebSocket, assigns it to
+     `this.ws`, and -- because `onopen`'s only guard is `this.ws === socket`,
+     which is trivially true for a socket nobody else has touched -- flips
+     `link` from "suspended" back to "open" behind the UI's back, or (if a
+     resume() already started its own connect() in the interim) silently
+     clobbers `this.ws` out from under that legitimate, possibly-already-open
+     socket. Confirmed with a harness driving this class against a fake
+     WebSocket + a deliberately delayed wsUrl(): suspend() firing 10ms into a
+     50ms-delayed ticket POST reliably left `link` at "open" after the delay
+     elapsed, with no code path having called connect() again. Every await
+     boundary in connect() re-checks its captured epoch against the current
+     one and bails out if suspend() (or a newer connect()) moved on without
+     it. */
+  private connectEpoch = 0;
 
   /* Per-tab cursor. Seeded from `GET /tabs/:id` on restore and advanced by
      every frame we actually deliver, so a reconnect asks for exactly the gap.
@@ -258,6 +281,7 @@ export class GatewayConnection {
     if (this.connecting) return;
     if (this.ws && (this.ws.readyState === 0 || this.ws.readyState === 1)) return;
     this.connecting = true;
+    const epoch = ++this.connectEpoch;
     this.clearRetry();
     this.setLink(this.attempt === 0 ? "connecting" : "reconnecting");
     let url: string | null = null;
@@ -266,6 +290,11 @@ export class GatewayConnection {
     } catch {
       url = null;
     }
+    /* suspend() (or a second connect(), belt-and-suspenders) ran while the
+       ticket POST above was in flight -- see connectEpoch's comment. Bail
+       out without touching `connecting` (suspend() already reset it) or
+       `this.ws`, and let the now-orphaned ticket simply expire unused. */
+    if (epoch !== this.connectEpoch) return;
     this.connecting = false;
     if (!url) {
       this.scheduleRetry();
@@ -276,6 +305,15 @@ export class GatewayConnection {
       socket = new WebSocket(url);
     } catch {
       this.scheduleRetry();
+      return;
+    }
+    if (epoch !== this.connectEpoch) {
+      /* Same race, caught between the wsUrl() check above and here. Nothing
+         async runs in between today (`new WebSocket()` is synchronous), so
+         this cannot currently trigger -- kept as a guard against a future
+         edit adding an await in this gap, which would silently reopen the
+         hole this whole mechanism exists to close. */
+      try { socket.close(); } catch { /* ignore */ }
       return;
     }
     this.ws = socket;
@@ -308,6 +346,11 @@ export class GatewayConnection {
      does not schedule a retry the backgrounded app can never service. */
   suspend(): void {
     this.setLink("suspended");
+    /* Invalidate any connect() awaiting its ticket POST right now -- see
+       connectEpoch's comment on the class fields. Must happen before
+       `connecting` is reset below so a stale connect() finds both signals
+       consistent (it never re-sets `connecting` itself on this path). */
+    this.connectEpoch++;
     this.clearRetry();
     this.stopHeartbeat();
     const socket = this.ws;
@@ -395,6 +438,16 @@ export class GatewayConnection {
      retrying fixes a missing token, and a spinning reconnect hides that. */
   markUnauthorized(): void {
     this.setLink("unauthorized");
+    /* Same stale-connect() hole as suspend() (see connectEpoch's comment): a
+       401 discovered by some unrelated rpc() call while a connect() is mid
+       ticket-POST must not let that connect() land a socket and flip link
+       back to "open" a moment later, silently hiding the bad-token banner.
+       Resetting `connecting` alongside is required, not optional -- the
+       epoch bump makes the in-flight connect() bail out via its own
+       `epoch !== this.connectEpoch` check WITHOUT touching `connecting`
+       itself, so whichever caller invalidates the epoch owns clearing it. */
+    this.connectEpoch++;
+    this.connecting = false;
     this.clearRetry();
     this.stopHeartbeat();
     try { this.ws?.close(1000, "unauthorized"); } catch { /* ignore */ }

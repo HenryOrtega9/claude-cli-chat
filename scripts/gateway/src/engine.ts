@@ -18,6 +18,7 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 
 import { SubprocessManager, type SpawnOptions, type TabSession } from "../../../src/claude/SubprocessManager";
 import type {
@@ -29,7 +30,7 @@ import type {
   ToolUseBlock,
   UsageSnapshot,
 } from "../../../src/claude/Events";
-import { sessionFilePathFor } from "../../../src/claude/session-files";
+import { projectDirFor, sessionFilePathFor } from "../../../src/claude/session-files";
 import type { Persistence } from "../../../src/storage/Persistence";
 import type { ChatMessage, TabState, ToolCall } from "../../../src/view/state";
 import { MODEL_IDS, type ModelKey, type PermissionMode } from "../../../src/settings-data";
@@ -53,6 +54,9 @@ export type TabPatch = {
   effort?: string;
   permissionMode?: string;
   pinnedFilePaths?: string[];
+  /* Composer draft text. The one field of a StoredTab write the client
+     legitimately owns — see RemoteFileStorage's applyConversation(). */
+  draft?: string;
 };
 
 export type EngineDeps = {
@@ -145,6 +149,15 @@ export class TabEngine {
      turn. See patch() / prepareForTurn(). */
   private needsRespawn = false;
   private pendingTeardown: Promise<void> | null = null;
+  /* Session ids THIS incognito tab has used. `--no-session-persistence`
+     suppresses the transcript but the CLI still writes a one-line `ai-title`
+     record (Wire Format Gotcha #6) — and any subagent transcripts — keyed by
+     session id, under ~/.claude/projects/<slug>/. clear() mints a fresh id
+     without cleaning up the one it's discarding (that would race a child
+     that hasn't finished dying), so ids accumulate here and are purged in
+     clear() and destroy(). Mirrors TabController.cleanupIncognitoSessionFiles
+     on desktop. Always empty for a non-incognito tab. */
+  private readonly incognitoSessionIds = new Set<string>();
 
   constructor(
     private deps: EngineDeps,
@@ -232,6 +245,8 @@ export class TabEngine {
       effort: this.state.effort,
       permissionMode: this.state.permissionMode,
       pinnedFilePaths: this.state.pinnedFilePaths,
+      draft: this.state.draft,
+      pendingApprovals: this.pendingApprovalFrames(),
       busy: this.busy,
       status: this.status,
       lastSeq: this.seq,
@@ -266,6 +281,9 @@ export class TabEngine {
       if (!this.busy && this.pending.size === 0) this.pendingTeardown = this.dropChildForRespawn();
     }
     if (Array.isArray(p.pinnedFilePaths)) this.state.pinnedFilePaths = p.pinnedFilePaths;
+    /* Draft is not engine-affecting — it never touches `before` above, so a
+       draft-only patch never drops a live child. */
+    if (typeof p.draft === "string") this.state.draft = p.draft || undefined;
     this.state.updatedAt = Date.now();
     this.save();
     this.emit("tab_status", this.statusPayload());
@@ -409,6 +427,11 @@ export class TabEngine {
        what discarding a conversation mid-stream should do. */
     if (this.busy || this.hasLiveChild || this.pending.size > 0) await this.abort();
 
+    /* The child that used the OLD id is confirmed dead now (abort() awaited
+       teardownSession()), so its ai-title residue is safe to remove before
+       a new id takes its place. */
+    if (this.incognito) await this.cleanupIncognitoSessionFiles();
+
     this._sessionId = randomUUID();
     this.sessionEstablished = false;
     this.resumeUnavailable = false;
@@ -431,6 +454,8 @@ export class TabEngine {
     this.state.createdAt = now;
     this.state.updatedAt = now;
     this.state.busy = false;
+    /* "New chat" discards whatever was mid-typed too. */
+    this.state.draft = undefined;
 
     /* Wipe the replay history BEFORE the two frames below, so they become the
        first entries of the new one and any client still holding an older cursor
@@ -476,7 +501,28 @@ export class TabEngine {
   async destroy(): Promise<void> {
     this.disposed = true;
     await this.evict("delete");
+    if (this.incognito) await this.cleanupIncognitoSessionFiles();
     await this.ring.destroy();
+  }
+
+  /* Delete every on-disk file the CLI wrote for this incognito tab's
+     sessions: the per-session `<id>.jsonl` (ai-title residue) and the
+     `<id>/` subdirectory (subagent transcripts). Best-effort and idempotent
+     — `rm` with `force` never throws on a missing path. Only this tab's own
+     session ids are ever in the set, so this never touches another tab's
+     files in the shared project dir. Mirrors
+     TabController.cleanupIncognitoSessionFiles on desktop; the daemon has no
+     `plugin.removeSessionFiles` host indirection to go through since it IS
+     the node process. */
+  private async cleanupIncognitoSessionFiles(): Promise<void> {
+    if (this.incognitoSessionIds.size === 0) return;
+    const ids = Array.from(this.incognitoSessionIds);
+    this.incognitoSessionIds.clear();
+    const dir = projectDirFor(this.deps.vault);
+    await Promise.all(ids.flatMap(id => [
+      rm(sessionFilePathFor(this.deps.vault, id), { force: true }).catch(() => undefined),
+      rm(`${dir}/${id}`, { force: true, recursive: true }).catch(() => undefined),
+    ]));
   }
 
   async flush(): Promise<void> {
@@ -606,6 +652,9 @@ export class TabEngine {
             /* A re-declared id that reached init exists again. */
             this.resumeUnavailable = false;
             this.status = this.busy ? "running" : "ready";
+            /* Only an ESTABLISHED session actually wrote anything to disk
+               (the ai-title residue), so only established ids need cleanup. */
+            if (this.incognito) this.incognitoSessionIds.add(this._sessionId);
             this.emit("tab_status", this.statusPayload());
           }
           return;

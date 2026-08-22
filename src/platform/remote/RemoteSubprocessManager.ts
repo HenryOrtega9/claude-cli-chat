@@ -24,6 +24,13 @@
      onStderr             `tab_status.stderrTail`, deduped against what we've
                           already forwarded
      getPendingApprovals  `approval_request` frames minus `approval_resolved`
+                          received while THIS session object has been alive
+                          — see `fetchPendingApprovals` below for the gap
+                          that leaves (a still-pending approval from before
+                          this process/session existed) and `onApprovalResolved`
+                          for the other half (a resolution this client's UI
+                          never saw because it happened over HTTP, from a
+                          notification action, while the socket was down).
 
    Two semantics from `TabSession` are replicated deliberately, because
    TabController depends on both (see its listener binding, ~line 1080):
@@ -125,6 +132,20 @@ export class RemoteTabSession implements TabSessionLike {
      Forwarding the whole tail each time would repeat the same bytes into the
      error bubble, so only the newly appended suffix goes out. */
   private lastStderrTail = "";
+  /* Fired when an `approval_resolved` frame names a request this session
+     still has pending. Exists because the ONLY thing `onFrame`'s
+     "approval_resolved" case used to do was delete from `pendingApprovals` —
+     silent bookkeeping nobody outside this class could observe. That was
+     fine as long as every resolution happened locally (TabController's
+     handleApproval already removes its own card optimistically before the
+     frame round-trips back). It stopped being fine once TurnNotifier started
+     resolving approvals straight over HTTP from a notification's Allow/Deny
+     action while this client's UI never saw it: the card TabController is
+     still showing has no way to learn the request was resolved out from
+     under it. TabController wires this (see its `ensureSession()`) to clear
+     the card and, on an allow, resume its thinking indicator — the same
+     epilogue `handleApproval`'s own allow branch runs. */
+  private readonly approvalResolvedListeners: Array<(requestId: string, allowed: boolean) => void> = [];
   /* Turn ids we minted, so a `turn_done` for someone else's turn (another
      client driving the same tab) is still delivered but never mistaken for
      our own submission failing. */
@@ -277,6 +298,18 @@ export class RemoteTabSession implements TabSessionLike {
     return Array.from(this.pendingApprovals.values());
   }
 
+  /* See the field comment on `approvalResolvedListeners`. Not part of
+     `TabSessionLike` — TabController reaches for it structurally (a plain
+     optional-member check), so a local/desktop `TabSession` that has no such
+     method is simply a no-op there. */
+  onApprovalResolved(cb: (requestId: string, allowed: boolean) => void): () => void {
+    this.approvalResolvedListeners.push(cb);
+    return () => {
+      const i = this.approvalResolvedListeners.indexOf(cb);
+      if (i >= 0) this.approvalResolvedListeners.splice(i, 1);
+    };
+  }
+
   /* ----- inbound ---------------------------------------------------------- */
 
   private onFrame(frame: Frame): void {
@@ -304,8 +337,14 @@ export class RemoteTabSession implements TabSessionLike {
         return;
       }
       case "approval_resolved": {
-        const requestId = (frame.payload as { request_id?: unknown }).request_id;
-        if (typeof requestId === "string") this.pendingApprovals.delete(requestId);
+        const payload = frame.payload as { request_id?: unknown; allowed?: unknown };
+        const requestId = payload.request_id;
+        if (typeof requestId !== "string") return;
+        this.pendingApprovals.delete(requestId);
+        const allowed = payload.allowed === true;
+        for (const cb of this.approvalResolvedListeners) {
+          try { cb(requestId, allowed); } catch (err) { console.warn("[vaultgw] approval-resolved listener threw", err); }
+        }
         return;
       }
       default:
@@ -427,6 +466,65 @@ export class RemoteSubprocessManager implements SubprocessManagerLike {
 
   get(tabId: string): RemoteTabSession | undefined {
     return this.sessions.get(tabId);
+  }
+
+  /* Reconciliation for a gap `getPendingApprovals()` cannot close on its
+     own: that method only ever reflects `approval_request` frames THIS
+     session object was alive to receive. A tab that mounts fresh — a cold
+     app relaunch, or a resync remount after the replay ring rolled over
+     (`ios-web/src/shell.ts`'s `resyncTab`, which destroys and reconstructs
+     the TabController) — starts a brand-new session with an empty cache,
+     even though the daemon may still be sitting on an unresolved
+     `approval_request` from before this process existed. There is no
+     "replay everything since the beginning" HTTP call, so this fetches
+     `GET /tabs/:id` instead and reads a `pendingApprovals` field.
+
+     That field does NOT exist on the wire yet — verified against the
+     current `storedTab()` in `scripts/gateway/src/engine.ts` (lines ~235-253
+     as of this change), which returns id/sessionId/title/.../busy/status/
+     lastSeq and nothing about `this.pending`. The daemon already computes
+     the exact right shape for this in the same file:
+
+       pendingApprovalFrames(): Array<Record<string, unknown>> {
+         return Array.from(this.pending.values()).map(p => ({ ...p.req.request, request_id: p.req.request_id }));
+       }
+
+     — but nothing calls it. The one-line server-side fix is to add it to
+     `storedTab()`:
+
+       storedTab() {
+         return {
+           ...
+           lastSeq: this.seq,
+           pendingApprovals: this.pendingApprovalFrames(),
+         };
+       }
+
+     No `server.ts` change is needed: `GET /tabs/:id`'s handler already
+     returns `engine.storedTab()` verbatim (both the tab-scoped route and the
+     no-op-tab-config-PATCH-then-GET path). Until that lands, this method
+     always resolves `[]` (a missing/non-array field), which is a safe,
+     honest empty result — reconciliation callers must already tolerate "no
+     pending approvals" as the common case. */
+  async fetchPendingApprovals(tabId: string): Promise<ControlRequestEvent[]> {
+    const res = await this.conn.rpc("GET", `/tabs/${encodeURIComponent(tabId)}`);
+    if (res.status !== 200) return [];
+    const body = res.json as { pendingApprovals?: unknown } | undefined;
+    const raw = Array.isArray(body?.pendingApprovals) ? body.pendingApprovals : [];
+    const out: ControlRequestEvent[] = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") continue;
+      const payload = entry as Record<string, unknown>;
+      const requestId = payload.request_id;
+      if (typeof requestId !== "string") continue;
+      const { request_id: _drop, ...request } = payload;
+      out.push({
+        type: "control_request",
+        request_id: requestId,
+        request: request as ControlRequestEvent["request"],
+      });
+    }
+    return out;
   }
 
   /* Remote Control is not available over the gateway; these exist because

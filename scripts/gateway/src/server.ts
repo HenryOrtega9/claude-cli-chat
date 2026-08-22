@@ -30,7 +30,7 @@ import { NoCapacityError, TabRegistry } from "./registry";
 import type { StateMirror } from "./state-mirror";
 import type { TokenStore } from "./token";
 import { UsageFetcher } from "./usage";
-import { acceptUpgrade, isWebSocketUpgrade, rejectUpgrade, type WsConnection } from "./ws";
+import { acceptUpgrade, isWebSocketUpgrade, rejectUpgrade, traceWs, type WsConnection } from "./ws";
 
 const TICKET_TTL_MS = 60_000;
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
@@ -81,7 +81,11 @@ export class GatewayServer {
         sendJson(res, 500, { error: "internal_error", message: String(err) });
       });
     });
-    this.http.on("upgrade", (req, socket) => this.handleUpgrade(req, socket));
+    /* The third argument is bytes the HTTP parser already read past the
+       request headers before handing the socket over -- see ws.ts's
+       acceptUpgrade for why dropping it (the previous signature omitted it
+       entirely) is a real, if usually-empty-in-practice, bug. */
+    this.http.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));
     /* A phone that walks out of Wi-Fi leaves a half-open socket behind;
        without this the daemon accumulates them across a day of commuting. */
     this.http.keepAliveTimeout = 65_000;
@@ -319,6 +323,7 @@ export class GatewayServer {
         effort: typeof body?.effort === "string" ? body.effort : undefined,
         permissionMode: typeof body?.permissionMode === "string" ? body.permissionMode : undefined,
         pinnedFilePaths: Array.isArray(body?.pinnedFilePaths) ? body.pinnedFilePaths as string[] : undefined,
+        draft: typeof body?.draft === "string" ? body.draft : undefined,
       });
       if (body?.active === true) this.deps.registry.setActive(engine.id);
       await this.deps.registry.saveIndex();
@@ -434,30 +439,55 @@ export class GatewayServer {
 
   /* ---------- WebSocket ---------- */
 
-  private handleUpgrade(req: IncomingMessage, socket: Duplex): void {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-    const match = /^\/ws\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
-    if (!match || !isWebSocketUpgrade(req)) {
-      rejectUpgrade(socket, 400, "bad_request");
-      return;
-    }
-    if (!this.redeemTicket(match[1])) {
-      rejectUpgrade(socket, 401, "invalid_ticket");
-      return;
-    }
-    const conn = acceptUpgrade(req, socket);
-    if (!conn) return;
-    this.deps.log(`ws ${conn.id} connected`);
+  private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    /* This entire method is synchronous, deliberately: `conn.onMessage` and
+       `sendHello` below must run in the same tick `acceptUpgrade` returns in,
+       with nothing awaited in between, or a frame that arrives (or, for
+       `head`, one that already arrived) before a later tick registers the
+       listener is silently dropped -- exactly the bug that was found in
+       test/ws-client.mjs's Client, whose `hello` listener was registered one
+       microtask late. If this function ever grows an `await` before
+       `sendHello`, that invariant breaks. */
+    try {
+      const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+      const match = /^\/ws\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
+      if (!match || !isWebSocketUpgrade(req)) {
+        rejectUpgrade(socket, 400, "bad_request");
+        return;
+      }
+      if (!this.redeemTicket(match[1])) {
+        traceWs("?", `ticket rejected for ${match[1].slice(0, 8)}... (already redeemed, expired, or a duplicate connect racing the reconnect timer)`);
+        rejectUpgrade(socket, 401, "invalid_ticket");
+        return;
+      }
+      const conn = acceptUpgrade(req, socket, head);
+      if (!conn) return;
+      this.deps.log(`ws ${conn.id} connected`);
+      traceWs(conn.id, "upgrade accepted, registering listeners + sending hello synchronously");
 
-    /* Subscribe to nothing until the client says what it wants; the hello
-       frame tells it every tab's cursor so it can ask precisely. */
-    conn.onMessage(text => this.handleWsMessage(conn, text));
-    conn.onClose(() => {
-      this.subs.delete(conn.id);
-      this.deps.log(`ws ${conn.id} closed`);
-    });
+      /* Subscribe to nothing until the client says what it wants; the hello
+         frame tells it every tab's cursor so it can ask precisely. */
+      conn.onMessage(text => this.handleWsMessage(conn, text));
+      conn.onClose(() => {
+        this.subs.delete(conn.id);
+        this.deps.log(`ws ${conn.id} closed`);
+      });
 
-    this.sendHello(conn);
+      this.sendHello(conn);
+      traceWs(conn.id, "hello sent");
+    } catch (err) {
+      /* A throw anywhere above (bad Host header, a registry read mid-mutation,
+         etc.) used to propagate out of this http 'upgrade' event handler and
+         land in main.ts's `uncaughtException` handler, which only logs --
+         the process survives, but THIS socket never gets its 101 (or never
+         gets its hello if the throw happened after) and just sits there
+         until the client's own timeout gives up and retries. Catching here
+         means a future bug in this path degrades to one failed connection
+         (traced below) instead of a silent, unexplained stall. */
+      traceWs("?", `handleUpgrade threw: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      this.deps.log(`ws upgrade handler threw: ${String(err)}`);
+      try { socket.destroy(); } catch { /* already gone */ }
+    }
   }
 
   /* Deliberately synchronous, reading catalogCache directly rather than
@@ -476,6 +506,7 @@ export class GatewayServer {
      here costs nothing beyond one redundant `/catalog` fetch, which
      `RemoteHost.prime()` already makes independently of `hello`. */
   private sendHello(conn: WsConnection): void {
+    traceWs(conn.id, `sendHello: registry.list()=${this.deps.registry.list().length} tabs, catalogCache=${this.catalogCache ? "warm" : "cold"}`);
     conn.send(JSON.stringify(makeFrame("hello", null, 0, {
       serverStartedAt: this.deps.startedAt,
       tabs: this.deps.registry.list().map(t => ({ id: t.id, lastSeq: t.lastSeq, status: t.status })),

@@ -29,11 +29,18 @@
                  conversation file DELETE left behind — see registry.ts
                  remove(). Genuinely nonexistent and closed-but-revivable are
                  indistinguishable from here; both end up `null`.
-       write  -> NO-OP. The daemon projects and persists the conversation from
-                 the event stream it is already parsing; a phone echoing its
-                 own render back would be a second, lower-fidelity writer to
-                 the same file. Reported as success so Persistence's debounced
-                 saves stay quiet instead of logging a failure per token.
+       write  -> ALMOST a no-op. The daemon projects and persists the
+                 conversation from the event stream it is already parsing; a
+                 phone echoing its own render back would be a second, lower-
+                 fidelity writer to the same file, so every field except
+                 `draft` is dropped. `draft` (unsent composer text) is the one
+                 field the daemon has no other way to learn — the user hasn't
+                 submitted it, so it never appears on the wire — and is mapped
+                 to PATCH /tabs/:id {draft} (see applyConversation()), deduped
+                 against the last value sent so an unrelated save (streamed
+                 message content, a tool result...) doesn't refire it. Reports
+                 success either way so Persistence's debounced saves stay
+                 quiet instead of logging a failure per token.
        remove -> NO-OP. DELETE /tabs/:id, issued by the shell, drops the tab
                  from the OPEN index and its live child, but deliberately
                  LEAVES the conversation file and its meta sidecar on disk —
@@ -98,6 +105,10 @@ type StoredTabResponse = {
   messages?: unknown[];
   messageCount?: number;
   lastSeq?: number;
+  /* Unsent composer text — see the class header's write() note and
+     applyConversation() below. Passed straight through: TabState.draft in
+     src/view/state.ts carries the full contract. */
+  draft?: string;
 };
 
 /* GET /conversations row: id, title, updatedAt, messageCount. A superset of
@@ -143,6 +154,11 @@ export class RemoteFileStorage implements FileStorage {
      different staleness tolerances and different write paths invalidate
      them. */
   private conversationListCache: { at: number; value: ConversationRow[] } | null = null;
+  /* Last `draft` value actually PATCHed per tab id, so applyConversation()
+     can skip the round trip when a save carries the same text as before
+     (the common case — most saves are triggered by something other than a
+     draft change). */
+  private readonly lastDraftSent = new Map<string, string>();
   private static readonly CACHE_MS = 1500;
 
   constructor(private readonly conn: GatewayConnection) {}
@@ -160,6 +176,10 @@ export class RemoteFileStorage implements FileStorage {
     this.storedTabCache.delete(id);
     this.tabIndexCache = null;
     this.conversationListCache = null;
+    /* Allow a resend even if the next write happens to carry the same text
+       as the last one we sent — e.g. after a reopen() re-seeded the tab from
+       disk, our cached "last sent" value may no longer reflect reality. */
+    this.lastDraftSent.delete(id);
   }
 
   /* ----- reads ------------------------------------------------------------ */
@@ -272,7 +292,8 @@ export class RemoteFileStorage implements FileStorage {
     if (path === TABS_PATH) return this.applyTabIndex(data);
     if (path === MCP_PATH) return this.applyMcp(data);
     if (path === SETTINGS_PATH) return this.applySettings(data);
-    if (conversationId(path)) return; /* the daemon projects these itself */
+    const conv = conversationId(path);
+    if (conv) return this.applyConversation(conv, data);
     throw new Error(`RemoteFileStorage cannot write ${path}`);
   }
 
@@ -343,6 +364,28 @@ export class RemoteFileStorage implements FileStorage {
       : [];
     if (res.status === 200) this.conversationListCache = { at: Date.now(), value };
     return value;
+  }
+
+  /* The daemon projects and persists almost all of a conversation itself —
+     see the class header. `draft` is the one field this client legitimately
+     writes back: composer text the daemon has no other way to learn. Meta
+     writes (the sidecar Persistence writes alongside every body) carry no
+     draft and are skipped outright. */
+  private async applyConversation(conv: { id: string; meta: boolean }, data: string): Promise<void> {
+    if (conv.meta) return;
+    let parsed: { draft?: unknown };
+    try {
+      parsed = JSON.parse(data) as { draft?: unknown };
+    } catch {
+      return;
+    }
+    const draft = typeof parsed.draft === "string" ? parsed.draft : "";
+    if (this.lastDraftSent.get(conv.id) === draft) return;
+    this.lastDraftSent.set(conv.id, draft);
+    const res = await this.conn.rpc("PATCH", `/tabs/${encodeURIComponent(conv.id)}`, { draft });
+    /* Best-effort: let a failed PATCH retry on the tab's next debounced save
+       rather than pretending the daemon has the new value. */
+    if (res.status !== 200) this.lastDraftSent.delete(conv.id);
   }
 
   private async applyTabIndex(data: string): Promise<void> {

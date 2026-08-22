@@ -300,6 +300,28 @@ async function main() {
   assert(toolCalls.some(t => t.status === "completed"), `persisted a completed tool call (${toolCalls.map(t => `${t.name}:${t.status}`).join(", ") || "none"})`);
   log(`   stored tab: ${stored.json.messages.length} messages, title ${JSON.stringify(stored.json.title)}`);
 
+  /* --- 5b. composer draft round-trips through PATCH/GET ---
+     `draft` is the one StoredTab field a client legitimately writes back —
+     see RemoteFileStorage.applyConversation() and engine.ts patch(). Not
+     engine-affecting: setting it must never drop the live child or otherwise
+     disturb the tab's status. */
+  log("draft persistence: PATCH /tabs/:id {draft}");
+  assert(stored.json.draft === undefined, `fresh tab has no draft yet (got ${JSON.stringify(stored.json.draft)})`);
+  const statusBeforeDraft = (await api("GET", "/health")).json.tabs.find(t => t.id === tabId)?.status;
+  const draftPatch = await api("PATCH", `/tabs/${tabId}`, { draft: "unsent composer text" });
+  assert(draftPatch.status === 200, `PATCH {draft} -> 200 (got ${draftPatch.status} ${JSON.stringify(draftPatch.json)})`);
+  const withDraft = await api("GET", `/tabs/${tabId}`);
+  assert(withDraft.json.draft === "unsent composer text", `GET reflects the patched draft (got ${JSON.stringify(withDraft.json.draft)})`);
+  const statusAfterDraft = (await api("GET", "/health")).json.tabs.find(t => t.id === tabId)?.status;
+  assert(statusAfterDraft === statusBeforeDraft, `draft patch is not engine-affecting (status stayed ${statusAfterDraft})`);
+  const draftClearPatch = await api("PATCH", `/tabs/${tabId}`, { draft: "" });
+  assert(draftClearPatch.status === 200, `PATCH {draft:""} -> 200 (got ${draftClearPatch.status})`);
+  const draftCleared = await api("GET", `/tabs/${tabId}`);
+  assert(!draftCleared.json.draft, `empty-string draft clears back to falsy (got ${JSON.stringify(draftCleared.json.draft)})`);
+  /* Leave a draft in place so the clear regression below can assert it gets
+     wiped too. */
+  await api("PATCH", `/tabs/${tabId}`, { draft: "should not survive /clear" });
+
   /* --- 6. HTTP replay endpoint agrees with the socket --- */
   const events = await api("GET", `/tabs/${tabId}/events?since=${cutoffSeq}&limit=5000`);
   assert(events.status === 200 && !events.json.evicted, `GET /tabs/:id/events?since -> 200, evicted=${events.json.evicted}`);
@@ -330,6 +352,7 @@ async function main() {
   const afterClear = await api("GET", `/tabs/${tabId}`);
   assert(afterClear.status === 200, `cleared tab still exists (GET -> ${afterClear.status})`);
   assert((afterClear.json.messages ?? []).length === 0, `conversation is empty (${(afterClear.json.messages ?? []).length} messages)`);
+  assert(!afterClear.json.draft, `clear wipes the draft too (got ${JSON.stringify(afterClear.json.draft)})`);
   /* D4: the new id isn't ESTABLISHED yet either — clear() reset the tab back
      to "minted, never spawned", exactly the state a fresh POST /tabs leaves
      a tab in, so GET /tabs/:id reports null until the next turn's

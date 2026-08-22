@@ -43,6 +43,18 @@ export type WsConnection = {
 
 let nextConnId = 1;
 
+/* Root-cause tracing for the intermittent "hello never arrives" stall
+   (Deferred item D). Off by default: this is a hot path and every write here
+   is on the token-streaming latency budget. `VAULT_GATEWAY_TRACE_WS=1`
+   timestamps every step of the handshake -> hello pipeline with millisecond
+   precision so a stall shows exactly which write stalled or which step never
+   ran, instead of a guess. */
+const TRACE = process.env.VAULT_GATEWAY_TRACE_WS === "1";
+export function traceWs(connId: number | string, msg: string): void {
+  if (!TRACE) return;
+  process.stderr.write(`[ws-trace ${new Date().toISOString()}] conn=${connId} ${msg}\n`);
+}
+
 export function isWebSocketUpgrade(req: IncomingMessage): boolean {
   const upgrade = (req.headers.upgrade ?? "").toLowerCase();
   return upgrade === "websocket";
@@ -59,24 +71,40 @@ export function rejectUpgrade(socket: Duplex, status: number, message: string): 
   );
 }
 
-export function acceptUpgrade(req: IncomingMessage, socket: Duplex): WsConnection | null {
+/* `head` is Node's http server's third `upgrade` event argument: any bytes
+   the HTTP parser already read off the socket past the end of the request
+   headers before handing the socket over. For our own client (which never
+   writes a WS frame until it has read our 101 response) this is normally
+   empty, but a client that pipelines aggressively, or a proxy in front of
+   us that buffers, can hand us a socket whose first WS frame arrived
+   bundled with the handshake request itself. Dropping it silently (the
+   previous behavior: `server.ts` didn't even accept the parameter) would
+   lose that frame exactly the way the client-side race in
+   test/ws-client.mjs lost `hello` — see that file's fix for the mirror-image
+   bug. Processing is deferred to a microtask (see the constructor) rather
+   than run inline here, so it happens after the caller has registered
+   `onMessage`, not before. */
+export function acceptUpgrade(req: IncomingMessage, socket: Duplex, head?: Buffer): WsConnection | null {
   const key = req.headers["sec-websocket-key"];
   if (typeof key !== "string" || req.headers["sec-websocket-version"] !== "13") {
     rejectUpgrade(socket, 400, "bad_websocket_handshake");
     return null;
   }
   const accept = createHash("sha1").update(key + GUID).digest("base64");
-  socket.write(
+  const conn = new Connection(socket, head);
+  traceWs(conn.id, `accepted, writing 101 (head=${head?.length ?? 0}B)`);
+  const wrote = socket.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
     "Upgrade: websocket\r\n" +
     "Connection: Upgrade\r\n" +
     `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   );
+  traceWs(conn.id, `101 write() returned ${wrote} (false = kernel buffer full, still queued not dropped)`);
   /* Nagle would coalesce our small JSON frames into ~40ms batches, which on a
      token stream reads as stutter. The upgrade socket is always a net.Socket
      in practice; the cast is to Duplex's narrower type, not a guess. */
   (socket as Duplex & { setNoDelay?: (v: boolean) => void }).setNoDelay?.(true);
-  return new Connection(socket);
+  return conn;
 }
 
 class Connection implements WsConnection {
@@ -92,11 +120,68 @@ class Connection implements WsConnection {
   private fragChunks: Buffer[] = [];
   private fragBytes = 0;
 
-  constructor(private socket: Duplex) {
-    socket.on("data", chunk => this.onData(chunk));
-    socket.on("error", () => this.teardown());
-    socket.on("close", () => this.teardown());
-    socket.on("end", () => this.teardown());
+  /* Non-null only between construction and the head microtask flushing (see
+     below). While set, `data` events must not be processed inline -- they
+     get queued behind `head` instead -- or a frame that arrived split across
+     `head` and a same-tick `data` event could be processed out of order.
+     `queueMicrotask` alone does not guarantee "head always processed before
+     any subsequently-arriving data": Node interleaves the process.nextTick
+     queue with the Promise microtask queue, and some of a net.Socket's own
+     internal data delivery (flushing bytes already sitting in the socket's
+     read buffer at the moment a `data` listener attaches, which can be
+     exactly the case here) runs through `process.nextTick`, which is
+     serviced ahead of a plain `queueMicrotask` callback scheduled at the same
+     point. A gate on this flag, rather than relying on scheduling-primitive
+     ordering, is correct regardless of which queue either side happens to
+     use. */
+  private pendingHead: Buffer | null = null;
+  private queuedWhileHeadPending: Buffer[] = [];
+
+  constructor(private socket: Duplex, head?: Buffer) {
+    socket.on("data", chunk => this.onInboundData(chunk));
+    socket.on("error", err => { traceWs(this.id, `socket error: ${String(err)}`); this.teardown(); });
+    socket.on("close", () => { traceWs(this.id, "socket close"); this.teardown(); });
+    socket.on("end", () => { traceWs(this.id, "socket end"); this.teardown(); });
+    /* See acceptUpgrade's comment on `head`. Deferred to a microtask: the
+       caller (server.ts's handleUpgrade) is fully synchronous and calls
+       `conn.onMessage(...)` immediately after `acceptUpgrade()` returns with
+       no `await` in between, so a microtask queued here runs strictly after
+       that registration lands -- never before it, which is what would
+       silently drop a frame bundled into `head`. Any `data` chunk that shows
+       up before this flushes is queued (see onInboundData) rather than
+       processed immediately, so `head`'s bytes -- which logically arrived
+       first on the wire -- are never delivered after bytes that arrived
+       later. */
+    if (head && head.length > 0) {
+      this.pendingHead = head;
+      traceWs(this.id, `deferring ${head.length}B of pre-upgrade head bytes to microtask`);
+      queueMicrotask(() => this.flushPendingHead());
+    }
+  }
+
+  /* Routing point for every inbound chunk. Fast path (the overwhelming
+     majority of a connection's lifetime, once `head` -- usually empty to
+     begin with -- has flushed) is a direct call straight through; the queue
+     only exists for the brief window described on `pendingHead`. */
+  private onInboundData(chunk: Buffer): void {
+    if (this.pendingHead !== null) {
+      this.queuedWhileHeadPending.push(chunk);
+      return;
+    }
+    this.onData(chunk);
+  }
+
+  private flushPendingHead(): void {
+    const head = this.pendingHead;
+    this.pendingHead = null;
+    if (head) this.onData(head);
+    if (this.closed) return;
+    const queued = this.queuedWhileHeadPending;
+    this.queuedWhileHeadPending = [];
+    for (const chunk of queued) {
+      if (this.closed) return;
+      this.onData(chunk);
+    }
   }
 
   onMessage(cb: (text: string) => void): void { this.messageCbs.push(cb); }
@@ -108,8 +193,10 @@ class Connection implements WsConnection {
   send(text: string): void {
     if (this.closed) return;
     try {
-      this.socket.write(encodeFrame(0x1, Buffer.from(text, "utf8")));
-    } catch {
+      const wrote = this.socket.write(encodeFrame(0x1, Buffer.from(text, "utf8")));
+      if (!wrote) traceWs(this.id, "send() write() returned false (backpressure; Node still queues and flushes it)");
+    } catch (err) {
+      traceWs(this.id, `send() threw: ${String(err)}`);
       this.teardown();
     }
   }
@@ -194,6 +281,7 @@ class Connection implements WsConnection {
   }
 
   private deliver(payload: Buffer): void {
+    if (this.messageCbs.length === 0) traceWs(this.id, "deliver() with zero message listeners registered -- frame is being dropped");
     const text = payload.toString("utf8");
     for (const cb of this.messageCbs) {
       try { cb(text); } catch (err) { console.error("[vault-gateway] ws message handler threw:", err); }

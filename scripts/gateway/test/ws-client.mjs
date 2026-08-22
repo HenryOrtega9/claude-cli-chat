@@ -75,11 +75,37 @@ export function wsConnect(url, { timeoutMs = 15_000 } = {}) {
 }
 
 class Client {
+  /* Root cause of Deferred item D's "hello never arrives" stall: `wsConnect`
+     resolves with `new Client(socket, rest)`, where `rest` is whatever bytes
+     already sat in the TCP read buffer past the `\r\n\r\n` handshake
+     terminator. The gateway writes its 101 response and the `hello` frame
+     back-to-back in the same synchronous call (server.ts's handleUpgrade),
+     with Nagle disabled -- so on a fast loopback/tailnet link the kernel very
+     often flushes both as one segment, and `rest` already contains the full
+     `hello` frame text before this constructor even runs. That data used to
+     be fed straight into `onData` -> `deliver` synchronously, INSIDE the
+     `resolve(new Client(...))` call, i.e. before the `await wsConnect(...)`
+     caller's next line (`ws.onMessage(...)`) has had a chance to run --
+     Promise resolution only schedules the *continuation* as a microtask, it
+     doesn't run it early. `messageCbs` was still empty, so `deliver` iterated
+     zero callbacks and the frame vanished for good; the caller's `waitFor`
+     then burned its full 10s timeout waiting for a frame that already came
+     and went. Measured: on this machine, `rest` carries the `hello` frame
+     ~1/3 of connects (matching the "~1 in 3 smoke-test runs" report), and
+     the actual drop rate (only when `rest` happens to contain a COMPLETE
+     frame rather than a partial one) was ~3%.
+
+     Fix: buffer frames that arrive before any listener is registered instead
+     of discarding them, and flush the backlog into the first listener added
+     (mirroring how a real WebSocket client can never miss `open`-then-
+     `message` because the spec mandates async event dispatch -- this hand-
+     rolled client had no such guarantee and needed one built in). */
   constructor(socket, initial) {
     this.socket = socket;
     this.closed = false;
     this.messageCbs = new Set();
     this.closeCbs = new Set();
+    this.pending = [];
     this.buf = Buffer.alloc(0);
     this.fragOpcode = 0;
     this.fragChunks = [];
@@ -89,7 +115,15 @@ class Client {
     if (initial.length > 0) this.onData(initial);
   }
 
-  onMessage(cb) { this.messageCbs.add(cb); return () => this.messageCbs.delete(cb); }
+  onMessage(cb) {
+    this.messageCbs.add(cb);
+    if (this.pending.length > 0) {
+      const backlog = this.pending;
+      this.pending = [];
+      for (const text of backlog) cb(text);
+    }
+    return () => this.messageCbs.delete(cb);
+  }
   onClose(cb) { this.closeCbs.add(cb); }
 
   send(text) {
@@ -193,6 +227,7 @@ class Client {
   deliver(opcode, payload) {
     if (opcode !== 0x1) return;
     const text = payload.toString("utf8");
+    if (this.messageCbs.size === 0) { this.pending.push(text); return; }
     for (const cb of this.messageCbs) cb(text);
   }
 }

@@ -47,8 +47,8 @@ Git: all work on `main`, commit per agent with a clear scope prefix (`shared-ui:
 | GET | `/catalog` | `{skills, commands, subagents, models:[{key,id,label,efforts,group}], efforts:[...], permissionModes:[{key,label}], mcpServers:[{name,enabled,status}], userName, hash}` — `hash` is the `catalogHash` the `hello` frame carries. `permissionModes` omits `bypassPermissions` entirely (a phone tab may never run in it). 5-minute server cache; `?refresh=1` forces a rescan. |
 | GET | `/tabs` | `TabIndex` (`src/storage/Persistence.ts` shape: `{activeTabId, tabs:[{id,title,sessionId}]}`) — OPEN tabs only |
 | POST | `/tabs` | `{title?, model?, effort?, permissionMode?, incognito?}` → `{id, sessionId}` (no spawn) |
-| GET | `/tabs/:id` | `StoredTab`, plus the live `{busy, status, lastSeq}` so a cold client can render and resume from one call. 404 for a CLOSED tab — see `POST /tabs/:id/reopen` |
-| PATCH | `/tabs/:id` | `{title?, model?, effort?, permissionMode?, pinnedFilePaths?, active?:true}` → `{ok}`; engine-affecting changes take effect via respawn `--resume` on next turn |
+| GET | `/tabs/:id` | `StoredTab`, plus the live `{busy, status, lastSeq, pendingApprovals}` (pending `control_request` payloads incl. `request_id`, so a cold client can re-render approval cards) so a cold client can render and resume from one call. Includes `draft` (unsent composer text) — the one StoredTab field the daemon does not derive from the event stream. 404 for a CLOSED tab — see `POST /tabs/:id/reopen` |
+| PATCH | `/tabs/:id` | `{title?, model?, effort?, permissionMode?, pinnedFilePaths?, draft?, active?:true}` → `{ok}`; engine-affecting changes take effect via respawn `--resume` on next turn. `draft` is never engine-affecting — a draft-only patch never drops a live child |
 | DELETE | `/tabs/:id` | → `{ok}`. Drops the live child and takes the tab out of the OPEN index (`GET /tabs`, `GET /tabs/:id`), but deliberately LEAVES the conversation file and its meta sidecar on disk, so it still appears in `GET /conversations` and can be revived with `POST /tabs/:id/reopen`. Incognito tabs never wrote a file, so this is a true delete for them |
 | GET | `/conversations` | `{conversations:[{id,title,updatedAt,messageCount}]}` — every conversation the daemon has ever persisted, open AND closed, sourced straight from `Persistence.listConversations()` against the daemon's own on-disk store. This is what History lists; `GET /tabs` only has the open subset |
 | POST | `/tabs/:id/reopen` | → `StoredTab` (same shape as `GET /tabs/:id`), 404 `{error:"no_such_tab"}` if nothing is persisted under that id (never existed, or incognito). Reconstructs a closed tab from its persisted conversation file and puts it back in the OPEN index — idempotent, a no-op returning the current projection if the tab is already open |
@@ -132,6 +132,26 @@ Native → page (native calls `window.__vaultgw.dispatch(name, payload)` via `ev
 | `share` | `{text}` — insert into the active composer |
 
 The native connectivity banner is a native view; the page may also show an inline state but must not be the only indicator.
+
+### `switchTab` — notification deep link (separate entry point)
+
+Tapping a `turn_done` or `approval_request` local notification (`ios/Sources/TurnNotifier.swift`'s `didReceive(response:)`, default action only — Allow/Deny still resolve straight against `/tabs/:id/approve` and never reach the page) deep-links the page to the tab the notification named, past whatever tab was last active, and — for an approval notification — scrolls to that approval's card.
+
+This does **not** ride `window.__vaultgw.dispatch` above. That channel only starts draining once `renderer.ts`'s `boot()` reaches `installHandler()`, which sits behind several awaited gateway round trips (`getConfig`, `/health`, and up to ~33s of `waitForReady` polling for a cold iCloud vault); a notification tapped while the app is still cold-launching would land in that window and be silently dropped by the switch's `default: return`. Instead:
+
+```ts
+window.__vaultgwSwitchTab({ tabId, requestId? }) : void
+```
+
+defined by `ios-web/src/native.ts` at that module's own evaluation time — which ES modules guarantee happens before any of `renderer.ts`'s top-level code runs, let alone its async `boot()` — so it is live from the first instant the bundle executes. `NativeBridge.swift`'s `rawDispatch` special-cases the `"switchTab"` name to call this instead of `.dispatch(name, payload)`; every other name is unaffected. A call before a handler has registered (`native.ts`'s `onSwitchTab`, called once by `IosChatShell`'s constructor) queues one entry (latest wins — there is only one page to land on) and delivers it the moment registration happens.
+
+`IosChatShell` parks a switch that arrives before `mount()` has finished restoring tabs (`pendingSwitchTab`), and `restoreTabs()` peeks it (without consuming) so the tab selected on the very first render is already the notification's target when that target is among the tabs being restored — avoiding a flash of whatever was active before the app was killed. `mount()`'s own consumption, right after `restoreTabs()`, is what actually performs the select + scroll-to-card pass, and is also what handles a target tab this client doesn't have mounted at all (closed on this device, or never seen before) by fetching it fresh via `persistence.loadTab` (`GET /tabs/:id`, reopening a closed tab if needed).
+
+An already-mounted target tab is deliberately **not** torn down and rebuilt: `TabState.pendingApprovals` is excluded from the persisted/re-fetched shape by design (runtime-only, repopulated solely by live `control_request` events), so remounting an in-progress tab from a fresh `GET` would silently drop a genuinely still-pending approval's card rather than preserve it. Catching an already-mounted tab up on whatever it missed while backgrounded is the socket reconnect's job — already triggered on every foreground via the existing `resume` dispatch, independently of `switchTab`, subscribing `tabs: "all"` with each tab's own cursor.
+
+There is no per-card `requestId` in the DOM (`ApprovalModal.ts`'s cards are keyed only in an in-memory `Map`), so the scroll targets the approval area's most recently added card — correct for the overwhelmingly common case of one outstanding approval per tab. It retries for up to ~4s since the card the notification named may not have replayed back onto the tab yet; an already-resolved approval has no card to scroll to, which is a normal outcome, not a failure.
+
+TurnNotifier's `bridge` reference (needed to call `NativeBridge.dispatch`) is wired by `RootView.onAppear`, which can run after a cold-launch notification tap already fired `didReceive(response:)`; `TurnNotifier` parks that one deep link in-memory (`pendingSwitch`) and flushes it the moment `bridge` is set, so a terminated-app launch never loses it.
 
 ## Visual direction (ios-web, wave 2)
 
