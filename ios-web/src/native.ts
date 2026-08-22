@@ -42,6 +42,64 @@ function webkitHandler(): { postMessage(body: unknown): Promise<unknown> } | nul
   return wk?.messageHandlers?.native ?? null;
 }
 
+/* ---------------------------------------------------------------------------
+   Deep-link dispatch: notification tap -> tab switch
+   ------------------------------------------------------------------------ */
+
+/* Not routed through window.__vaultgw.dispatch (renderer.ts). That channel's
+   `queued` array only drains once renderer.ts's boot() calls
+   installHandler() — behind several awaited gateway round trips (getConfig,
+   /health, and up to ~33s of `waitForReady` polling for a cold iCloud vault).
+   A notification tapped while the app is still cold-launching can land in
+   that window; the switch's `default: return` would drop it silently.
+
+   `window.__vaultgwSwitchTab` is defined right here, at this module's own
+   evaluation time. ES modules guarantee every imported module (this one
+   included) finishes evaluating before the importing module's (renderer.ts)
+   own top-level code runs, let alone its async boot() — so this entry point
+   is live from the first instant the bundle executes, independent of how
+   long the rest of boot() takes. NativeBridge.swift's `rawDispatch` calls it
+   directly for the "switchTab" name only; every other name still rides the
+   documented `dispatch` channel. See CONTRACTS.md's native bridge section. */
+export type PendingTabSwitch = { tabId: string; requestId?: string };
+
+let switchTabHandler: ((p: PendingTabSwitch) => void) | null = null;
+/* At most one entry: a second tap before the first is consumed simply
+   replaces it. There is only one page to land on, so "most recent not--
+   ification tapped" is the only sensible semantics — mirrors `dispatch`'s
+   own `liveHandler`/`queued` pattern in renderer.ts, scoped to this one
+   message. */
+let queuedTabSwitch: PendingTabSwitch | null = null;
+
+function handleSwitchTabCall(payload: unknown): void {
+  const p = payload as { tabId?: unknown; requestId?: unknown } | undefined;
+  const tabId = typeof p?.tabId === "string" ? p.tabId : "";
+  if (!tabId) return;
+  const msg: PendingTabSwitch = {
+    tabId,
+    requestId: typeof p?.requestId === "string" ? p.requestId : undefined,
+  };
+  if (switchTabHandler) switchTabHandler(msg);
+  else queuedTabSwitch = msg;
+}
+
+(window as unknown as { __vaultgwSwitchTab: typeof handleSwitchTabCall }).__vaultgwSwitchTab
+  = handleSwitchTabCall;
+
+/* Registered once, by IosChatShell's constructor — as early as this module
+   graph allows, well before the shell's own async mount() has restored any
+   tabs. A switch that arrived (queued above) before registration is
+   delivered synchronously the moment it registers, so the shell never has to
+   poll for one. */
+export function onSwitchTab(handler: (p: PendingTabSwitch) => void): void {
+  switchTabHandler = handler;
+  if (queuedTabSwitch) {
+    const pending = queuedTabSwitch;
+    queuedTabSwitch = null;
+    handler(pending);
+  }
+}
+
 export const DEV_KEYS = {
   token: "vaultgw.dev.token",
   base: "vaultgw.dev.base",

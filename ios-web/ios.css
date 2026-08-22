@@ -411,9 +411,7 @@ body {
     min-height: 44px;
   }
 
-  #app .claudian-popup-row,
-  #app .suggestion-item,
-  #app .claudian-history-row {
+  #app .claudian-popup-row {
     min-height: 44px;
   }
 }
@@ -691,6 +689,118 @@ body {
 
 .claudian-mcp-server-row {
   overflow: visible;
+}
+
+/* `.claudian-history-row` (HistoryModal) and `.suggestion-item`
+   (DomSuggestModalHost, used by SubagentPicker) render into modals — outside
+   #app, same as the MCP rows above — so the pre-existing `#app
+   .claudian-history-row` / `#app .suggestion-item` touch-target rule further
+   down this file (still scoped under `#app .claudian-popup-row`, which DOES
+   live inside #app via InputBox's composer popups) never matched on iOS: a
+   history row and a suggest-modal result row both stayed at their unpadded
+   text height with no 44px floor. Un-scoped here so it actually applies. */
+@media (pointer: coarse) {
+  .claudian-history-row,
+  .suggestion-item {
+    min-height: 44px;
+  }
+}
+
+/* `.claudesk-menu-item` (platform.showContextMenu) is TabBar's long-press
+   tab-close menu — the one touch affordance a coarse pointer actually has
+   for closing a background tab. 6px/13px like the plain `.modal button`
+   case above, so the same 44px floor applies. Also renders to
+   document.body, outside #app. */
+@media (pointer: coarse) {
+  .claudesk-menu-item {
+    min-height: 44px;
+    padding: 10px 8px;
+  }
+}
+
+/* MCPManagerModal forwards a tap anywhere on a touch-host row to the 16x16
+   checkbox (see the `isTouchHost()` guard there); this is the matching visual
+   affordance — a comfortable tap zone and a bigger, easier-to-read box, since
+   the native default renders far under 44pt on iOS. */
+@media (pointer: coarse) {
+  /* `.claudian-mcp-server-list` (styles.css) is a column flex with
+     `max-height: 60vh; overflow-y: auto`, and `.claudian-mcp-server-row` is
+     `overflow: visible`. With the 44px head this touch mode adds, a vault
+     with enough servers exceeds 60vh and WebKit shrinks flex items past
+     their own content height instead of only scrolling the container — the
+     `.claudian-mcp-server-summary` (endpoint) line still paints (nothing
+     clips a visible-overflow box) but lands below the row's now-too-short
+     border box, under the next row. `flex-shrink: 0` opts the row out of
+     that shrink pass entirely so its height always matches its content;
+     confirmed via getBoundingClientRect() against the running app (row
+     bottom used to land above its own summary's top) that this is what
+     the shrink was doing, not a rendering glitch. */
+  .claudian-mcp-server-row-touch {
+    cursor: pointer;
+    min-height: 44px;
+    flex-shrink: 0;
+  }
+
+  .claudian-mcp-server-row-touch .claudian-mcp-server-head {
+    min-height: 44px;
+    align-items: center;
+  }
+
+  .claudian-mcp-server-toggle {
+    width: 20px;
+    height: 20px;
+    margin-right: 8px;
+  }
+}
+
+/* Generic Obsidian-style modal buttons (MCP manager's Refresh, Create
+   Subagent's Cancel/Create, Subagent Manager's Refresh/Open/Reveal, and any
+   future .modal button) are 6px/12px padding at 13px text — comfortably
+   under 44pt. None of the per-surface pill/button rules above cover these
+   plain buttons, so fix it once at the shared selector rather than chasing
+   each modal's button classes individually. */
+@media (pointer: coarse) {
+  .modal button {
+    min-height: 44px;
+    padding: 10px 16px;
+  }
+}
+
+/* Same story for the plain text/select fields these modals build off the
+   Obsidian baseline (app/desktop.css `.modal input[type="text"], .modal
+   select, .modal .dropdown`) — 6px padding at 13px text, under 44pt. Most
+   visible in CreateSubagentModal's Name/Description/"Save location" fields.
+   Excludes textarea: CreateSubagentModal's already clears 44px via its own
+   140px min-height. */
+@media (pointer: coarse) {
+  .modal input[type="text"],
+  .modal input[type="search"],
+  .modal input[type="number"],
+  .modal select,
+  .modal .dropdown {
+    min-height: 44px;
+    padding: 10px 12px;
+  }
+}
+
+/* CreateSubagentModal's Cancel/Create row is the last child of a form long
+   enough (three fields plus a 140px-min textarea) to exceed the modal's
+   height on a phone; `.modal-content` is the scrolling ancestor
+   (app/desktop.css), so pinning the footer to ITS bottom edge keeps the
+   actions reachable without scrolling past the whole form first. `bottom`
+   compensates for `.modal`'s own 20px/24px padding (app/desktop.css) so the
+   bar reaches the modal's true edge instead of floating 20px short of it;
+   the negative margins extend it edge-to-edge to match. */
+@media (pointer: coarse) {
+  .claudian-create-subagent-footer {
+    position: sticky;
+    bottom: -20px;
+    margin: 16px -24px -20px -24px;
+    padding: 12px 24px calc(12px + var(--vgw-safe-bottom, 0px));
+    background: var(--background-primary);
+    border-top: 1px solid var(--background-modifier-border);
+    z-index: 2;
+  }
 }
 
 /* Long tool output and code blocks scroll inside their own box

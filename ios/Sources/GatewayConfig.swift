@@ -89,6 +89,35 @@ enum GatewayConfig {
         return URL(string: path, relativeTo: base)?.absoluteURL
     }
 
+    /// Builds a probe URL that forces `probeScheme` instead of the stored
+    /// `scheme`, for the https-first "Test connection" flow.
+    ///
+    /// https and http live on different ports when Tailscale TLS-terminates
+    /// in front of the plain-HTTP daemon (`tailscale serve --https=443
+    /// http://127.0.0.1:8788`), so an https probe with no explicit
+    /// `overridePort` omits the port entirely and lets URLSession default to
+    /// 443 — the standard `tailscale serve` port — rather than reusing the
+    /// stored gateway port (8788, meaningless for TLS). `overridePort` exists
+    /// so tests can point the https leg at a throwaway local port without
+    /// root. An http probe always uses the stored `port`, since that IS the
+    /// daemon's port and there is no separate "http override".
+    static func probeURL(_ path: String, scheme probeScheme: String, port overridePort: Int? = nil) -> URL? {
+        let host = effectiveHost
+        guard !host.isEmpty else { return nil }
+        var components = URLComponents()
+        components.scheme = probeScheme == "https" ? "https" : "http"
+        if let overridePort {
+            guard (1...65535).contains(overridePort) else { return nil }
+            components.port = overridePort
+        } else if probeScheme != "https" {
+            guard (1...65535).contains(port) else { return nil }
+            components.port = port
+        }
+        components.host = host
+        guard let base = components.url else { return nil }
+        return URL(string: path, relativeTo: base)?.absoluteURL
+    }
+
     /// `ws(s)://host:port` prefix for `wsUrl`.
     static var webSocketOrigin: String {
         let wsScheme = scheme == "https" ? "wss" : "ws"

@@ -215,7 +215,19 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
               let payloadData = try? JSONSerialization.data(withJSONObject: payload),
               let payloadJSON = String(data: payloadData, encoding: .utf8)
         else { return }
-        let script = "window.__vaultgw && window.__vaultgw.dispatch(\(nameJSON), \(payloadJSON))"
+        /* `switchTab` (a notification-tap deep link) deliberately bypasses
+           `window.__vaultgw.dispatch`. That channel only starts draining once
+           renderer.ts's boot() calls installHandler(), which sits behind
+           several awaited gateway round trips (getConfig, /health, up to
+           ~33s of waking a cold iCloud vault) — a tap landing in that window
+           would hit the switch's `default: return` and vanish. It instead
+           calls `window.__vaultgwSwitchTab`, which ios-web/src/native.ts
+           defines at module-evaluation time — live before any of that async
+           boot work starts, per CONTRACTS.md's native bridge section. Every
+           other name is unaffected and still rides `dispatch`. */
+        let script = name == "switchTab"
+            ? "window.__vaultgwSwitchTab && window.__vaultgwSwitchTab(\(payloadJSON))"
+            : "window.__vaultgw && window.__vaultgw.dispatch(\(nameJSON), \(payloadJSON))"
         webView.evaluateJavaScript(script)
     }
 

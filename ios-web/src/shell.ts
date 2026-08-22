@@ -44,12 +44,21 @@ import {
 } from "../../src/settings-data";
 import type { Persistence } from "../../src/storage/Persistence";
 import type { GatewayConnection, LinkState } from "../../src/platform/remote/GatewayConnection";
-import { isNativeHost } from "./native";
+import { isNativeHost, onSwitchTab, type PendingTabSwitch } from "./native";
 import type { RemoteHost } from "../../src/platform/remote/RemoteHost";
 import type { RemoteFileStorage } from "../../src/platform/remote/RemoteFileStorage";
 import type { GatewayTransport } from "../../src/platform/remote/transport";
+import type { InputBox } from "../../src/view/InputBox";
 
 export type ConnectivityPayload = { state?: string; message?: string };
+
+/* The `share` dispatch's payload shape — native.ts's ShareInbox hand-off
+   (iOS Share Extension) and DebugLaunchEnvironment's VAULTGW_AUTOSEND both
+   land here through the same `case "share"` in renderer.ts. */
+export type SharePayload = {
+  text?: string;
+  images?: { mediaType: string; dataUri: string }[];
+};
 
 /* Header affordances the phone does not offer. Environment snippets are
    authored in a settings file on the Mac; Remote Control is a PTY flow that
@@ -124,6 +133,30 @@ export class IosChatShell {
   /* Tabs this client just cleared, so the daemon's own `resync` for that clear
      is not answered with a rebuild we have already done in place. */
   private readonly selfCleared = new Set<string>();
+  /* True once mount() has finished restoreTabs(). Guards switchTab deep
+     links: one arriving before this is true would find `this.tabs` empty
+     (or mid-build) and either no-op or race restoreTabs' own mounting, so it
+     is parked in `pendingSwitchTab` and replayed at the end of mount()
+     instead. */
+  private mounted = false;
+  /* A switchTab deep link (notification tap) received before mount()
+     finishes. restoreTabs() also peeks this (without consuming it) so the
+     INITIAL active tab can already be the right one — avoiding a flash of
+     whatever was active before the app was killed — when the deep link's
+     target is among the tabs being restored. mount()'s own consumption,
+     after restoreTabs(), is what actually applies it (select + scroll),
+     which also covers the case where the target isn't a locally-known tab at
+     all (closed elsewhere, needs a server fetch — see switchTab()). */
+  private pendingSwitchTab: PendingTabSwitch | null = null;
+  /* A `share` dispatch (iOS Share Extension hand-off, or VAULTGW_AUTOSEND —
+     both go through renderer.ts's `case "share"` -> handleShare) that
+     arrived before mount() built the composer DOM. Same shape of bug as
+     pendingSwitchTab and the same fix: activeComposer() is a plain DOM
+     query with no retry, so a share landing during boot() (always true on a
+     cold launch — the WebKit IPC round-trip for evaluateJavaScript is far
+     faster than boot()'s network calls that precede installHandler) would
+     otherwise silently no-op. Buffered here, applied at the end of mount(). */
+  private pendingShare: SharePayload | null = null;
 
   constructor(
     private readonly root: HTMLElement,
@@ -132,7 +165,13 @@ export class IosChatShell {
     private readonly persistence: Persistence,
     private readonly storage: RemoteFileStorage,
     private readonly transport: GatewayTransport,
-  ) {}
+  ) {
+    /* Registered here, synchronously, at construction — before any of
+       mount()'s awaits — so a deep link that raced the cold-launch boot
+       sequence (see native.ts's __vaultgwSwitchTab) is captured as early as
+       this class can possibly capture it. */
+    onSwitchTab(pending => this.handleSwitchTab(pending));
+  }
 
   async mount(): Promise<void> {
     this.root.empty();
@@ -173,6 +212,17 @@ export class IosChatShell {
     this.conn.onResync((tabId, reason) => void this.resyncTab(tabId, reason));
 
     await this.restoreTabs();
+    this.mounted = true;
+    if (this.pendingSwitchTab) {
+      const pending = this.pendingSwitchTab;
+      this.pendingSwitchTab = null;
+      void this.switchTab(pending.tabId, pending.requestId);
+    }
+    if (this.pendingShare) {
+      const pending = this.pendingShare;
+      this.pendingShare = null;
+      this.applyShare(pending);
+    }
   }
 
   /* The shared header is fixed (src/ is not this change's to edit), so the two
@@ -244,9 +294,19 @@ export class IosChatShell {
         await this.createTab();
         return;
       }
-      const wanted = index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)
-        ? index.activeTabId
-        : this.tabs[0].state.id;
+      /* A pending switchTab deep link wins over the persisted active tab, so
+         the first render already shows the notification's target instead of
+         flashing whatever was active before the app was killed and then
+         flipping over once mount()'s post-restore consumption runs. Peeked,
+         not consumed: mount() still does the actual select + scroll-to-card
+         pass after this returns, which is also what handles a target that
+         isn't among these restored (open) tabs at all. */
+      const pendingTarget = this.pendingSwitchTab?.tabId;
+      const wanted = pendingTarget && this.tabs.some(t => t.state.id === pendingTarget)
+        ? pendingTarget
+        : index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)
+          ? index.activeTabId
+          : this.tabs[0].state.id;
       this.selectTab(wanted, { skipSave: true });
     } finally {
       this.restoring = false;
@@ -330,6 +390,14 @@ export class IosChatShell {
         this.conn.setTabTitle(controller.state.id, controller.state.title);
         this.conn.setTabBusy(controller.state.id, controller.isBusy());
         this.pushTabConfig(controller);
+        /* The daemon projects and persists the conversation itself — except
+           for `draft` (unsent composer text), which it has no way to learn
+           on its own. Route it through the normal Persistence save path like
+           the plugin/desktop already do: RemoteFileStorage's write() maps a
+           conversation-body write's `draft` field to PATCH /tabs/:id and
+           dedupes against the last value sent, so this is a cheap no-op call
+           on every OTHER kind of state change (messages, tool results...). */
+        if (!controller.state.incognito) void this.persistence.scheduleSaveTab(controller.state);
         /* The daemon projects and persists the conversation itself; what the
            phone still owns is the tab INDEX (title, active tab), which
            RemoteFileStorage maps to PATCH /tabs/:id. */
@@ -540,12 +608,36 @@ export class IosChatShell {
        too), so this is a removal, not a resync. */
     if (reason === "gone") return this.dropGoneTab(idx, tabId);
     this.storage.invalidateTab(tabId);
+    /* loadTab (GET /tabs/:id) happens BEFORE old.destroy() below, so even a
+       flush right before destroy would already be too late to make this
+       GET's response reflect it — flushing here would still race the
+       server round-trip. Instead capture the live text straight off the
+       DOM (same textarea.claudian-input selector activeComposer() uses,
+       just scoped to THIS tab's root rather than the visible one) and
+       reapply it after mountTab below if it differs from what the GET came
+       back with. Read via the DOM rather than InputBox's own draft API:
+       InputBox.flushDraft()/a value getter would need a change to
+       InputBox.ts beyond the addImageAttachments method this pass owns
+       there, and the DOM already holds the ground truth. */
     const fresh = await this.persistence.loadTab(tabId);
     if (!fresh) return;
     const [old] = this.tabs.splice(idx, 1);
     const wasActive = this.activeTabId === tabId;
+    const localDraft = old.root.querySelector<HTMLTextAreaElement>("textarea.claudian-input")?.value ?? "";
     await old.destroy();
     const controller = this.mountTab(fresh, { silent: true });
+    if (localDraft && localDraft !== (fresh.draft ?? "")) {
+      /* Reapply through the same input+dispatchEvent pattern insertIntoComposer
+         uses: InputBox's own "input" listener picks it up from there (autoResize,
+         scheduleDraftPublish), so the newly mounted controller ends up with
+         exactly the state it would have had if the resync had never
+         interrupted the user's typing. */
+      const composer = controller.root.querySelector<HTMLTextAreaElement>("textarea.claudian-input");
+      if (composer) {
+        composer.value = localDraft;
+        composer.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }
     /* Keep tab order stable so the bar doesn't jump under the user. */
     this.tabs.splice(this.tabs.indexOf(controller), 1);
     this.tabs.splice(idx, 0, controller);
@@ -602,8 +694,55 @@ export class IosChatShell {
 
   /* ----- native dispatch targets ------------------------------------------ */
 
-  /* `share` — text arriving from the iOS share sheet. Goes into the active
-     composer rather than being sent, so the user still frames the question. */
+  /* `share` — text and/or images arriving from the iOS share sheet (or
+     VAULTGW_AUTOSEND, which rides the same channel). Called from
+     renderer.ts's `case "share"`; buffers via pendingShare above when
+     mount() has not finished yet, applies immediately otherwise. Goes into
+     the active composer rather than being sent, so the user still frames
+     the question. */
+  handleShare(payload: SharePayload): void {
+    if (!this.mounted) {
+      /* No batch-share path exists, so two shares queuing before mount is
+         rare (it needs the app killed and relaunched twice in a hurry, or
+         ShareInbox.drain firing more than once before boot() finishes) but
+         not impossible — merge rather than let the second overwrite the
+         first. */
+      this.pendingShare = this.pendingShare
+        ? {
+            text: [this.pendingShare.text, payload.text].filter(Boolean).join("\n\n") || undefined,
+            images: [...(this.pendingShare.images ?? []), ...(payload.images ?? [])],
+          }
+        : payload;
+      return;
+    }
+    this.applyShare(payload);
+  }
+
+  private applyShare(payload: SharePayload): void {
+    if (payload.text) this.insertIntoComposer(payload.text);
+    if (payload.images && payload.images.length > 0) {
+      this.activeInputBox()?.addImageAttachments(payload.images);
+    }
+  }
+
+  /* TabController.inputBox is private — a TypeScript-only boundary, not a
+     runtime one. TabController.ts already exposes narrow passthroughs for
+     exactly this shape of need (ingestDroppedFiles, focusInput); the ideal
+     fix here is one more line there —
+     `addImageAttachments(items: {mediaType, dataUri}[]) { this.inputBox.addImageAttachments(items); }`
+     next to those — but TabController.ts is another concurrent pass's file
+     this wave (draft persistence / notification deep-link both touch it
+     right now), so this reaches through rather than risking a concurrent
+     write to a file outside this pass's ownership. Narrow and documented on
+     purpose: swap for the real passthrough once that lands. */
+  private activeInputBox(): InputBox | null {
+    const controller = this.tabs.find(t => t.state.id === this.activeTabId);
+    if (!controller) return null;
+    return controller.getInputBox();
+  }
+
+  /* `share` text — goes into the active composer rather than being sent, so
+     the user still frames the question. */
   insertIntoComposer(text: string): void {
     const composer = this.activeComposer();
     if (!composer) return;
@@ -611,6 +750,79 @@ export class IosChatShell {
     composer.value = existing ? `${existing.replace(/\s*$/, "")}\n\n${text}` : text;
     composer.dispatchEvent(new Event("input", { bubbles: true }));
     composer.focus();
+  }
+
+  /* `switchTab` — a notification tap's deep link (native.ts's
+     __vaultgwSwitchTab, wired via onSwitchTab in the constructor). Parked
+     until mount() has restored tabs; applied immediately once it has. */
+  private handleSwitchTab(pending: PendingTabSwitch): void {
+    if (!this.mounted) {
+      this.pendingSwitchTab = pending;
+      return;
+    }
+    void this.switchTab(pending.tabId, pending.requestId);
+  }
+
+  /* Activates the tab a notification named, foregrounding it over whatever
+     tab was last active — the deferred-item-B fix: previously a tapped
+     notification only foregrounded the app onto the last-active tab.
+
+     "Reload if stale" here means: a tab this client doesn't currently have
+     mounted (closed on this device, or opened for the first time from a
+     notification about a chat that lives only on the Mac) is fetched fresh
+     via persistence.loadTab (GET /tabs/:id, reopening a closed one if
+     needed) and mounted. An ALREADY-mounted tab is deliberately not torn
+     down and rebuilt here: TabState.pendingApprovals is excluded from the
+     persisted/re-fetched shape by design (Persistence.ts — it is
+     runtime-only, repopulated solely by live control_request events), so
+     remounting an in-progress tab from a fresh GET would silently drop a
+     genuinely still-pending approval's card instead of preserving it. The
+     socket's own reconnect — already triggered on every foreground via the
+     `resume` dispatch, independently of this method, subscribing `tabs:
+     "all"` with each tab's own cursor — is what catches an already-mounted
+     tab back up on whatever it missed while backgrounded. */
+  private switchTabSeq = 0;
+  async switchTab(tabId: string, requestId?: string): Promise<void> {
+    if (!tabId) return;
+    /* Two notification taps in quick succession can overlap in loadTab;
+       the last tap wins, so an older in-flight switch must not select. */
+    const token = ++this.switchTabSeq;
+    let controller = this.tabs.find(t => t.state.id === tabId);
+    if (!controller) {
+      this.storage.invalidateTab(tabId);
+      const state = await this.persistence.loadTab(tabId);
+      if (token !== this.switchTabSeq) return;
+      if (!state) {
+        platform.notify("That chat is no longer on the gateway.");
+        return;
+      }
+      controller = this.tabs.find(t => t.state.id === tabId) ?? this.mountTab(state, { silent: false });
+    }
+    if (token !== this.switchTabSeq) return;
+    this.selectTab(controller.state.id);
+    if (requestId) this.scrollToApprovalCard(requestId);
+  }
+
+  /* There is no per-card requestId in the DOM (ApprovalModal.ts's cards are
+     keyed only in an in-memory Map, not src/view's to fork for this) so this
+     targets the approval area's most recently added card, which is correct
+     for the overwhelmingly common case of one outstanding approval per tab.
+     Retries briefly: the card the notification named may not have re-arrived
+     yet (the socket's replay is async and can land after this runs), and an
+     already-resolved approval simply has no card to scroll to — that is a
+     normal outcome, not a failure, so this gives up quietly. */
+  private scrollToApprovalCard(requestId: string, attemptsLeft = 20): void {
+    if (!requestId) return;
+    const contents = Array.from(this.tabsContainer.querySelectorAll<HTMLElement>(".claudian-tab-content"));
+    const visible = contents.find(el => el.style.display !== "none");
+    const cards = visible?.querySelectorAll<HTMLElement>(".claudian-approval-area .claudian-ask-approval-info");
+    const card = cards && cards.length > 0 ? cards[cards.length - 1] : null;
+    if (card) {
+      card.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    if (attemptsLeft <= 0) return;
+    window.setTimeout(() => this.scrollToApprovalCard(requestId, attemptsLeft - 1), 200);
   }
 
   /* Native's connectivity dispatch. Inside the app this is the same sentence

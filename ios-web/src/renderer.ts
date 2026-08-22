@@ -41,7 +41,7 @@ import type { GatewayConfig } from "../../src/platform/remote/transport";
 import { nativeTransport } from "./native";
 import { IosPlatform } from "./platform";
 import { RemoteVaultFeatures } from "./vault";
-import { IosChatShell, type ConnectivityPayload } from "./shell";
+import { IosChatShell, type ConnectivityPayload, type SharePayload } from "./shell";
 
 /* The shared DEFAULT_SETTINGS.defaultModel is "sonnet-1m" (Sonnet 4.6 1M),
    which the CLI rejects on this account with "Usage credits required for 1M
@@ -198,6 +198,23 @@ function armBootRetry(probe: () => Promise<boolean>): void {
 
 const BOOT_RETRY_MS = 10_000;
 
+/* ShareInbox.swift (iOS Share Extension, via NativeBridge.dispatch("share", …))
+   and DebugLaunchEnvironment's VAULTGW_AUTOSEND both send this shape. Narrows
+   the untyped DispatchPayload defensively — a malformed image entry (missing
+   field, wrong type) is dropped rather than reaching InputBox.addImageAttachments
+   with a shape it doesn't expect. */
+function parseSharePayload(payload: DispatchPayload): SharePayload {
+  const text = typeof payload.text === "string" && payload.text ? payload.text : undefined;
+  const rawImages = Array.isArray(payload.images) ? payload.images : [];
+  const images = rawImages.filter(
+    (img): img is { mediaType: string; dataUri: string } =>
+      !!img && typeof img === "object"
+      && typeof (img as Record<string, unknown>).mediaType === "string"
+      && typeof (img as Record<string, unknown>).dataUri === "string",
+  );
+  return { text, images: images.length > 0 ? images : undefined };
+}
+
 /* ---------------------------------------------------------------------------
    Boot
    ------------------------------------------------------------------------ */
@@ -296,8 +313,14 @@ async function boot(): Promise<void> {
         applySafeArea(payload);
         return;
       case "share": {
-        const text = payload.text;
-        if (typeof text === "string" && text) shell.insertIntoComposer(text);
+        /* Routed through handleShare (not insertIntoComposer directly) so a
+           share arriving before shell.mount() finishes — always true on a
+           cold launch, since the WebKit IPC round-trip for
+           evaluateJavaScript beats boot()'s network calls that precede
+           installHandler — is buffered and replayed once the composer DOM
+           actually exists, instead of silently no-oping against an empty
+           `#app`. See IosChatShell.handleShare (ios-web/src/shell.ts). */
+        shell.handleShare(parseSharePayload(payload));
         return;
       }
       default:

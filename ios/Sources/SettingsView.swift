@@ -141,28 +141,47 @@ struct SettingsView: View {
         GatewayConfig.setToken(trimmed)
     }
 
+    /// https-first: probes `https://<host>` on the standard `tailscale serve
+    /// --https=443` port before falling back to the stored http port. If the
+    /// https leg gets any real HTTP response back (proof the TLS layer
+    /// works, independent of auth), Settings switches itself to https/443 —
+    /// "a Settings toggle default of https when the probe succeeds". Tailscale
+    /// TLS certs are not enabled for this tailnet as of 2026-08-21
+    /// (`tailscale cert` → "your Tailscale account does not support getting
+    /// TLS certs"; `CertDomains` is null in `tailscale status --json`), so in
+    /// practice this always falls through to http today — see ios/README.md.
     private func testConnection() {
         saveToken()
         testing = true
         status = "Testing…"
         Task {
-            let outcome = await GatewayClient.send(path: "/health")
-            let state = ConnectivityState.from(outcome)
-            switch outcome {
+            let result = await GatewayClient.probePreferredScheme()
+            let state = ConnectivityState.from(result.outcome)
+            let schemeLabel = result.scheme.uppercased()
+            switch result.outcome {
             case .http(let code, let data):
                 if code == 200 {
                     let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                     let gatewayState = json?["state"] as? String ?? "ready"
-                    var line = "Connected. Gateway is \(gatewayState)."
+                    var line = "Connected via \(schemeLabel). Gateway is \(gatewayState)."
                     if let cwd = json?["cwd"] as? String, !cwd.isEmpty {
                         line += " Vault: \((cwd as NSString).lastPathComponent)."
                     }
                     status = line
                 } else {
-                    status = "HTTP \(code) — \(state.message)"
+                    status = "\(schemeLabel) HTTP \(code) — \(state.message)"
                 }
             case .failure(let failure, let message):
-                status = "\(state.message) (\(failure.rawValue): \(message))"
+                status = "\(schemeLabel) — \(state.message) (\(failure.rawValue): \(message))"
+            }
+            if result.httpsAvailable {
+                if scheme != "https" || port != 443 {
+                    scheme = "https"
+                    port = 443
+                    status += " Switched Settings to HTTPS (port 443) — it's available now."
+                }
+            } else {
+                status += " HTTPS isn't available on this gateway yet; staying on HTTP."
             }
             testing = false
         }

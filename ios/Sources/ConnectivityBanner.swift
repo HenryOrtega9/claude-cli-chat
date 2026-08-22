@@ -45,6 +45,7 @@ struct ConnectivityBanner: View {
         case .macAsleep: return "moon.zzz"
         case .gatewayDown: return "bolt.horizontal.circle"
         case .unauthorized: return "key.slash"
+        case .tlsError: return "lock.trianglebadge.exclamationmark"
         case .starting: return "hourglass"
         }
     }

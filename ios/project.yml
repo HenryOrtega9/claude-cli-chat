@@ -76,6 +76,16 @@ targets:
             tail92466c.ts.net:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: true
+        # The Share Extension's hand-off channel: it cannot call
+        # UIApplication directly (app-extension-unavailable), so it uses
+        # `NSExtensionContext.open(_:completionHandler:)` on this scheme,
+        # which SwiftUI's `.onOpenURL` (VaultGatewayApp.swift) picks up to
+        # drain ios/Sources/ShareInbox.swift. No host/path is parsed — the
+        # URL is purely a wake-up signal, so one static entry covers it.
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.henryortega.vaultgateway.share
+            CFBundleURLSchemes:
+              - vaultgw-share
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.henryortega.vaultgateway
@@ -83,6 +93,48 @@ targets:
         TARGETED_DEVICE_FAMILY: 1
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: NO
         ENABLE_USER_SCRIPT_SANDBOXING: YES
+    dependencies:
+      - target: ShareExtension
+        embed: true
+
+  # The Share Sheet target: "Claude & Second Brain" in the row that appears
+  # when text, a URL, or an image is shared from another app. No storyboard,
+  # no compose UI — ShareViewController.swift writes the shared items into
+  # the App Group's ShareInbox/ folder and hands off to the main app via the
+  # vaultgw-share:// scheme above. See ios/README.md, "Share Extension".
+  ShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+    entitlements:
+      path: ShareExtension/ShareExtension.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.dev.henryortega.vaultgateway
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: "Claude & Second Brain"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          # Swift's default ObjC runtime name for an NSObject-rooted class is
+          # exactly "<ModuleName>.<ClassName>" — no @objc(...) override
+          # needed on ShareViewController for this string to resolve.
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsWebPageWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 4
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.henryortega.vaultgateway.share
+        TARGETED_DEVICE_FAMILY: 1
+        SKIP_INSTALL: YES
 
 # Declared explicitly rather than leaning on Xcode's autocreated scheme, so
 # `xcodebuild -scheme VaultGateway` behaves the same on a fresh clone.

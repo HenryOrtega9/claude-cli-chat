@@ -78,6 +78,10 @@ struct RootView: View {
 
             WebHost(bridge: bridge, inspectable: webInspector) {
                 if let state = monitor.state { bridge.dispatchConnectivity(state) }
+                // Covers both a cold launch straight off a share (the page
+                // has never been ready before now) and a content-process
+                // crash reload racing a share that landed while it was down.
+                ShareInbox.drain(bridge: bridge)
                 #if DEBUG
                 DebugLaunchEnvironment.autosendIfNeeded(bridge: bridge)
                 #endif
@@ -114,6 +118,11 @@ struct RootView: View {
         }
         .onAppear {
             bridge.onOpenSettings = { showSettings = true }
+            // As early as possible: a notification tap that launched the app
+            // from cold can call TurnNotifier.shared.didReceive(response:)
+            // before this line runs, in which case it queues on the
+            // singleton and this assignment's didSet flushes it.
+            TurnNotifier.shared.bridge = bridge
             #if DEBUG
             DebugLaunchEnvironment.startCommandChannel(bridge: bridge)
             #endif
@@ -135,6 +144,17 @@ struct RootView: View {
         }
         .onChange(of: safeInsets) { _, _ in pushInsets() }
         .onChange(of: bannerHeight) { _, _ in pushInsets() }
+        // The Share Extension ATTEMPTS a hand-off via `extensionContext.open`,
+        // which this fires for — but Apple documents that call as working
+        // only from a Today widget, not a Share Extension (verified
+        // 2026-08-21, see ShareViewController.finish's comment), so this
+        // firing at all is not guaranteed. The `.active` case below is the
+        // handler this can't do without: the app coming to the foreground by
+        // the user manually switching back to it (the expected outcome of a
+        // share) always fires it, independent of whether `open` worked.
+        .onOpenURL { _ in
+            ShareInbox.drain(bridge: bridge)
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
@@ -144,6 +164,7 @@ struct RootView: View {
                 monitor.start()
                 bridge.dispatch("resume")
                 if let state = monitor.state { bridge.dispatchConnectivity(state) }
+                ShareInbox.drain(bridge: bridge)
             case .inactive, .background:
                 // The page closes its socket and flushes setState; the
                 // persisted busyTabs from that call is what arms the wait.

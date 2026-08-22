@@ -24,6 +24,23 @@ final class TurnNotifier: NSObject {
     private var session: URLSession?
     private var backgroundCompletion: (() -> Void)?
 
+    /// Wired from `RootView.onAppear` once the `NativeBridge` `@StateObject`
+    /// exists. `TurnNotifier.shared` is a process-lifetime singleton that can
+    /// receive `didReceive response` (a notification tap that launches the
+    /// app from cold) before SwiftUI has built the view hierarchy at all, so
+    /// a tap arriving before this is wired must not be lost — see
+    /// `pendingSwitch` / `flushPendingSwitch()` below.
+    weak var bridge: NativeBridge? {
+        didSet { flushPendingSwitch() }
+    }
+
+    /// A `switchTab` deep link that arrived before `bridge` was wired.
+    /// Flushed the moment `bridge` is set. At most one entry: a second tap
+    /// before the first flushes simply replaces it, which is the same
+    /// "latest wins" semantics `dispatch`'s own queue has for everything
+    /// else that only makes sense once (there is only one page to land on).
+    private var pendingSwitch: (tab: String, requestId: String)?
+
     /// `log stream --predicate 'subsystem == "dev.henryortega.vaultgateway"'`
     /// is the only way to watch this path: everything interesting happens while
     /// the app is suspended, where there is no UI to look at.
@@ -178,6 +195,29 @@ final class TurnNotifier: NSObject {
         return tab.isEmpty ? "Your vault chat" : "Tab \(tab.prefix(8))"
     }
 
+    /// Deep-link the page to the tab (and, if the tap was on an approval
+    /// notification, the specific request) a notification named. Dispatched
+    /// as `switchTab` — see `ios-web/src/native.ts`'s `__vaultgwSwitchTab`
+    /// for why this rides its own entry point rather than
+    /// `window.__vaultgw.dispatch`.
+    @MainActor
+    private func dispatchSwitchTab(tab: String, requestId: String, via bridge: NativeBridge) {
+        var payload: [String: Any] = ["tabId": tab]
+        if !requestId.isEmpty { payload["requestId"] = requestId }
+        bridge.dispatch("switchTab", payload)
+    }
+
+    /// `didSet` on `bridge` is a synchronous, non-isolated context, but
+    /// `NativeBridge.dispatch` is `@MainActor` — hop over explicitly rather
+    /// than awaiting here (a property observer cannot be `async`).
+    private func flushPendingSwitch() {
+        guard let bridge, let pending = pendingSwitch else { return }
+        pendingSwitch = nil
+        Task { @MainActor in
+            self.dispatchSwitchTab(tab: pending.tab, requestId: pending.requestId, via: bridge)
+        }
+    }
+
     private func resolve(tab: String, requestID: String, allowed: Bool) async {
         guard !tab.isEmpty, !requestID.isEmpty else { return }
         _ = await GatewayClient.send(
@@ -271,6 +311,19 @@ extension TurnNotifier: UNUserNotificationCenterDelegate {
             await resolve(tab: tab, requestID: requestID, allowed: true)
         case Self.denyAction:
             await resolve(tab: tab, requestID: requestID, allowed: false)
+        case UNNotificationDefaultActionIdentifier:
+            // Tapping the notification body itself (not an Allow/Deny
+            // action): foreground onto the tab it named, past whatever tab
+            // was last active. `tab` can legitimately be empty for a
+            // malformed/old payload — nothing to link to.
+            guard !tab.isEmpty else { return }
+            if let bridge {
+                await dispatchSwitchTab(tab: tab, requestId: requestID, via: bridge)
+            } else {
+                // Cold launch: RootView hasn't wired `bridge` yet. Stash it;
+                // `bridge`'s didSet flushes as soon as it is.
+                pendingSwitch = (tab, requestID)
+            }
         default:
             break
         }
