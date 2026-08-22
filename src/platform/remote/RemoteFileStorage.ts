@@ -22,24 +22,36 @@
 
    `<store>/conversations/<id>.json`
        read   -> GET /tabs/:id (the daemon's own projection of the stream, so a
-                 cold client renders history from one call)
+                 cold client renders history from one call); a 404 there means
+                 the tab isn't currently live (closed from this device or
+                 another one) and is retried once against
+                 POST /tabs/:id/reopen, which reconstructs it from the
+                 conversation file DELETE left behind — see registry.ts
+                 remove(). Genuinely nonexistent and closed-but-revivable are
+                 indistinguishable from here; both end up `null`.
        write  -> NO-OP. The daemon projects and persists the conversation from
                  the event stream it is already parsing; a phone echoing its
                  own render back would be a second, lower-fidelity writer to
                  the same file. Reported as success so Persistence's debounced
                  saves stay quiet instead of logging a failure per token.
-       remove -> NO-OP (DELETE /tabs/:id, issued by the shell, removes both).
+       remove -> NO-OP. DELETE /tabs/:id, issued by the shell, drops the tab
+                 from the OPEN index and its live child, but deliberately
+                 LEAVES the conversation file and its meta sidecar on disk —
+                 that's what makes reopen() above possible, and what GET
+                 /conversations lists for History.
 
    `<store>/conversations/<id>.meta.json`
-       read   -> synthesized from GET /tabs/:id
-                 (`{title, updatedAt, messageCount}`); the daemon writes real
-                 sidecars, but re-deriving is one call instead of two.
+       read   -> synthesized from GET /conversations (title, updatedAt,
+                 messageCount), NOT from GET /tabs/:id — deriving it from the
+                 latter would silently reopen a closed conversation just to
+                 render its row title, the instant History's list renders.
        write  -> NO-OP, same reason as the body.
 
    `<store>` and `<store>/conversations`
        exists -> true, mkdir -> no-op. The daemon owns the directory.
-       list(`<store>/conversations`) -> one `<id>.json` entry per tab in
-                 GET /tabs, which is what History needs.
+       list(`<store>/conversations`) -> one `<id>.json` entry per row in
+                 GET /conversations (open AND closed tabs), which is what
+                 History needs.
 
    `.claude/mcp.json`
        read   -> synthesized `{disabledServers:[…]}` from GET /catalog's
@@ -88,6 +100,13 @@ type StoredTabResponse = {
   lastSeq?: number;
 };
 
+/* GET /conversations row: id, title, updatedAt, messageCount. A superset of
+   GET /tabs — it's sourced from the daemon's persisted conversation files
+   directly, so it includes tabs the phone has since closed (DELETE keeps the
+   file precisely so History can still list and restore them) as well as
+   every currently open one. */
+type ConversationRow = { id: string; title: string; updatedAt: number; messageCount: number };
+
 function isTmp(path: string): boolean {
   return path.endsWith(".tmp");
 }
@@ -119,6 +138,11 @@ export class RemoteFileStorage implements FileStorage {
   private tabIndexCache: { at: number; value: TabIndex } | null = null;
   private readonly storedTabCache = new Map<string, { at: number; value: StoredTabResponse | null }>();
   private catalogCache: { at: number; disabled: string[] } | null = null;
+  /* GET /conversations — open AND closed tabs. Separate from tabIndexCache
+     (GET /tabs, open only) because History listing and the open tab bar have
+     different staleness tolerances and different write paths invalidate
+     them. */
+  private conversationListCache: { at: number; value: ConversationRow[] } | null = null;
   private static readonly CACHE_MS = 1500;
 
   constructor(private readonly conn: GatewayConnection) {}
@@ -129,11 +153,13 @@ export class RemoteFileStorage implements FileStorage {
     this.tabIndexCache = null;
     this.storedTabCache.clear();
     this.catalogCache = null;
+    this.conversationListCache = null;
   }
 
   invalidateTab(id: string): void {
     this.storedTabCache.delete(id);
     this.tabIndexCache = null;
+    this.conversationListCache = null;
   }
 
   /* ----- reads ------------------------------------------------------------ */
@@ -146,8 +172,8 @@ export class RemoteFileStorage implements FileStorage {
     if (path === MCP_PATH || path === SETTINGS_PATH) return true;
     const conv = conversationId(path);
     if (conv) {
-      const index = await this.loadTabIndex();
-      return index.tabs.some(t => t.id === conv.id);
+      const rows = await this.loadConversationList();
+      return rows.some(r => r.id === conv.id);
     }
     return false;
   }
@@ -163,15 +189,22 @@ export class RemoteFileStorage implements FileStorage {
     if (path === SETTINGS_PATH) return JSON.stringify({ permissions: { allow: await this.loadAllow() } });
     const conv = conversationId(path);
     if (conv) {
+      /* Meta reads (History listing) are served from GET /conversations —
+         cheap, and crucially it works for a CLOSED tab without reviving it.
+         Full-body reads (actually opening a conversation) go through
+         loadStoredTab(), which — see its comment — auto-reopens a closed tab
+         on the daemon so it's live and addressable for turns from here on.
+         Deriving meta from loadStoredTab() instead, as this used to, would
+         have silently reopened every closed conversation the instant History
+         rendered its row title. */
+      if (conv.meta) {
+        const rows = await this.loadConversationList();
+        const row = rows.find(r => r.id === conv.id);
+        if (!row) throw new Error(`No such conversation: ${conv.id}`);
+        return JSON.stringify({ title: row.title, updatedAt: row.updatedAt, messageCount: row.messageCount });
+      }
       const tab = await this.loadStoredTab(conv.id);
       if (!tab) throw new Error(`No such conversation: ${conv.id}`);
-      if (conv.meta) {
-        return JSON.stringify({
-          title: tab.title ?? "Untitled",
-          updatedAt: tab.updatedAt ?? 0,
-          messageCount: tab.messageCount ?? (Array.isArray(tab.messages) ? tab.messages.length : 0),
-        });
-      }
       return JSON.stringify(tab);
     }
     throw new Error(`RemoteFileStorage cannot read ${path}`);
@@ -183,10 +216,14 @@ export class RemoteFileStorage implements FileStorage {
     return Promise.reject(new Error("RemoteFileStorage has no binary reads"));
   }
 
+  /* `Persistence.listConversations()` (the shared History source) calls this
+     to enumerate `<store>/conversations/*.json`. Sourced from GET
+     /conversations rather than GET /tabs so closed-but-kept conversations
+     appear in History too, not just the open tab bar. */
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
     if (path === CONV_DIR) {
-      const index = await this.loadTabIndex();
-      return { files: index.tabs.map(t => `${CONV_DIR}/${t.id}.json`), folders: [] };
+      const rows = await this.loadConversationList();
+      return { files: rows.map(r => `${CONV_DIR}/${r.id}.json`), folders: [] };
     }
     if (path === IOS_STORE_DIR) return { files: [TABS_PATH], folders: [CONV_DIR] };
     return { files: [], folders: [] };
@@ -256,17 +293,55 @@ export class RemoteFileStorage implements FileStorage {
     return value;
   }
 
+  /* GET /tabs/:id only answers for a tab currently held live in the
+     daemon's registry. A tab closed via DELETE (its conversation file kept
+     on disk precisely so History can still show it — see registry.ts
+     remove()) 404s there until something asks the daemon to revive it. A
+     404 here is exactly that ask: POST /tabs/:id/reopen reconstructs the
+     engine from the persisted file and returns the same StoredTab shape, so
+     opening a History row works the same way opening an already-live tab
+     does, with one extra round trip the caller never has to know about.
+     "Genuinely never existed" and "closed but revivable" are
+     indistinguishable from here — the reopen call answers its own 404 for
+     the former, which collapses to the same `null` this returns either
+     way. */
   private async loadStoredTab(id: string): Promise<StoredTabResponse | null> {
     const cached = this.storedTabCache.get(id);
     if (cached && Date.now() - cached.at < RemoteFileStorage.CACHE_MS) return cached.value;
-    const res = await this.conn.rpc("GET", `/tabs/${encodeURIComponent(id)}`);
+    let res = await this.conn.rpc("GET", `/tabs/${encodeURIComponent(id)}`);
+    if (res.status === 404) res = await this.conn.rpc("POST", `/tabs/${encodeURIComponent(id)}/reopen`);
     const value = res.status === 200 && res.json && typeof res.json === "object"
       ? res.json as StoredTabResponse
       : null;
     this.storedTabCache.set(id, { at: Date.now(), value });
+    /* A reopen also puts the tab back in the OPEN index (registry.ts), so the
+       next GET /tabs reflects it — stale otherwise since nothing else here
+       invalidates tabIndexCache on a successful revive. */
+    if (value) this.tabIndexCache = null;
     /* The tab's cursor comes back with the projection, so a cold restore
        subscribes from exactly where the daemon's render ends. */
     if (value && typeof value.lastSeq === "number") this.conn.seedSeq(id, value.lastSeq);
+    return value;
+  }
+
+  /* GET /conversations: every conversation the daemon has ever persisted,
+     open or closed. The superset GET /tabs (open only) can't give History,
+     and reading it never revives anything — see the read() comment above. */
+  private async loadConversationList(): Promise<ConversationRow[]> {
+    const cached = this.conversationListCache;
+    if (cached && Date.now() - cached.at < RemoteFileStorage.CACHE_MS) return cached.value;
+    const res = await this.conn.rpc("GET", "/conversations");
+    const raw = (res.json as { conversations?: unknown } | undefined)?.conversations;
+    const value: ConversationRow[] = Array.isArray(raw)
+      ? raw.filter((r): r is ConversationRow => !!r && typeof (r as ConversationRow).id === "string")
+        .map(r => ({
+          id: r.id,
+          title: typeof r.title === "string" && r.title ? r.title : "Untitled",
+          updatedAt: typeof r.updatedAt === "number" ? r.updatedAt : 0,
+          messageCount: typeof r.messageCount === "number" ? r.messageCount : 0,
+        }))
+      : [];
+    if (res.status === 200) this.conversationListCache = { at: Date.now(), value };
     return value;
   }
 

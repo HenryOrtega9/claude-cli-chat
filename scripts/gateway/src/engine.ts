@@ -84,8 +84,30 @@ function resolveModel(model: string | undefined): string | undefined {
 
 export class TabEngine {
   readonly id: string;
-  readonly sessionId: string;
   readonly incognito: boolean;
+
+  /* Mutable behind a getter rather than `readonly`: clear() mints a new one so
+     the next turn starts a genuinely fresh CLI conversation instead of
+     `--resume`-ing the one the user just discarded. Every reader outside this
+     class only ever reads it. */
+  private _sessionId: string;
+  get sessionId(): string { return this._sessionId; }
+
+  /* The sessionId exposed to callers OUTSIDE this class (POST /tabs,
+     GET /tabs, GET /tabs/:id). Null until a conversation genuinely exists
+     under it — see canResume(). Internal spawn logic keeps reading the real
+     `sessionId` getter above directly; that identity is stable from the
+     moment the tab is created regardless of whether the CLI has used it yet.
+
+     This matters because the client's incognito lock keys off
+     `state.sessionId !== null` (TabController): a phone tab whose id and
+     sessionId are BOTH minted synchronously at POST /tabs time (registry.ts
+     assigns `randomUUID()` unconditionally) used to report a non-null
+     sessionId before the CLI had ever seen it, which permanently locked the
+     incognito toggle on a tab that had nothing to protect yet. */
+  get establishedSessionId(): string | null {
+    return this.canResume() ? this._sessionId : null;
+  }
 
   status: TabStatus = "idle";
   busy = false;
@@ -138,7 +160,7 @@ export class TabEngine {
     },
   ) {
     this.id = init.id;
-    this.sessionId = init.sessionId ?? init.restored?.sessionId ?? randomUUID();
+    this._sessionId = init.sessionId ?? init.restored?.sessionId ?? randomUUID();
     this.incognito = init.incognito ?? false;
     this.ring = new ReplayRing(`${deps.eventsDir}/${this.id}.ndjson`);
     const now = Date.now();
@@ -200,7 +222,7 @@ export class TabEngine {
   storedTab() {
     return {
       id: this.state.id,
-      sessionId: this.state.sessionId,
+      sessionId: this.establishedSessionId,
       title: this.state.title,
       createdAt: this.state.createdAt,
       updatedAt: this.state.updatedAt,
@@ -217,7 +239,7 @@ export class TabEngine {
   }
 
   indexEntry() {
-    return { id: this.id, title: this.state.title, sessionId: this.sessionId };
+    return { id: this.id, title: this.state.title, sessionId: this.establishedSessionId };
   }
 
   /* Engine-affecting patches (model/effort/permissionMode) do NOT restart a
@@ -362,6 +384,69 @@ export class TabEngine {
     this.status = "idle";
     this.emit("tab_status", this.statusPayload());
     this.save();
+  }
+
+  /* Reset the tab IN PLACE — the desktop's TabController.clear(), moved to the
+     side that actually owns the conversation. The tab id, its slot in the index
+     and its model / effort / permission mode survive; the child, the messages,
+     the replay history and the session id do not.
+
+     The new session id is the whole point. Wiping only the projection would
+     leave the next turn spawning `--resume <old uuid>`, so the model would
+     answer carrying the full context of a conversation the user believes they
+     discarded. That is precisely why the phone could not just call
+     TabController.clear() locally, and why this is a server operation. */
+  async clear(): Promise<{ sessionId: string; lastSeq: number }> {
+    /* Settle a queued child-replacement first: it must not land on the child
+       the next turn will spawn under the new id. */
+    const queued = this.pendingTeardown;
+    if (queued) {
+      this.pendingTeardown = null;
+      await queued;
+    }
+    /* abort() denies every outstanding approval, kills the child, releases the
+       busy flag and tells clients the in-flight turn is over — all four are
+       what discarding a conversation mid-stream should do. */
+    if (this.busy || this.hasLiveChild || this.pending.size > 0) await this.abort();
+
+    this._sessionId = randomUUID();
+    this.sessionEstablished = false;
+    this.resumeUnavailable = false;
+    this.resumedThisSpawn = false;
+    this.sawInitThisSpawn = false;
+    this.needsRespawn = false;
+    this.toolToMessage.clear();
+    this.currentAssistant = null;
+    this.currentAssistantId = null;
+    this.currentTurn = null;
+    this.stderrTail = "";
+    this.busy = false;
+    this.status = "idle";
+
+    const now = Date.now();
+    this.state.messages = [];
+    this.state.pendingApprovals.clear();
+    this.state.sessionId = this._sessionId;
+    this.state.title = "New chat";
+    this.state.createdAt = now;
+    this.state.updatedAt = now;
+    this.state.busy = false;
+
+    /* Wipe the replay history BEFORE the two frames below, so they become the
+       first entries of the new one and any client still holding an older cursor
+       is told to resync rather than being handed frames from a conversation
+       that no longer exists. */
+    await this.ring.reset(this.seq + 1);
+    this.emit("tab_status", this.statusPayload());
+    const lastSeq = this.emit("resync", { reason: "cleared", sessionId: this._sessionId });
+
+    /* Straight to disk rather than through the 500 ms debounce: a daemon killed
+       inside that window would come back holding the conversation the user just
+       discarded, which is exactly the bug this route exists to fix. Incognito
+       tabs keep touching nothing. */
+    if (!this.incognito) await this.deps.persistence.saveTab(this.state).catch(() => undefined);
+    this.touch();
+    return { sessionId: this._sessionId, lastSeq };
   }
 
   approve(requestId: string, allowed: boolean, reason?: string, updatedInput?: Record<string, unknown>): boolean {

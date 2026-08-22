@@ -76,6 +76,12 @@ export class RemoteVaultFeatures implements VaultFeatures {
       for (const cb of this.listeners) {
         try { cb(); } catch { /* a listener must not break the refresh */ }
       }
+    } catch (err) {
+      /* GatewayConnection.rpc() is documented not to throw, but start() calls
+         this fire-and-forget (`void this.refresh()`), so any surprise here —
+         a malformed row, a bridge exception — must not become an unhandled
+         rejection. Worst case the mention popup stays on its last snapshot. */
+      console.warn("[vaultgw] file index refresh failed", err);
     } finally {
       this.refreshing = false;
     }

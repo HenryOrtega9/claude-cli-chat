@@ -27,7 +27,7 @@
    browser's in dev). Node's global WebSocket must never be used against this
    daemon — see the caveat in CONTRACTS.md. */
 
-import type { GatewayTransport } from "./transport";
+import type { GatewayTransport, RpcResult } from "./transport";
 
 export type FrameType =
   | "hello"
@@ -90,7 +90,7 @@ export class GatewayConnection {
   private readonly tabListeners = new Map<string, Set<FrameListener>>();
   private readonly anyListeners = new Set<FrameListener>();
   private readonly linkListeners = new Set<(state: LinkState) => void>();
-  private readonly resyncListeners = new Set<(tabId: string) => void>();
+  private readonly resyncListeners = new Set<(tabId: string, reason: string) => void>();
 
   private stateTimer: ReturnType<typeof setTimeout> | null = null;
   private stateDirty = false;
@@ -123,7 +123,11 @@ export class GatewayConnection {
     return () => this.linkListeners.delete(cb);
   }
 
-  onResync(cb: (tabId: string) => void): () => void {
+  /* `reason` is the daemon's: "buffer_evicted" (the ring rolled past our cursor)
+     or "cleared" (someone reset this tab through POST /tabs/:id/clear). Both
+     want the same repair — refetch GET /tabs/:id — but they want very different
+     things said to the user, so the reason travels with the callback. */
+  onResync(cb: (tabId: string, reason: string) => void): () => void {
     this.resyncListeners.add(cb);
     return () => this.resyncListeners.delete(cb);
   }
@@ -213,8 +217,39 @@ export class GatewayConnection {
 
   /* ----- HTTP ------------------------------------------------------------- */
 
-  rpc(method: string, path: string, body?: unknown) {
-    return this.transport.rpc(method, path, body);
+  /* Every remote module (RemoteFileStorage, RemoteHost, RemoteSubprocessManager,
+     the shell, vault.ts) calls through here rather than the transport
+     directly, for two reasons:
+
+     1. A 401 from ANY route — not just the boot-time /health probe renderer.ts
+        already handles — means the token is bad (rotated, revoked) and no
+        amount of retrying fixes it. Detecting it centrally means a 401 from a
+        turn submission, a tab PATCH, a catalog refresh or a file-index poll
+        all flip the link state the same way the boot probe does, instead of
+        each caller having to remember to. Previously only the FIRST /health
+        check ever called markUnauthorized(); a token that went bad mid-session
+        surfaced as a wall of inline per-call error bubbles ("Gateway rejected
+        the token") while the socket layer, none the wiser, kept retrying
+        forever with fresh backoff — "Reconnecting to the Mac…" instead of the
+        actionable "re-enroll in Settings" banner.
+     2. `transport.rpc()` is documented to resolve with `{status:0,...}`
+        rather than throw, and both implementations (native.ts) honor that —
+        but not unconditionally: NativeTransport's own postMessage bridge
+        rejecting, or a rogue exception inside BrowserTransport's res.text(),
+        would still propagate as a real rejection. Every caller here is a
+        `void this.something()` fire-and-forget or a `.then()` with no
+        `.catch()`, on the documented assumption that rpc() cannot throw — so
+        making that guarantee airtight in ONE place is cheaper and more
+        reliable than auditing every call site for a `.catch()`. */
+  async rpc(method: string, path: string, body?: unknown): Promise<RpcResult> {
+    let res: RpcResult;
+    try {
+      res = await this.transport.rpc(method, path, body);
+    } catch (err) {
+      res = { status: 0, error: "other", message: err instanceof Error ? err.message : String(err) };
+    }
+    if (res.status === 401) this.markUnauthorized();
+    return res;
   }
 
   /* ----- socket lifecycle -------------------------------------------------- */
@@ -415,8 +450,9 @@ export class GatewayConnection {
     }
 
     if (frame.t === "resync" && tabId) {
+      const reason = typeof frame.payload?.reason === "string" ? frame.payload.reason : "buffer_evicted";
       for (const cb of this.resyncListeners) {
-        try { cb(tabId); } catch { /* ignore */ }
+        try { cb(tabId, reason); } catch { /* ignore */ }
       }
       return;
     }

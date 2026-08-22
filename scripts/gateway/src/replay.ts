@@ -97,6 +97,21 @@ export class ReplayRing {
     await this.writeChain;
   }
 
+  /* Throw the whole history away but keep serving the tab (POST /tabs/:id/clear).
+     `nextSeq` is the seq the FIRST frame after the reset will carry, which
+     becomes the new floor: a client whose cursor sits below it gets
+     `evicted: true` and resyncs, which is exactly right — the frames it missed
+     describe a conversation that no longer exists. A client that was fully
+     caught up has `since + 1 === nextSeq`, clears the floor check, finds no
+     file, and correctly receives nothing. */
+  async reset(nextSeq: number): Promise<void> {
+    await this.writeChain;
+    this.ring = [];
+    this.bytes = 0;
+    this.floor = nextSeq;
+    await rm(this.filePath, { force: true }).catch(() => undefined);
+  }
+
   async destroy(): Promise<void> {
     await this.writeChain;
     this.ring = [];

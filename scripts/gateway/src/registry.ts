@@ -136,16 +136,47 @@ export class TabRegistry {
     return engine;
   }
 
+  /* "Close" the tab: drop its live child and take it out of the OPEN index
+     (GET /tabs, the tab bar) so it stops being addressable as a live tab.
+     The conversation and its meta sidecar are deliberately left on disk —
+     see reopen() below and GET /conversations — so History can still list
+     and restore it. Only the replay ring's ndjson spill is discarded (via
+     engine.destroy()); nothing streams into a closed tab, so there is
+     nothing there for a client to catch up on. Incognito tabs are the one
+     exception: they never wrote a conversation file to begin with
+     (TabEngine.save() no-ops), so this is already the equivalent of a full
+     delete for them. */
   async remove(id: string): Promise<boolean> {
     const engine = this.tabs.get(id);
     if (!engine) return false;
     this.tabs.delete(id);
     if (this.activeTabId === id) this.activeTabId = this.list()[0]?.id ?? null;
     await engine.destroy();
-    await this.persistence.deleteTab(id).catch(() => undefined);
     await this.saveIndex();
     this.deps.onStateChange();
     return true;
+  }
+
+  /* Revive a tab History still knows about but that isn't currently live —
+     either it was never restored (a cold rehydrate skips nothing, so this is
+     really only reachable for a tab closed via remove() above) or it was
+     closed and its conversation file survived. Returns the SAME engine
+     (idempotent) if the tab is already open. Returns null when there is
+     truly no persisted conversation under that id — a tab that never
+     existed, or an incognito tab (which never wrote one). Reopening puts the
+     tab back in the OPEN index, exactly like a fresh POST /tabs, so it shows
+     up in the tab bar / GET /tabs again and is addressable for turns. */
+  async reopen(id: string): Promise<TabEngine | null> {
+    const existing = this.tabs.get(id);
+    if (existing) return existing;
+    const state = await this.persistence.loadTab(id);
+    if (!state) return null;
+    const engine = this.makeEngine({ id, restored: state });
+    this.tabs.set(id, engine);
+    if (!this.activeTabId) this.activeTabId = id;
+    await this.saveIndex();
+    this.deps.onStateChange();
+    return engine;
   }
 
   liveChildren(): number {

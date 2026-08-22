@@ -85,7 +85,7 @@ already degrades to a no-op on.
 | MCP server endpoint / transport | shown as "no endpoint reported" | `/catalog` carries name, enabled and status, not the endpoint string. |
 | Voice pause / per-channel stop | stop only | The bridge exposes `speak` and `speak {stop:true}`; AVSpeechSynthesizer has one queue. A button that claimed to pause would be lying. |
 | Window lock | removed | The daemon is the single writer of its own store; two clients is a supported case, not a corruption risk. |
-| "New chat" (header) | closes the tab and opens a fresh one | Clearing in place would wipe the UI while the daemon still held the old session id, so the next turn would `--resume` a conversation the user believes they discarded. |
+| "New chat" (header) | `POST /tabs/:id/clear`, then `TabController.clear()` in place | The daemon owns the conversation, the replay spill and the session id, so a local-only clear left all three behind: the chat returned on the next restore and the next turn `--resume`d it. Close-and-recreate was the first workaround and was worse — it churned the tab id, lost the chat from History, and fell back to a neighbouring tab instead of a fresh chat whenever more than one was open. |
 
 ## Screenshots
 

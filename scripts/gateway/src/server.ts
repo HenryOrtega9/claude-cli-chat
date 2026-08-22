@@ -209,6 +209,20 @@ export class GatewayServer {
       return sendJson(res, 200, { ticket: this.mintTicket(), expiresIn: TICKET_TTL_MS / 1000 });
     }
 
+    /* --- conversations (History) ---
+       Every conversation ever created, open or closed — the superset GET
+       /tabs can't give you, because GET /tabs only lists tabs currently
+       holding a slot in the OPEN index. Sourced straight from the same
+       listConversations() the desktop's History modal already trusts, since
+       the daemon's own Persistence instance is a real filesystem adapter
+       (installNodePlatform) and remove() (DELETE /tabs/:id) leaves the
+       conversation file and its meta sidecar on disk precisely so this stays
+       true after a tab is closed. */
+    if (method === "GET" && path === "/conversations") {
+      const conversations = await this.deps.registry.persistence.listConversations();
+      return sendJson(res, 200, { conversations });
+    }
+
     /* --- tabs --- */
     if (path === "/tabs" && method === "GET") return sendJson(res, 200, this.deps.registry.index());
     if (path === "/tabs" && method === "POST") {
@@ -220,7 +234,19 @@ export class GatewayServer {
         permissionMode: typeof body?.permissionMode === "string" ? body.permissionMode : undefined,
         incognito: body?.incognito === true,
       });
-      return sendJson(res, 200, { id: engine.id, sessionId: engine.sessionId });
+      return sendJson(res, 200, { id: engine.id, sessionId: engine.establishedSessionId });
+    }
+
+    /* Revive a closed-but-persisted conversation from History. Handled BEFORE
+       the generic tab lookup below, which 404s on anything not currently
+       live — that lookup is exactly what a closed tab fails, and reopening
+       one is the whole point of this route. Idempotent: reopening an already
+       -open tab just returns its current projection. */
+    const reopenMatch = /^\/tabs\/([^/]+)\/reopen$/.exec(path);
+    if (reopenMatch && method === "POST") {
+      const engine = await this.deps.registry.reopen(decodeURIComponent(reopenMatch[1]));
+      if (!engine) return sendJson(res, 404, { error: "no_such_tab" });
+      return sendJson(res, 200, engine.storedTab());
     }
 
     const tabMatch = /^\/tabs\/([^/]+)(?:\/([a-z]+))?$/.exec(path);
@@ -234,6 +260,17 @@ export class GatewayServer {
         case "POST abort": {
           await engine.abort();
           return sendJson(res, 200, { ok: true });
+        }
+        /* "New chat" without losing the tab. DELETE + POST /tabs was the phone's
+           only way to express this, which churned the tab id, dropped the chat
+           out of History and — whenever the DELETE failed or another tab was
+           open — left the old conversation to come back on the next restore. */
+        case "POST clear": {
+          const { sessionId, lastSeq } = await engine.clear();
+          /* The index carries the title and the session id, both of which just
+             changed. */
+          await this.deps.registry.saveIndex();
+          return sendJson(res, 200, { ok: true, sessionId, lastSeq });
         }
         case "POST approve": return this.postApprove(req, res, engine);
         case "POST title": return this.postTitle(res, engine);
@@ -365,8 +402,20 @@ export class GatewayServer {
     const timeoutS = clampInt(url.searchParams.get("timeout"), 60, 1, WAIT_MAX_S);
 
     /* Answer immediately if the event the client is waiting for already
-       happened while it was reconnecting. */
-    const { frames } = await engine.replaySince(since - 1, 5000);
+       happened while it was reconnecting. `since` is clamped to >= 0 above,
+       so `since - 1` underflows to -1 exactly when a client's cursor is 0
+       (a brand-new tab, or one it has never heard from). ReplayRing.since()
+       treats anything below its floor (1) as "gap older than the ring" and,
+       for -1 specifically, short-circuits straight to `evicted: true` with
+       no frames — even when the ring holds every frame the tab has ever
+       produced — because `since + 1 (0) < floor (1)` is true regardless of
+       what is actually on disk. That silently defeated this fast path for
+       every zero-cursor /wait: the exact case a phone hits parking a
+       background wait on a tab whose first turn just finished, or an
+       approval that just resolved, while it was reconnecting. Floor the
+       argument at 0 so a zero cursor reads as "everything", matching the
+       `>= since` semantics `already` below actually wants. */
+    const { frames } = await engine.replaySince(Math.max(0, since - 1), 5000);
     const already = frames.find(f => (f.t === "turn_done" || f.t === "approval_request") && f.seq >= since);
     if (already) return sendJson(res, 200, { frame: already, lastSeq: engine.lastSeq });
 
@@ -408,15 +457,29 @@ export class GatewayServer {
       this.deps.log(`ws ${conn.id} closed`);
     });
 
-    void this.sendHello(conn);
+    this.sendHello(conn);
   }
 
-  private async sendHello(conn: WsConnection): Promise<void> {
-    const catalog = await this.catalog().catch(() => null);
+  /* Deliberately synchronous, reading catalogCache directly rather than
+     `await`ing `this.catalog()`. This used to await the full catalog build —
+     harmless on a warm cache (a 5-minute hit), but `buildCatalog()` shells
+     out to `claude mcp list`, which the code's own comments elsewhere note
+     "can take seconds when a remote connector is slow", and the cache is
+     cold on every daemon restart (`catalogAt` starts at 0). Confirmed live
+     against a real account with several MCP servers: the very first
+     reconnect after a restart stalled well past 10s waiting on `hello` —
+     which blocked not just `catalogHash` but the `tabs` list every
+     reconnecting client needs to seed its cursors and resubscribe. Exactly
+     the reconnect-after-Mac-sleep / network-switch path this daemon exists
+     to make fast. `catalogHash` is a pure optimization (lets the client skip
+     re-rendering its pickers when nothing changed) — a stale or null value
+     here costs nothing beyond one redundant `/catalog` fetch, which
+     `RemoteHost.prime()` already makes independently of `hello`. */
+  private sendHello(conn: WsConnection): void {
     conn.send(JSON.stringify(makeFrame("hello", null, 0, {
       serverStartedAt: this.deps.startedAt,
       tabs: this.deps.registry.list().map(t => ({ id: t.id, lastSeq: t.lastSeq, status: t.status })),
-      catalogHash: catalog?.hash ?? null,
+      catalogHash: this.catalogCache?.hash ?? null,
     })));
   }
 
@@ -492,6 +555,26 @@ export class GatewayServer {
 
     const since = (msg.since && typeof msg.since === "object" ? msg.since : {}) as Record<string, number>;
     const targets = this.deps.registry.list().filter(t => tabs === "all" || tabs.has(t.id));
+
+    /* The client's `since` map names every tab it is tracking a cursor for,
+       independent of whether this subscribe asked for "all" or an explicit
+       list. A tab named there but absent from the registry entirely (deleted
+       from another device while this client was disconnected, or a
+       subscribe racing the daemon's own boot-time restore()) has no engine
+       to replay from and produces no live frames ever again — the
+       `evicted: true` signal below only fires for a tab the registry DOES
+       still hold, whose ring happened to roll past the cursor. Without this,
+       the client just hears silence for that tab forever: no resync, no
+       error, the composer (if it was mid-turn) stays locked. Reusing the
+       `resync` frame with reason "gone" routes through the client's existing
+       resync handling rather than inventing a second signal it would also
+       have to wire up. */
+    const known = new Set(this.deps.registry.list().map(t => t.id));
+    for (const tabId of Object.keys(since)) {
+      if (known.has(tabId)) continue;
+      conn.send(JSON.stringify(makeFrame("resync", tabId, 0, { reason: "gone" })));
+    }
+
     for (const engine of targets) {
       const cursor = Number.isFinite(since[engine.id]) ? Number(since[engine.id]) : 0;
       if (cursor >= engine.lastSeq) continue;

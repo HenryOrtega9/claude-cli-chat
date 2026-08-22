@@ -9,10 +9,14 @@
      replay/seq/session-id machinery is keyed on the daemon's.
    - closeTab() DELETEs the tab. The daemon owns the conversation file and the
      event spill, so a local-only delete would leak both.
-   - "New chat" (the header's clear button) closes the tab and opens a fresh
-     one instead of calling TabController.clear(). Clearing in place would wipe
-     the UI while leaving the daemon holding the old session id, so the next
-     turn would `--resume` a conversation the user believes they discarded.
+   - "New chat" (the header's clear button) POSTs /tabs/:id/clear and only then
+     calls TabController.clear() locally. A purely local clear would wipe the UI
+     while the daemon kept the messages, the replay ring and the session id, so
+     the chat came back on the next restore and the next turn `--resume`d a
+     conversation the user believed they had discarded. Closing and recreating
+     the tab was the earlier workaround: it churned the tab id, dropped the chat
+     out of History, and did not even yield a fresh chat when other tabs were
+     open, because closeTab falls back to selecting a neighbour.
    - There is no window lock. The daemon is the single writer of its own store,
      and two phones talking to it is a supported case (each gets the same
      frames), not a corruption risk — which is exactly what the lock existed to
@@ -88,6 +92,13 @@ function sanitizeRestoredTab(state: TabState): TabState {
   return state;
 }
 
+/* How long a tab we cleared ourselves ignores the daemon's `resync` for that
+   clear. Generous on purpose: the frame travels over the WebSocket while the
+   answer came back over HTTP, so it can land either side of the response, and
+   the only cost of a wide window is that a genuine buffer_evicted resync for
+   the same tab in the same second is skipped. */
+const SELF_CLEAR_GRACE_MS = 10_000;
+
 const CONNECTIVITY_TEXT: Record<string, string> = {
   ok: "",
   starting: "Mac is waking the gateway…",
@@ -110,6 +121,9 @@ export class IosChatShell {
   /* tab id -> the model/effort/mode triple last accepted by the daemon, so the
      per-token onStateChange flood does not become a PATCH flood. */
   private readonly pushedConfig = new Map<string, string>();
+  /* Tabs this client just cleared, so the daemon's own `resync` for that clear
+     is not answered with a rebuild we have already done in place. */
+  private readonly selfCleared = new Set<string>();
 
   constructor(
     private readonly root: HTMLElement,
@@ -156,7 +170,7 @@ export class IosChatShell {
     });
     this.installBypassModeGuard();
     this.conn.onLinkState(state => this.renderLinkState(state));
-    this.conn.onResync(tabId => void this.resyncTab(tabId));
+    this.conn.onResync((tabId, reason) => void this.resyncTab(tabId, reason));
 
     await this.restoreTabs();
   }
@@ -365,9 +379,28 @@ export class IosChatShell {
   async closeTab(tabId: string): Promise<void> {
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
+    await this.conn.rpc("DELETE", `/tabs/${encodeURIComponent(tabId)}`);
+    await this.removeLocalTab(idx, tabId);
+  }
+
+  /* The daemon told us (over the socket, `resync{reason:"gone"}`) that this
+     tab no longer exists on its side at all — most likely DELETEd from
+     another device while this one was disconnected. Unlike closeTab() there
+     is nothing left to delete server-side, and unlike a plain resync there is
+     nothing to reload from (GET /tabs/:id 404s too), so this just tears down
+     the local half and says why. */
+  private async dropGoneTab(idx: number, tabId: string): Promise<void> {
+    await this.removeLocalTab(idx, tabId);
+    platform.notify("This chat was removed on the Mac.", 5000);
+  }
+
+  /* Shared teardown: destroy the controller, forget the tab everywhere on
+     this client, and pick a sensible new active tab. Callers differ only in
+     whether the daemon still needs telling (closeTab) or already knows
+     (dropGoneTab). */
+  private async removeLocalTab(idx: number, tabId: string): Promise<void> {
     const [removed] = this.tabs.splice(idx, 1);
     await removed.destroy();
-    await this.conn.rpc("DELETE", `/tabs/${encodeURIComponent(tabId)}`);
     this.conn.forgetTab(tabId);
     this.pushedConfig.delete(tabId);
     this.storage.invalidate();
@@ -384,18 +417,51 @@ export class IosChatShell {
     void this.saveIndex();
   }
 
-  /* The header's "new chat" button. See the class header for why this is a
-     close-and-create rather than TabController.clear(). */
+  /* The header's "new chat" button: reset the ACTIVE tab in place, keeping its
+     id, its slot in the tab bar and its model / effort / mode. See the class
+     header for why the daemon has to be told first. */
   private async newChat(): Promise<void> {
     const active = this.tabs.find(t => t.state.id === this.activeTabId);
-    if (active && active.state.messages.length === 0) {
-      /* Already empty — nothing to discard, and recreating would churn a tab
-         id for no reason. */
+    if (!active) {
+      await this.createTab();
+      return;
+    }
+    if (active.state.messages.length === 0 && !active.isBusy()) {
+      /* Already empty — nothing to discard, and a round trip would only churn
+         the session id of a chat that has not started. */
       active.focusInput();
       return;
     }
-    if (active) await this.closeTab(active.state.id);
-    else await this.createTab();
+    const tabId = active.state.id;
+    /* Suppress the `resync` the daemon broadcasts for this clear: it is meant
+       for OTHER clients, and letting it rebuild the controller we are about to
+       reset ourselves would tear down and remount the tab for nothing. */
+    this.selfCleared.add(tabId);
+    window.setTimeout(() => this.selfCleared.delete(tabId), SELF_CLEAR_GRACE_MS);
+    const res = await this.conn.rpc("POST", `/tabs/${encodeURIComponent(tabId)}/clear`);
+    if (res.status !== 200) {
+      this.selfCleared.delete(tabId);
+      platform.notify(
+        res.status === 0
+          ? "Can't reach the gateway — the chat was not cleared."
+          : `Gateway refused to clear the chat (HTTP ${res.status}).`,
+        6000,
+      );
+      return;
+    }
+    /* Jump the cursor past the wiped history. Without this the next reconnect
+       subscribes with a `since` below the ring's new floor, the daemon answers
+       `resync`, and the tab rebuilds itself for no reason. */
+    const lastSeq = (res.json as { lastSeq?: unknown } | undefined)?.lastSeq;
+    if (typeof lastSeq === "number") this.conn.seedSeq(tabId, lastSeq);
+    this.storage.invalidateTab(tabId);
+    /* The shared reset: kills this client's session handle, empties the
+       messages, restores the welcome screen. The daemon has already minted the
+       new session id, and the next `tab_status` carries it. */
+    await active.clear();
+    this.renderTabBar();
+    void this.saveIndex();
+    active.focusInput();
   }
 
   private async forkFromMessage(source: TabController, messageId: string): Promise<void> {
@@ -458,13 +524,21 @@ export class IosChatShell {
     void this.saveIndex();
   }
 
-  /* The daemon's replay ring no longer reaches back to our cursor. Rebuilding
-     from GET /tabs/:id is the contract's prescribed answer: the daemon's own
-     projection is authoritative, and the controller re-renders from it. */
-  private async resyncTab(tabId: string): Promise<void> {
+  /* The daemon's replay ring no longer reaches back to our cursor — either it
+     rolled over, or someone cleared the tab and the old history is gone.
+     Rebuilding from GET /tabs/:id is the contract's prescribed answer in both
+     cases: the daemon's own projection is authoritative, and the controller
+     re-renders from it. */
+  private async resyncTab(tabId: string, reason = "buffer_evicted"): Promise<void> {
     if (this.restoring) return;
+    if (this.selfCleared.has(tabId)) return;
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
+    /* "gone" (server.ts handleSubscribe): the daemon has no engine at all for
+       this id — deleted from another device, most likely. Unlike a plain
+       buffer eviction there is nothing to rebuild from (GET /tabs/:id 404s
+       too), so this is a removal, not a resync. */
+    if (reason === "gone") return this.dropGoneTab(idx, tabId);
     this.storage.invalidateTab(tabId);
     const fresh = await this.persistence.loadTab(tabId);
     if (!fresh) return;
@@ -478,7 +552,12 @@ export class IosChatShell {
     if (wasActive) this.selectTab(tabId, { skipSave: true });
     else controller.hide();
     this.renderTabBar();
-    platform.notify("Reloaded this chat from the Mac (the replay buffer had rolled over).", 5000);
+    platform.notify(
+      reason === "cleared"
+        ? "This chat was cleared on another device."
+        : "Reloaded this chat from the Mac (the replay buffer had rolled over).",
+      5000,
+    );
   }
 
   private renderTabBar(): void {
