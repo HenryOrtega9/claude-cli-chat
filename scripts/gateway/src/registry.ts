@@ -28,6 +28,17 @@ export class NoCapacityError extends Error {
   }
 }
 
+/* The id grammar the daemon actually mints — `ios-<base36>-<base36>` (see
+   create() below) plus whatever a restored id already looked like, which was
+   minted the same way in an earlier process. Any route that turns a
+   caller-supplied id into a filesystem path (reopen() is the one today —
+   everything else goes through the in-memory `tabs` Map) must reject
+   anything outside this shape before it reaches Persistence, or a
+   percent-encoded `../..` id survives WHATWG URL normalization (which only
+   canonicalizes literal `..` segments, not encoded ones) long enough to read
+   or create a file outside the tab store. */
+export const TAB_ID_RE = /^[A-Za-z0-9_-]+$/;
+
 export type RegistryDeps = {
   vault: string;
   storeDir: string;
@@ -61,7 +72,9 @@ export class TabRegistry {
     for (const entry of index.tabs) {
       const state = await this.persistence.loadTab(entry.id);
       if (!state) continue;
-      this.tabs.set(entry.id, this.makeEngine({ id: entry.id, restored: state }));
+      const engine = this.makeEngine({ id: entry.id, restored: state });
+      await engine.restoreFromDisk();
+      this.tabs.set(entry.id, engine);
     }
     this.deps.log(`restored ${this.tabs.size} tab(s) from ${this.deps.storeDir}`);
   }
@@ -167,11 +180,18 @@ export class TabRegistry {
      tab back in the OPEN index, exactly like a fresh POST /tabs, so it shows
      up in the tab bar / GET /tabs again and is addressable for turns. */
   async reopen(id: string): Promise<TabEngine | null> {
+    /* Guard here too, not just in server.ts's route: this is the one place a
+       caller-supplied id turns into a filesystem path (Persistence.loadTab ->
+       NodeFileStorage.abs, no containment check of its own), so any future
+       caller of reopen() is covered even if it skips the HTTP layer's own
+       check. */
+    if (!TAB_ID_RE.test(id)) return null;
     const existing = this.tabs.get(id);
     if (existing) return existing;
     const state = await this.persistence.loadTab(id);
     if (!state) return null;
     const engine = this.makeEngine({ id, restored: state });
+    await engine.restoreFromDisk();
     this.tabs.set(id, engine);
     if (!this.activeTabId) this.activeTabId = id;
     await this.saveIndex();
@@ -196,9 +216,27 @@ export class TabRegistry {
     }
   }
 
+  /* The on-disk projection of the tab list: everything index() reports minus
+     any incognito tab. index() itself stays unfiltered — GET /tabs and the
+     live tab bar legitimately show an incognito tab for as long as THIS
+     process has it open — but persisting its id, generated title and
+     established sessionId into tabs.json is exactly the disk write
+     CLAUDE.md's incognito rule (and TabEngine.save()'s no-op) exist to
+     prevent. Falls back to the first surviving tab (or null) when the
+     currently-active tab is the one being filtered out, so a restored index
+     never points activeTabId at a tab that isn't in it. */
+  private persistableIndex() {
+    const tabs = this.list().filter(t => !t.incognito);
+    const activeStillPresent = this.activeTabId !== null && tabs.some(t => t.id === this.activeTabId);
+    return {
+      activeTabId: activeStillPresent ? this.activeTabId : (tabs[0]?.id ?? null),
+      tabs: tabs.map(t => t.indexEntry()),
+    };
+  }
+
   async saveIndex(): Promise<void> {
     try {
-      await this.persistence.saveIndex(this.index());
+      await this.persistence.saveIndex(this.persistableIndex());
     } catch (err) {
       this.deps.log(`index save failed: ${String(err)}`);
     }

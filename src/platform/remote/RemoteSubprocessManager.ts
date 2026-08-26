@@ -227,6 +227,22 @@ export class RemoteTabSession implements TabSessionLike {
     }
   }
 
+  /* dispose() minus the /abort POST. Not part of TabSessionLike — TabController
+     reaches for it structurally (see teardownSession's `opts.abort`), the same
+     way it reaches for onApprovalResolved. Exists for the iOS shell's resync
+     remount path (ios-web/src/shell.ts resyncTab): a resync is this CLIENT
+     catching up (replay ring rolled over, another device cleared/reopened the
+     tab) — it says nothing about whether the daemon's turn should stop, so
+     destroying the old controller to remount a fresh one around the same tab
+     must not abort a turn the Mac may still be generating for it. */
+  detach(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.pendingApprovals.clear();
+  }
+
   /* ----- outbound --------------------------------------------------------- */
 
   sendUserText(text: string): void {

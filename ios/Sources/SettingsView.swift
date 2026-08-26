@@ -175,10 +175,15 @@ struct SettingsView: View {
                 status = "\(schemeLabel) — \(state.message) (\(failure.rawValue): \(message))"
             }
             if result.httpsAvailable {
-                if scheme != "https" || port != 443 {
+                // Only the scheme changes here — `port` stays whatever the
+                // http daemon uses. `GatewayConfig.url`/`webSocketOrigin`
+                // both omit the port for https and default to 443, the
+                // standard `tailscale serve` port, so there is no separate
+                // "https port" to persist, and the http port survives a
+                // later switch back if https ever stops working.
+                if scheme != "https" {
                     scheme = "https"
-                    port = 443
-                    status += " Switched Settings to HTTPS (port 443) — it's available now."
+                    status += " Switched Settings to HTTPS — it's available now."
                 }
             } else {
                 status += " HTTPS isn't available on this gateway yet; staying on HTTP."

@@ -32,6 +32,25 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
    letting a peer allocate unbounded memory. */
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
+/* A peer that stops draining (backgrounded, radio asleep, but the TCP socket
+   never got a FIN) leaves every subsequent send() queued in Node's writable
+   buffer. With --include-partial-messages on by default that's one frame per
+   token delta, so a long agentic run on a dead socket can pile up the whole
+   turn in daemon RSS. Closing once the queue crosses this is far above any
+   real burst (a normal turn's frames are a few KB apiece) and well below
+   "the daemon's memory got hurt." */
+const MAX_QUEUED_BYTES = 4 * 1024 * 1024;
+
+/* Nothing at the HTTP layer covers a socket once it's been handed off to the
+   `upgrade` event — server.ts's keepAliveTimeout/headersTimeout are pure
+   HTTP keep-alive knobs and stop applying at that point. The client already
+   pings every 30s with a 10s pong deadline, but that only protects the
+   client's own view of liveness; nothing server-side ever closed a socket a
+   phone walked away from without sending a FIN. `setTimeout` fires after
+   this many ms with no read OR write activity — a healthy connection resets
+   it on every ping/pong/frame in either direction and never gets close. */
+const IDLE_TIMEOUT_MS = 90_000;
+
 export type WsConnection = {
   readonly id: number;
   send(text: string): void;
@@ -104,6 +123,15 @@ export function acceptUpgrade(req: IncomingMessage, socket: Duplex, head?: Buffe
      token stream reads as stutter. The upgrade socket is always a net.Socket
      in practice; the cast is to Duplex's narrower type, not a guess. */
   (socket as Duplex & { setNoDelay?: (v: boolean) => void }).setNoDelay?.(true);
+  /* See IDLE_TIMEOUT_MS above: this is the only server-side liveness check on
+     an upgraded socket. `setTimeout`'s callback becomes a 'timeout' listener,
+     so it can fire more than once if the peer stays idle past a first grace
+     period that didn't get cleaned up for some other reason -- conn.close()
+     is idempotent (checks `this.closed`), so that's harmless. */
+  (socket as Duplex & { setTimeout?: (ms: number, cb: () => void) => void }).setTimeout?.(IDLE_TIMEOUT_MS, () => {
+    traceWs(conn.id, `idle timeout after ${IDLE_TIMEOUT_MS}ms with no activity; closing`);
+    conn.close(1008, "idle_timeout");
+  });
   return conn;
 }
 
@@ -192,6 +220,20 @@ class Connection implements WsConnection {
 
   send(text: string): void {
     if (this.closed) return;
+    /* See MAX_QUEUED_BYTES above: `write()`'s own `false` return only says
+       Node's internal buffer crossed its highWaterMark, which is far too low
+       a bar to act on for a peer that is merely slow. `writableLength` is the
+       actual queue depth; a peer that isn't draining at all lets it climb
+       without bound instead. Typed `Duplex` doesn't expose it (only
+       `stream.Writable` does, in the .d.ts), but the upgrade socket is always
+       a real net.Socket at runtime, same as the setNoDelay/setTimeout casts
+       above. */
+    const queued = (this.socket as Duplex & { writableLength?: number }).writableLength ?? 0;
+    if (queued > MAX_QUEUED_BYTES) {
+      traceWs(this.id, `send() closing: writableLength ${queued}B exceeds ${MAX_QUEUED_BYTES}B cap (peer not draining)`);
+      this.close(1008, "backpressure");
+      return;
+    }
     try {
       const wrote = this.socket.write(encodeFrame(0x1, Buffer.from(text, "utf8")));
       if (!wrote) traceWs(this.id, "send() write() returned false (backpressure; Node still queues and flushes it)");

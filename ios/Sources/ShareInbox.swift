@@ -42,19 +42,34 @@ enum ShareInbox {
     /// `NativeBridge.dispatch` queues until `markPageReady()` fires and
     /// replays in order, the same mechanism a `connectivity` or `safeArea`
     /// dispatch arriving before boot relies on.
+    ///
+    /// The file reads and base64 encoding (up to 4 images, downscaled to
+    /// 2048px JPEG q0.82 — several MB before encoding, ~1.33x that after) run
+    /// off the main actor: `drain` fires on `.active`/`didFinish`, exactly the
+    /// launch/foreground moment where a synchronous multi-megabyte read +
+    /// encode would show up as a hitch.
     @MainActor
     static func drain(bridge: NativeBridge) {
         guard let dir = directoryURL else { return }
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
-        for name in names.filter({ $0.hasSuffix(".json") }).sorted() {
-            let manifestURL = dir.appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: manifestURL) else { continue }
-            try? fm.removeItem(at: manifestURL)
-            guard let item = try? JSONDecoder().decode(Item.self, from: data) else { continue }
-            dispatch(item, dir: dir, fm: fm, bridge: bridge)
+        Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+            var payloads: [[String: Any]] = []
+            for name in names.filter({ $0.hasSuffix(".json") }).sorted() {
+                let manifestURL = dir.appendingPathComponent(name)
+                guard let data = try? Data(contentsOf: manifestURL) else { continue }
+                try? fm.removeItem(at: manifestURL)
+                guard let item = try? JSONDecoder().decode(Item.self, from: data) else { continue }
+                if let payload = buildPayload(item, dir: dir, fm: fm) {
+                    payloads.append(payload)
+                }
+            }
+            sweepOrphans(dir: dir, fm: fm, names: names)
+            guard !payloads.isEmpty else { return }
+            await MainActor.run {
+                for payload in payloads { bridge.dispatch("share", payload) }
+            }
         }
-        sweepOrphans(dir: dir, fm: fm, names: names)
     }
 
     /// A `ShareViewController` process killed (OOM under the ~120MB extension
@@ -67,10 +82,10 @@ enum ShareInbox {
     ///
     /// `names` is the directory listing from BEFORE this drain's own
     /// processing, so files this run's manifests just legitimately consumed
-    /// (and already deleted, in `dispatch`'s `defer`) are simply not found on
-    /// re-lookup and skipped — `attributesOfItem` on a path that no longer
-    /// exists returns nil, which the guard below treats as "leave it alone",
-    /// not an error.
+    /// (and already deleted, in `buildPayload`'s `defer`) are simply not
+    /// found on re-lookup and skipped — `attributesOfItem` on a path that no
+    /// longer exists returns nil, which the guard below treats as "leave it
+    /// alone", not an error.
     ///
     /// The 60s age cutoff is what keeps this from racing a legitimate
     /// in-flight write: a second Share Extension process that has written its
@@ -91,8 +106,10 @@ enum ShareInbox {
         }
     }
 
-    @MainActor
-    private static func dispatch(_ item: Item, dir: URL, fm: FileManager, bridge: NativeBridge) {
+    /// Builds one `share` dispatch payload from a manifest item — the file
+    /// reads and base64 encoding, run off the main actor by `drain`. Returns
+    /// nil when there is nothing to send (no text and no readable image).
+    private static func buildPayload(_ item: Item, dir: URL, fm: FileManager) -> [String: Any]? {
         var payload: [String: Any] = [:]
         if let text = item.text, !text.isEmpty { payload["text"] = text }
 
@@ -111,7 +128,7 @@ enum ShareInbox {
         }
         if !images.isEmpty { payload["images"] = images }
 
-        guard payload["text"] != nil || payload["images"] != nil else { return }
-        bridge.dispatch("share", payload)
+        guard payload["text"] != nil || payload["images"] != nil else { return nil }
+        return payload
     }
 }

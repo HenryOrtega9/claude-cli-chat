@@ -59,16 +59,18 @@ struct RootView: View {
     @State private var bannerHeight: CGFloat = 0
     @State private var safeInsets = EdgeInsets()
     /// `scenePhase` transitions .active -> .inactive -> .background as two
-    /// separate `onChange` firings on a backgrounding event, and both used to
-    /// be caught by `case .inactive, .background:` — arming the background
-    /// `/wait` twice per backgrounding. The two live `URLSessionDownloadTask`s
-    /// that produced are reconciled down to one by `arm`'s own
-    /// `getAllTasks`-based cleanup, but that cleanup is asynchronous, so
-    /// there is a real window where both are in flight and a delivered frame
-    /// can post two local notifications for the same turn. Gate the actual
-    /// arm to once per backgrounding; keep dispatching `suspend` on both
-    /// transitions since `.inactive` fires first and gives the page the most
-    /// time to flush `setState` before the arm reads it.
+    /// separate `onChange` firings on a real backgrounding event, but
+    /// `.inactive` alone is not a reliable backgrounding signal — Control
+    /// Center, a call banner, and the notification-permission alert
+    /// (`requestAuthorizationIfNeeded`, whose alert the `.onAppear` comment
+    /// above already flags as leaving the scene `.inactive` indefinitely)
+    /// all pass through it too. Only `.background` tears down the socket and
+    /// arms the wait; `armedForBackground` just guards against `.background`
+    /// somehow firing twice without an intervening `.active` (defensive: two
+    /// live `URLSessionDownloadTask`s racing could otherwise double-notify
+    /// for the same turn). See `TurnNotifier.armWhenBackgrounded` for how the
+    /// arm itself waits for the post-suspend `setState` flush to land rather
+    /// than reading a snapshot that's still mid-flight.
     @State private var armedForBackground = false
 
     var body: some View {
@@ -165,20 +167,25 @@ struct RootView: View {
                 bridge.dispatch("resume")
                 if let state = monitor.state { bridge.dispatchConnectivity(state) }
                 ShareInbox.drain(bridge: bridge)
-            case .inactive, .background:
-                // The page closes its socket and flushes setState; the
-                // persisted busyTabs from that call is what arms the wait.
-                // This case fires once for .inactive and again for
-                // .background on the same backgrounding event — dispatch
-                // suspend both times (idempotent: GatewayConnection.suspend
-                // just closes an already-closed socket the second time), but
-                // only arm the background wait once, or two /wait downloads
-                // can race and double-notify.
+            case .inactive:
+                // Transient: Control Center, a call banner, a permission
+                // alert can all land here without the app actually
+                // backgrounding. Tearing down the socket and connectivity
+                // polling for the few seconds one of those is on screen is
+                // worse than leaving them alone — only .background is a
+                // trustworthy "the app is actually going away" signal.
+                break
+            case .background:
+                // The page closes its socket and flushes setState.
+                // TurnNotifier arms once that flush is confirmed to have
+                // landed (or a short fallback elapses), not off a
+                // synchronous UserDefaults read here — the flush is still
+                // two async postMessage hops away at the instant this fires.
                 bridge.dispatch("suspend")
                 monitor.stop()
                 if !armedForBackground {
                     armedForBackground = true
-                    TurnNotifier.shared.armFromPersistedState()
+                    TurnNotifier.shared.armWhenBackgrounded()
                 }
             @unknown default:
                 break

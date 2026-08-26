@@ -45,6 +45,11 @@
     VAULT_GATEWAY_APPROVAL_TIMEOUT_S default 600
     VAULT_GATEWAY_CLAUDE            default: autodetected claude binary
     VAULT_GATEWAY_PARTIAL           "0" disables --include-partial-messages
+    VAULT_GATEWAY_TRACE_EVENTS      "1" re-enables the CLI bridge's per-event
+                                    console.log/warn tracing (off by default:
+                                    with partial messages on, that's ~one
+                                    line per token delta into this file,
+                                    unrotated)
 -->
 <plist version="1.0">
 <dict>

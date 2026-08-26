@@ -49,8 +49,17 @@ export interface GatewayTransport {
   getConfig(): Promise<GatewayConfig>;
   rpc(method: string, path: string, body?: unknown): Promise<RpcResult>;
   /* Mints a single-use ticket and returns the full `ws(s)://…/ws/<ticket>`
-     URL. Rejects (or resolves with `null`) when the daemon is unreachable. */
-  wsUrl(): Promise<string | null>;
+     URL. `url` resolves `null` (never rejects) when the daemon is
+     unreachable OR when the mint was refused for any other reason — the
+     caller (GatewayConnection.connect()) cannot tell those apart from `url`
+     alone and must retry either way. `unauthorized` is the one refusal
+     reason that must NOT be retried: a 401 minting the ticket means the
+     bearer token itself is bad, same as a 401 from any other route (see
+     GatewayConnection.rpc()'s header comment on why every 401 has to call
+     markUnauthorized()), so it is surfaced explicitly rather than collapsing
+     into the same "url is null, schedule another attempt" path a merely
+     unreachable daemon takes. */
+  wsUrl(): Promise<{ url: string | null; unauthorized: boolean }>;
   setState(state: GatewayClientState): void;
   haptic(kind: "light" | "medium" | "success" | "warning" | "error" | "selection"): void;
   copy(text: string): void;

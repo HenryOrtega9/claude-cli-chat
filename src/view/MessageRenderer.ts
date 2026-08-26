@@ -86,6 +86,29 @@ export class MessageListRenderer {
      before constructing this class, but nothing here should hard-depend on
      that ordering). */
   private scrollBottomBtn: HTMLElement | null = null;
+  /* Streaming re-render throttle. Every delta from the daemon (text_delta,
+     thinking_delta, a tool's content_block_start/stop, a completed
+     input_json_delta boundary) calls upsertMessage() again for the SAME
+     growing message, and each call is a full doUpsert pass: renderContent
+     re-parses and re-sanitizes the WHOLE accumulated text (see
+     renderContent/renderMarkdownInto), not just what's new. Left
+     unthrottled, a 400-delta reply reparses and re-sanitizes its own
+     (growing) markup 400 times on a phone's main thread while it's also
+     trying to lay out and scroll. While `msg.streaming` is true, calls are
+     coalesced per message id: the first in a burst renders immediately (the
+     user still sees the first token land without delay), and any that land
+     within STREAM_THROTTLE_MS of it are folded into a single trailing
+     render rather than each getting their own pass — `msg` is the SAME
+     mutable object every caller mutates in place, so whichever call the
+     trailing timer fires under already reflects every delta that arrived
+     in between. A message's final call (`msg.streaming` false or absent —
+     the authoritative post-stream `assistant` event, or any non-streaming
+     upsert) always renders immediately at full fidelity, bypassing the
+     throttle entirely, so the finished output can never be what a stale
+     trailing timer produced. */
+  private readonly streamRenderTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly lastStreamRenderAt = new Map<string, number>();
+  private static readonly STREAM_THROTTLE_MS = 80;
 
   constructor(app: AppHandle, component: RenderLifecycle, container: HTMLElement) {
     this.app = app;
@@ -191,6 +214,17 @@ export class MessageListRenderer {
        message /clear was meant to remove. Dropping the chain map detaches the
        stale promise so a late render can't re-enter the cleared container. */
     this.renderChains.clear();
+    /* Same reasoning as renderChains just above, for the streaming throttle's
+       own trailing timers: a scheduled catch-up render captures `generation`
+       only when it FIRES (dispatchUpsert reads `this.generation` from inside
+       the timer callback), so bumping the counter below is not enough on its
+       own to make doUpsert's bail check catch it — the fired call would see
+       the already-bumped generation and think it's current, resurrecting a
+       bubble into the just-emptied container. Cancelling outright closes
+       that gap the counter can't. */
+    for (const timer of this.streamRenderTimers.values()) clearTimeout(timer);
+    this.streamRenderTimers.clear();
+    this.lastStreamRenderAt.clear();
     /* Bump the generation so any doUpsert already scheduled behind an in-flight
        MarkdownRenderer.render await bails on resume instead of re-appending a
        bubble to the freshly-emptied container. Clearing the map above cannot
@@ -246,6 +280,47 @@ export class MessageListRenderer {
   }
 
   async upsertMessage(msg: ChatMessage) {
+    if (msg.streaming) {
+      const now = Date.now();
+      const last = this.lastStreamRenderAt.get(msg.id);
+      if (last !== undefined && now - last < MessageListRenderer.STREAM_THROTTLE_MS) {
+        /* Inside the throttle window: fold this call into whichever trailing
+           render is already scheduled (or schedule the one that will catch
+           up) instead of dispatching a fresh doUpsert of our own. Resolves
+           right away rather than waiting on that timer — this call did no
+           DOM work, so there is nothing for the caller to legitimately wait
+           on, and stalling handleStreamEvent's own await here would only
+           slow down how fast it can drain the next buffered delta. */
+        if (!this.streamRenderTimers.has(msg.id)) {
+          const timer = setTimeout(() => {
+            this.streamRenderTimers.delete(msg.id);
+            this.lastStreamRenderAt.set(msg.id, Date.now());
+            void this.dispatchUpsert(msg);
+          }, MessageListRenderer.STREAM_THROTTLE_MS - (now - last));
+          this.streamRenderTimers.set(msg.id, timer);
+        }
+        return;
+      }
+      this.lastStreamRenderAt.set(msg.id, now);
+    } else {
+      /* Not streaming: either this message's authoritative final render
+         (content_block_stop's owning `assistant` event already flipped
+         `streaming` to false before calling here) or a message that was
+         never streamed at all. Either way it must land at full fidelity
+         right now, so drop a same-id trailing catch-up still pending —
+         letting it fire afterward would redundantly re-render a message
+         that's already current — and the rate bookkeeping with it. */
+      const timer = this.streamRenderTimers.get(msg.id);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        this.streamRenderTimers.delete(msg.id);
+      }
+      this.lastStreamRenderAt.delete(msg.id);
+    }
+    await this.dispatchUpsert(msg);
+  }
+
+  private dispatchUpsert(msg: ChatMessage): Promise<void> {
     /* Serialize per-message: queue this upsert behind any in-flight chain for
        the same id so MarkdownRenderer.render's await can never interleave with
        another upsert clearing the same content element. GC the map entry once
@@ -259,7 +334,7 @@ export class MessageListRenderer {
     next.finally(() => {
       if (this.renderChains.get(msg.id) === next) this.renderChains.delete(msg.id);
     });
-    await next;
+    return next;
   }
 
   /* Tear down all DOM and bookkeeping for a single message. Used when a
@@ -284,6 +359,13 @@ export class MessageListRenderer {
     this.liveEls.delete(id);
     this.thinkingOpenOverride.delete(id);
     this.renderChains.delete(id);
+    /* Same gap as reset()'s: a pending trailing render for this id would
+       otherwise fire later, find no liveEls entry, and re-create a bubble
+       for a message this fold just removed. */
+    const timer = this.streamRenderTimers.get(id);
+    if (timer !== undefined) clearTimeout(timer);
+    this.streamRenderTimers.delete(id);
+    this.lastStreamRenderAt.delete(id);
   }
 
   private async doUpsert(msg: ChatMessage, gen: number) {

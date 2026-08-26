@@ -41,10 +41,16 @@ function syncFileWriter(): SyncFileWriter | null {
   return probedSyncWriter;
 }
 
-/* Persisted shape of a tab. Excludes runtime-only state (pendingApprovals,
-   busy) since those are bound to a live subprocess and cannot survive a
-   restart. Per-tab overrides (model/effort/mode/snippet) DO persist so the
-   user's tab settings survive an Obsidian reload. */
+/* Persisted shape of a tab. Excludes runtime-only state (pendingApprovals)
+   since it's bound to a live subprocess and cannot survive a restart. `busy`
+   is the one exception: toStored() below never writes it (true on desktop/
+   plugin, where the subprocess dies with the host), but RemoteFileStorage's
+   read() maps GET /tabs/:id straight through, and the daemon's own busy flag
+   DOES survive an iOS relaunch — the child lives on the Mac. loadTab() below
+   reads it back so a cold restore of a mid-turn tab renders with a locked
+   composer instead of a false "idle" that a follow-up submit 409s against.
+   Per-tab overrides (model/effort/mode/snippet) DO persist so the user's tab
+   settings survive an Obsidian reload. */
 type StoredTab = {
   id: string;
   sessionId: string | null;
@@ -71,6 +77,10 @@ type StoredTab = {
      gateway's own StoredTab-shaped projection (scripts/gateway/src/engine.ts
      storedTab()) carries it separately for the remote client. */
   draft?: string;
+  /* Remote-only (see the type comment above) — absent from every local
+     write, so a desktop/plugin load always falls through to the `false`
+     default in loadTab() below. */
+  busy?: boolean;
 };
 
 /* Lightweight stand-in for a sent attachment — filename/kind/mediaType only,
@@ -198,7 +208,11 @@ export class Persistence {
       updatedAt,
       messages,
       pendingApprovals: new Map(),
-      busy: false,
+      /* See StoredTab.busy's comment: true only ever arrives from
+         RemoteFileStorage's mapping of the daemon's live `busy` flag; a
+         local/desktop file never has this field, so this reads back as
+         `false` there exactly as before. */
+      busy: typeof stored.busy === "boolean" ? stored.busy : false,
       model: typeof stored.model === "string" ? stored.model : undefined,
       effort: typeof stored.effort === "string" ? stored.effort : undefined,
       permissionMode: typeof stored.permissionMode === "string" ? stored.permissionMode : undefined,

@@ -109,6 +109,12 @@ type StoredTabResponse = {
      applyConversation() below. Passed straight through: TabState.draft in
      src/view/state.ts carries the full contract. */
   draft?: string;
+  /* True while the daemon has a live turn running for this tab (see
+     engine.ts storedTab()). Read straight through by Persistence.loadTab
+     into TabState.busy — the one field StoredTab persists that isn't
+     written back, since only the daemon's own busy flag is authoritative. */
+  busy?: boolean;
+  status?: string;
 };
 
 /* GET /conversations row: id, title, updatedAt, messageCount. A superset of

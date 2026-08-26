@@ -130,6 +130,20 @@ export class IosChatShell {
   /* tab id -> the model/effort/mode triple last accepted by the daemon, so the
      per-token onStateChange flood does not become a PATCH flood. */
   private readonly pushedConfig = new Map<string, string>();
+  /* tab id -> the last `draft` value onStateChange actually scheduled a save
+     for. Every OTHER field a remote save touches (messages, tool results...)
+     is a no-op on this host — the daemon already projects and persists the
+     conversation itself, see RemoteFileStorage's class header — so on a long
+     streaming turn, calling scheduleSaveTab() on every token would debounce
+     into a doSaveTab() that JSON.stringifies the whole (possibly
+     multi-message) conversation, RemoteFileStorage.write() JSON.parses it
+     right back, and then throws away everything but `draft` — two full
+     passes over a growing string, twice a second, purely to move a few bytes
+     of composer text that almost never changed. Comparing against this map
+     skips scheduling entirely when the draft didn't move, so streaming
+     tokens cost nothing here; a real composer edit still schedules exactly
+     the same debounced write as before. */
+  private readonly pushedDraft = new Map<string, string>();
   /* Tabs this client just cleared, so the daemon's own `resync` for that clear
      is not answered with a rebuild we have already done in place. */
   private readonly selfCleared = new Set<string>();
@@ -394,10 +408,17 @@ export class IosChatShell {
            for `draft` (unsent composer text), which it has no way to learn
            on its own. Route it through the normal Persistence save path like
            the plugin/desktop already do: RemoteFileStorage's write() maps a
-           conversation-body write's `draft` field to PATCH /tabs/:id and
-           dedupes against the last value sent, so this is a cheap no-op call
-           on every OTHER kind of state change (messages, tool results...). */
-        if (!controller.state.incognito) void this.persistence.scheduleSaveTab(controller.state);
+           conversation-body write's `draft` field to PATCH /tabs/:id. Gated
+           on `pushedDraft` (see its own comment) so a token-streaming state
+           change that left `draft` untouched never even arms the debounce —
+           only an actual composer edit schedules a save. */
+        if (!controller.state.incognito) {
+          const draftSig = controller.state.draft ?? "";
+          if (this.pushedDraft.get(controller.state.id) !== draftSig) {
+            this.pushedDraft.set(controller.state.id, draftSig);
+            void this.persistence.scheduleSaveTab(controller.state);
+          }
+        }
         /* The daemon projects and persists the conversation itself; what the
            phone still owns is the tab INDEX (title, active tab), which
            RemoteFileStorage maps to PATCH /tabs/:id. */
@@ -412,6 +433,10 @@ export class IosChatShell {
       state.id,
       `${state.model ?? ""}|${state.effort ?? ""}|${state.permissionMode ?? ""}`,
     );
+    /* Same seeding, for the same reason: mounting a tab already carries
+       whatever `draft` it was loaded with, so that value must not look like
+       a fresh edit the first time onStateChange fires. */
+    this.pushedDraft.set(state.id, state.draft ?? "");
     this.tabs.push(controller);
     if (!opts.silent) this.renderTabBar();
     return controller;
@@ -445,10 +470,9 @@ export class IosChatShell {
   }
 
   async closeTab(tabId: string): Promise<void> {
-    const idx = this.tabs.findIndex(t => t.state.id === tabId);
-    if (idx === -1) return;
+    if (!this.tabs.some(t => t.state.id === tabId)) return;
     await this.conn.rpc("DELETE", `/tabs/${encodeURIComponent(tabId)}`);
-    await this.removeLocalTab(idx, tabId);
+    await this.removeLocalTab(tabId);
   }
 
   /* The daemon told us (over the socket, `resync{reason:"gone"}`) that this
@@ -457,20 +481,30 @@ export class IosChatShell {
      is nothing left to delete server-side, and unlike a plain resync there is
      nothing to reload from (GET /tabs/:id 404s too), so this just tears down
      the local half and says why. */
-  private async dropGoneTab(idx: number, tabId: string): Promise<void> {
-    await this.removeLocalTab(idx, tabId);
+  private async dropGoneTab(tabId: string): Promise<void> {
+    await this.removeLocalTab(tabId);
     platform.notify("This chat was removed on the Mac.", 5000);
   }
 
   /* Shared teardown: destroy the controller, forget the tab everywhere on
      this client, and pick a sensible new active tab. Callers differ only in
      whether the daemon still needs telling (closeTab) or already knows
-     (dropGoneTab). */
-  private async removeLocalTab(idx: number, tabId: string): Promise<void> {
+     (dropGoneTab).
+
+     Takes only the id, not an index a caller resolved before its own await —
+     `this.tabs` can be mutated by an interleaved close/resync while that
+     await was in flight (a slow tailnet lets two closes or two buffer_evicted
+     resyncs race), and splicing a stale index destroys whichever controller
+     now happens to sit there instead of the intended one. Re-resolving here,
+     with no await between the lookup and the splice, is the fix. */
+  private async removeLocalTab(tabId: string): Promise<void> {
+    const idx = this.tabs.findIndex(t => t.state.id === tabId);
+    if (idx === -1) return;
     const [removed] = this.tabs.splice(idx, 1);
     await removed.destroy();
     this.conn.forgetTab(tabId);
     this.pushedConfig.delete(tabId);
+    this.pushedDraft.delete(tabId);
     this.storage.invalidate();
     if (this.tabs.length === 0) {
       await this.createTab();
@@ -600,13 +634,32 @@ export class IosChatShell {
   private async resyncTab(tabId: string, reason = "buffer_evicted"): Promise<void> {
     if (this.restoring) return;
     if (this.selfCleared.has(tabId)) return;
-    const idx = this.tabs.findIndex(t => t.state.id === tabId);
-    if (idx === -1) return;
+    if (!this.tabs.some(t => t.state.id === tabId)) return;
     /* "gone" (server.ts handleSubscribe): the daemon has no engine at all for
        this id — deleted from another device, most likely. Unlike a plain
        buffer eviction there is nothing to rebuild from (GET /tabs/:id 404s
-       too), so this is a removal, not a resync. */
-    if (reason === "gone") return this.dropGoneTab(idx, tabId);
+       too), so this is normally a removal, not a resync.
+
+       BUT: the daemon also answers "gone" for every open tab while it is
+       still warming up (main.ts calls server.listen() before awaiting
+       registry.restore(), and /health answers "starting" for that whole
+       window — measured up to ~33s for a cold iCloud vault read). A socket
+       reconnect racing that window (launchd restart, Mac wake) would
+       otherwise get "gone" for every tab this client watches and destroy
+       them all. A fresh /health read distinguishes the two: only a "ready"
+       answer makes this frame trustworthy. A "starting" (or unreachable)
+       answer means it's the warm-up false positive, so it's discarded — the
+       daemon will say so again, correctly, once it's actually ready and the
+       tab is truly gone. */
+    if (reason === "gone") {
+      const health = await this.conn.rpc("GET", "/health");
+      const state = (health.json as { state?: unknown } | undefined)?.state;
+      if (health.status !== 200 || state !== "ready") return;
+      /* Re-check existence: the tab may have been closed locally, or already
+         resynced away, while the /health round trip was in flight. */
+      if (!this.tabs.some(t => t.state.id === tabId)) return;
+      return this.dropGoneTab(tabId);
+    }
     this.storage.invalidateTab(tabId);
     /* loadTab (GET /tabs/:id) happens BEFORE old.destroy() below, so even a
        flush right before destroy would already be too late to make this
@@ -621,10 +674,23 @@ export class IosChatShell {
        there, and the DOM already holds the ground truth. */
     const fresh = await this.persistence.loadTab(tabId);
     if (!fresh) return;
+    /* Resolved fresh, not reused from before the loadTab await: `this.tabs`
+       can be mutated by an interleaved close/resync while that GET was in
+       flight, and splicing a stale index would destroy whichever controller
+       now happens to sit there. Also doubles as the "did this tab disappear
+       while we were fetching it" guard. */
+    const idx = this.tabs.findIndex(t => t.state.id === tabId);
+    if (idx === -1) return;
     const [old] = this.tabs.splice(idx, 1);
     const wasActive = this.activeTabId === tabId;
     const localDraft = old.root.querySelector<HTMLTextAreaElement>("textarea.claudian-input")?.value ?? "";
-    await old.destroy();
+    /* { abort: false }: this is a client-side catch-up (replay ring rolled
+       over, or another device cleared/reopened the tab), not a user-driven
+       cancel — the daemon was never asked to stop anything, and destroying
+       `old` only to remount a fresh controller around the SAME tab a moment
+       later must not abort a turn the Mac may still be generating for it.
+       See TabController.destroy's `opts` comment. */
+    await old.destroy({ abort: false });
     const controller = this.mountTab(fresh, { silent: true });
     if (localDraft && localDraft !== (fresh.draft ?? "")) {
       /* Reapply through the same input+dispatchEvent pattern insertIntoComposer
@@ -823,6 +889,17 @@ export class IosChatShell {
     }
     if (attemptsLeft <= 0) return;
     window.setTimeout(() => this.scrollToApprovalCard(requestId, attemptsLeft - 1), 200);
+  }
+
+  /* Drains the active tab's composer debounce right now, without hiding it —
+     called from renderer.ts's app-backgrounding path (native `suspend`, and
+     the `pagehide` fallback) right before the socket suspends. A hidden tab
+     already flushed its own draft when the user switched away from it
+     (TabController.hide()); the active tab is the only one that can still
+     have unflushed text sitting behind InputBox's 500ms debounce at the
+     moment the app backgrounds. */
+  flushActiveDraft(): void {
+    this.tabs.find(t => t.state.id === this.activeTabId)?.flushDraft();
   }
 
   /* Native's connectivity dispatch. Inside the app this is the same sentence

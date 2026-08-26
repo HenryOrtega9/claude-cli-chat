@@ -113,8 +113,11 @@ export type ReadResult =
 export async function readVaultFile(vault: string, relPath: string): Promise<ReadResult> {
   if (!relPath) return { ok: false, status: 400, error: "missing_path" };
   const abs = resolve(vault, relPath);
-  /* Containment check on the RESOLVED path, so `..` segments and symlinked
-     names can't walk out of the vault. */
+  /* Containment check on the RESOLVED path so a lexical `..` segment can't
+     walk out of the vault. Purely lexical, though: `resolve()` never touches
+     the filesystem, so a symlink INSIDE the vault pointing outside it sails
+     through this check untouched — see the realpath-based recheck below,
+     which is what actually makes that true. */
   const rel = relative(vault, abs);
   if (rel.startsWith("..") || rel.startsWith(sep) || resolve(vault) === abs) {
     return { ok: false, status: 400, error: "path_outside_vault" };
@@ -122,23 +125,42 @@ export async function readVaultFile(vault: string, relPath: string): Promise<Rea
   /* Same dot-directory rule the listing uses, applied to reads so the two
      can't disagree: `.obsidian`, `.git`, `.trash` and our own store are not
      user content, and the permissions endpoint is the sanctioned way to see
-     `.claude/settings.json`. */
+     `.claude/settings.json`. Checked against the REQUEST path deliberately —
+     a symlink whose own name doesn't start with `.` must not dodge this by
+     pointing somewhere that does. */
   if (rel.split(sep).some(seg => seg.startsWith("."))) {
     return { ok: false, status: 403, error: "dot_path_excluded" };
   }
   if (!TEXT_EXTS.has(extname(abs).toLowerCase())) {
     return { ok: false, status: 415, error: "not_a_text_file" };
   }
+  /* `fs.stat`/`fs.readFile` below both follow symlinks, so the lexical check
+     above is not the guarantee its old comment claimed. Resolve the real
+     path and re-run the same containment test against it before either ever
+     touches the file — a symlink placed (deliberately or not) inside the
+     vault, pointing at `~/.ssh/config` or similar, must not be servable
+     through `.md`/`.json`/`.ts` just because its own name looks innocent. */
+  let realAbs: string;
+  try {
+    const [realVault, resolved] = await Promise.all([fs.realpath(vault), fs.realpath(abs)]);
+    realAbs = resolved;
+    const realRel = relative(realVault, realAbs);
+    if (realRel.startsWith("..") || realRel.startsWith(sep) || realVault === realAbs) {
+      return { ok: false, status: 400, error: "path_outside_vault" };
+    }
+  } catch {
+    return { ok: false, status: 404, error: "not_found" };
+  }
   let stat;
   try {
-    stat = await fs.stat(abs);
+    stat = await fs.stat(realAbs);
   } catch {
     return { ok: false, status: 404, error: "not_found" };
   }
   if (!stat.isFile()) return { ok: false, status: 404, error: "not_found" };
   if (stat.size > FILE_BYTE_CAP) return { ok: false, status: 413, error: "file_too_large" };
   try {
-    return { ok: true, path: rel, text: await fs.readFile(abs, "utf8") };
+    return { ok: true, path: rel, text: await fs.readFile(realAbs, "utf8") };
   } catch {
     return { ok: false, status: 500, error: "read_failed" };
   }

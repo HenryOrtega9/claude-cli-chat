@@ -82,6 +82,42 @@ final class TurnNotifier: NSObject {
 
     // MARK: - Arming
 
+    /// Set while a `.background` scenePhase transition is waiting on the
+    /// page's post-suspend `setState` flush to reach `NativeBridge.persistState`
+    /// before arming — reading `UserDefaults` synchronously at the moment of
+    /// backgrounding always sees the pre-suspend snapshot, since that flush is
+    /// still two async `postMessage` hops away. `armIfPending()` is the fast
+    /// path (fired by `persistState` the instant the flush lands); the
+    /// fallback timer is the safety net for a page that never flushes at all
+    /// (already gone, frozen) so backgrounding still ends up arming from
+    /// whatever is currently persisted instead of arming nothing.
+    private var armPending = false
+    private var armPendingFallback: DispatchWorkItem?
+
+    /// Called on the `.background` scenePhase transition, right after the
+    /// page's `suspend` dispatch is sent. Defers the actual arm to whichever
+    /// comes first: `armIfPending()` once the flush lands, or the fallback
+    /// timer below.
+    func armWhenBackgrounded() {
+        armPendingFallback?.cancel()
+        armPending = true
+        let fallback = DispatchWorkItem { [weak self] in self?.armIfPending() }
+        armPendingFallback = fallback
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: fallback)
+    }
+
+    /// Fires the deferred arm from `armWhenBackgrounded()`, if one is still
+    /// pending. Called both by the fallback timer and by
+    /// `NativeBridge.persistState` the moment the post-suspend flush actually
+    /// lands, so whichever happens first wins and the other is a no-op.
+    func armIfPending() {
+        guard armPending else { return }
+        armPending = false
+        armPendingFallback?.cancel()
+        armPendingFallback = nil
+        armFromPersistedState()
+    }
+
     /// Arm a wait for the most recently busy tab recorded by `setState`.
     /// No-op when nothing is busy or no token is enrolled.
     @discardableResult
@@ -220,7 +256,7 @@ final class TurnNotifier: NSObject {
 
     private func resolve(tab: String, requestID: String, allowed: Bool) async {
         guard !tab.isEmpty, !requestID.isEmpty else { return }
-        _ = await GatewayClient.send(
+        let outcome = await GatewayClient.send(
             path: "/tabs/\(tab)/approve",
             method: "POST",
             body: [
@@ -229,6 +265,37 @@ final class TurnNotifier: NSObject {
                 "reason": allowed ? "Allowed from a notification" : "Denied from a notification",
             ]
         )
+        switch outcome {
+        case .http(let status, _) where (200...299).contains(status):
+            Self.log.info("approval \(allowed ? "allow" : "deny", privacy: .public) sent tab=\(tab, privacy: .public)")
+        case .http(let status, _):
+            Self.log.error("approval send failed: http \(status, privacy: .public) tab=\(tab, privacy: .public)")
+            notifyApprovalFailed(tab: tab, requestID: requestID)
+        case .failure(let failure, let message):
+            Self.log.error("approval send failed: \(failure.rawValue, privacy: .public) \(message, privacy: .public) tab=\(tab, privacy: .public)")
+            notifyApprovalFailed(tab: tab, requestID: requestID)
+        }
+    }
+
+    /// Posted when a lock-screen Allow/Deny tap's POST back to the gateway
+    /// fails (offline, Mac asleep, token rotated, tab gone). The system
+    /// already dismissed the action notification by then, so without this
+    /// the user believes they resolved the approval when the turn is
+    /// actually still blocked waiting on the Mac.
+    private func notifyApprovalFailed(tab: String, requestID: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Couldn't send your approval"
+        content.body = "Open the app to approve or deny."
+        content.sound = .default
+        content.categoryIdentifier = Self.approvalCategory
+        content.userInfo = ["tab": tab, "request_id": requestID]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        ) { error in
+            if let error {
+                Self.log.error("approval-failed notification add failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 }
 

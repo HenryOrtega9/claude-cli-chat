@@ -14,6 +14,12 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
     private let queue = DispatchQueue(label: "dev.henryortega.vaultgateway.web", qos: .userInitiated)
     private let lock = NSLock()
     private var stopped = Set<ObjectIdentifier>()
+    /// `renderer.js` alone is ~10MB; handing WebKit that in one `didReceive`
+    /// is a single giant IPC message on the main thread, every navigation to
+    /// `vaultgw://app/index.html` (cold launch, a jetsammed content-process
+    /// reload, the page's own boot-retry). Slicing keeps each cross-process
+    /// message small.
+    private static let chunkSize = 256 * 1024
 
     override init() {
         root = Bundle.main.url(forResource: "Web", withExtension: nil)
@@ -57,7 +63,7 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
                 self.clearStopped(key)
                 return
             }
-            guard let resolved, let data = try? Data(contentsOf: resolved.file) else {
+            guard let resolved, let data = try? Data(contentsOf: resolved.file, options: .mappedIfSafe) else {
                 self.finish(urlSchemeTask, key: key, status: 404,
                             data: Data("Not found".utf8), mime: "text/plain; charset=utf-8",
                             url: url ?? Self.indexURL)
@@ -107,7 +113,20 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
                 return
             }
             task.didReceive(response)
-            task.didReceive(data)
+            // Feed the body in slices rather than one multi-megabyte message,
+            // re-checking `stop` between each so a reload that cancels this
+            // task mid-flight (webViewWebContentProcessDidTerminate) stops
+            // pushing bytes into it instead of running to the end regardless.
+            var offset = 0
+            while offset < data.count {
+                guard !self.isStopped(key) else {
+                    self.clearStopped(key)
+                    return
+                }
+                let end = min(offset + Self.chunkSize, data.count)
+                task.didReceive(data.subdata(in: offset..<end))
+                offset = end
+            }
             task.didFinish()
             self.lock.lock()
             self.stopped.remove(key)

@@ -309,6 +309,28 @@ export class TabEngine {
     return this.ring.since(since, limit);
   }
 
+  /* Resume the seq counter from whatever this tab's replay ndjson already
+     holds, instead of leaving it at the constructor's 0. Restricted to
+     restored/reopened tabs (the registry calls this only when `init.restored`
+     was passed) — a brand-new tab has no existing file, and ring.recoverTail()
+     is a no-op (returns 0) when there is none.
+
+     Without this, a daemon restart (launchd KeepAlive: crash, `kickstart -k`
+     after a rebuild, a Mac wake) left `seq` at 0 while a phone still resident
+     in memory kept its last-seen cursor from before the restart. The first
+     live frame after restart then carried seq 1, sitting below every cursor
+     the client already held, so `GatewayConnection`'s monotonic guard dropped
+     it and everything after it — the tab went permanently silent until the
+     app was force-reloaded. Resuming the counter here means the client's old
+     cursor and the engine's restored one agree, so a reconnect either needs
+     no replay at all (cursor === restored seq) or a normal bounded one — and
+     it means the ndjson spill on disk, which nothing truncates across a
+     restart, never ends up holding two generations of frames under the same
+     seq numbers. */
+  async restoreFromDisk(): Promise<void> {
+    this.seq = await this.ring.recoverTail();
+  }
+
   /* ---------- turns ---------- */
 
   /* Awaited by the server immediately before submit(): settles any child

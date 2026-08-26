@@ -400,13 +400,30 @@ export class TabController {
        the wire yet) and reconcilePendingApprovals below for why this is a
        structural/optional no-op on desktop and plugin hosts. */
     void this.reconcilePendingApprovals();
+    /* Counterpart reconciliation for `state.busy` (see Persistence.loadTab
+       and StoredTab.busy's comments): a tab restored from the daemon can
+       come back already mid-turn, but nothing subscribes this controller to
+       the gateway's frame stream until ensureSession() runs — normally lazy,
+       fired only from submit(). Without this, GatewayConnection has nobody
+       to deliver the rest of that turn's frames to, the composer stays
+       locked on `state.busy` forever, and a follow-up submit 409s. Always
+       false on desktop/plugin restores (local Persistence never persists
+       `busy`), so this is a no-op there — ensureSession() there only spawns
+       lazily from submit() as documented. */
+    if (this.state.busy) void this.ensureSession();
   }
 
   show() { this.root.style.display = ""; }
   /* Switching away is one of the moments a relaunch or an iOS background-kill
      can follow soon after — flush any debounced draft before the tab goes
      dark rather than trusting the composer's own 500ms timer. */
-  hide() { this.inputBox.flushDraft(); this.root.style.display = "none"; }
+  hide() { this.flushDraft(); this.root.style.display = "none"; }
+  /* Force the composer's own debounce out right now, without hiding the tab.
+     hide() already does this as part of switching away; this is the same
+     drain for a host that needs it WITHOUT a tab switch — the iOS shell's
+     app-backgrounding path (ios-web/src/renderer.ts), which flushes the
+     active (still visible) tab's draft before the socket suspends. */
+  flushDraft() { this.inputBox.flushDraft(); }
   /* True once destroy() has started. Late async continuations (title-gen
      resolving, a submit suspended on a restart teardown) check this so they
      don't resurrect a deleted conversation on disk or spawn a subprocess for
@@ -428,7 +445,15 @@ export class TabController {
   private officeFileMtime(path: string): number | undefined {
     return platform.vaultFeatures?.fileMtime(path);
   }
-  async destroy(): Promise<void> {
+  /* `opts.abort` defaults to true (a tab going away should stop whatever it
+     was doing). Pass `{ abort: false }` for a purely client-side rebuild —
+     the iOS shell's resync remount (ios-web/src/shell.ts resyncTab) destroys
+     this controller only to mount a fresh one around the same daemon tab a
+     moment later; the daemon was never asked to do anything and a turn it is
+     still generating must not be killed just because this client's replay
+     ring or UI needs to catch up. See teardownSession's `opts` for the
+     underlying session-level skip. */
+  async destroy(opts: { abort?: boolean } = {}): Promise<void> {
     this.destroyed = true;
     /* Closing a voice tab mid-narration silences it. Channel-scoped, so a
        sibling voice tab or an in-flight note read plays on untouched. */
@@ -444,7 +469,7 @@ export class TabController {
     if (this.remoteSession) this.plugin.subprocessManager.unregisterRemote(this.state.id);
     this.mentionIndexUnsub?.();
     this.mentionIndexUnsub = null;
-    await this.teardownSession("destroy");
+    await this.teardownSession("destroy", opts);
     const remoteWork = this.remoteSession ? [this.remoteSession.dispose()] : [];
     const tailerWork = this.jsonlTailer ? [this.jsonlTailer.stop()] : [];
     this.statusIndicator.destroy();
@@ -529,8 +554,21 @@ export class TabController {
      - clears stream pointers and pass timing
      - resets busy (except for "switch", which hands off to the next mode)
      - dismisses visible approval cards for user-driven teardowns
-     - clears the errorBubbleEmitted dedup flag */
-  private async teardownSession(reason: "cancel" | "restart" | "clear" | "switch" | "destroy"): Promise<void> {
+     - clears the errorBubbleEmitted dedup flag
+
+     `opts.abort` (default true) governs how the session itself is torn down.
+     False is for a client-side-only teardown (see destroy()'s comment): the
+     session is asked to detach — unsubscribe, drop listeners — WITHOUT the
+     abort side effect dispose() normally carries. `detach` is structural/
+     optional the same way `onApprovalResolved` is: only RemoteTabSession has
+     it (dispose() there POSTs /tabs/:id/abort, which is what must be
+     skipped), so a local/desktop TabSession — which has no live daemon turn
+     to preserve, and whose dispose() just SIGTERMs the child — always falls
+     through to the normal dispose() path regardless of `opts.abort`. */
+  private async teardownSession(
+    reason: "cancel" | "restart" | "clear" | "switch" | "destroy",
+    opts: { abort?: boolean } = {},
+  ): Promise<void> {
     if (this.tearingDown) return;
     this.tearingDown = true;
     try {
@@ -550,7 +588,12 @@ export class TabController {
         }
       }
       if (s) {
-        try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
+        const detachable = s as TabSessionLike & { detach?: () => void };
+        if (opts.abort === false && typeof detachable.detach === "function") {
+          try { detachable.detach(); } catch { /* ignore — best-effort */ }
+        } else {
+          try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
+        }
       }
       if (reason === "restart") {
         this.state.pendingApprovals.clear();
@@ -971,6 +1014,21 @@ export class TabController {
       await this.remoteSession.dispose();
       this.remoteSession = null;
     }
+    /* RemoteTabSession's dispose() (invoked inside teardownSession below)
+       unsubscribes and POSTs /abort but never emits an 'exit' — see its own
+       header comment. onExit's userCancelInitiated branch is the ONLY place
+       that renders the "*Stopped...*" note and resets the flag, so on the
+       remote engine it never runs: the conversation is left ending on a
+       half-finished bubble with only the transient toast below as evidence,
+       and userCancelInitiated stays stuck true until the next submit()
+       resets it. Detect that up front — before teardownSession nulls
+       `this.session` — using the same structural marker (`detach`)
+       RemoteTabSession exposes for the resync no-abort teardown path; a
+       local/desktop TabSession has no such method, so this is false there
+       and the real onExit (fired once the SIGTERM'd child actually dies)
+       keeps owning the note exactly as before. */
+    const sessionForCancel = this.session as (TabSessionLike & { detach?: () => void }) | null;
+    const noExitSignal = typeof sessionForCancel?.detach === "function";
     await this.teardownSession("cancel");
     /* teardownSession no-ops behind its re-entrancy guard when another
        teardown (e.g. a model-change restart) is already in flight, leaving
@@ -988,6 +1046,10 @@ export class TabController {
        needs_permission), whose 5s heartbeat would otherwise re-assert that app
        on the TC001 forever. Drop back to ready, mirroring clearConversation. */
     this.plugin.stateEmitter?.setState("ready");
+    if (noExitSignal) {
+      void this.renderCancelNote();
+      this.userCancelInitiated = false;
+    }
     platform.notify("Stopped Claude.");
     this.onStateChangeCb();
   }

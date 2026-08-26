@@ -284,11 +284,11 @@ export class GatewayConnection {
     const epoch = ++this.connectEpoch;
     this.clearRetry();
     this.setLink(this.attempt === 0 ? "connecting" : "reconnecting");
-    let url: string | null = null;
+    let wsResult: { url: string | null; unauthorized: boolean } = { url: null, unauthorized: false };
     try {
-      url = await this.transport.wsUrl();
+      wsResult = await this.transport.wsUrl();
     } catch {
-      url = null;
+      wsResult = { url: null, unauthorized: false };
     }
     /* suspend() (or a second connect(), belt-and-suspenders) ran while the
        ticket POST above was in flight -- see connectEpoch's comment. Bail
@@ -296,6 +296,18 @@ export class GatewayConnection {
        `this.ws`, and let the now-orphaned ticket simply expire unused. */
     if (epoch !== this.connectEpoch) return;
     this.connecting = false;
+    /* A 401 minting the ticket means the token itself is bad -- retrying on
+       backoff changes nothing (see rpc()'s header comment on why every 401
+       has to call markUnauthorized()). Without this check, wsUrl() collapsing
+       straight to `url: null` sent this down the same scheduleRetry() path as
+       an unreachable daemon: an endless "Reconnecting to the Mac…" instead of
+       the actionable re-enroll banner, re-minting a doomed ticket every ~15s
+       forever. */
+    if (wsResult.unauthorized) {
+      this.markUnauthorized();
+      return;
+    }
+    const url = wsResult.url;
     if (!url) {
       this.scheduleRetry();
       return;
@@ -498,8 +510,19 @@ export class GatewayConnection {
          duplicate (a replay racing a live frame) and must not be delivered
          twice — TabController would render the same assistant delta again. */
       if (frame.seq <= prev) return;
-      this.lastSeq.set(tabId, frame.seq);
-      this.markStateDirty();
+      /* Only advance the cursor once something can actually consume this
+         frame. A tab with no live listener (no session subscribed via
+         onTabFrame — e.g. a cold-launch restore whose TabController hasn't
+         called ensureSession() yet) has nobody to deliver to; marking the
+         frame "seen" here would burn it forever, since the daemon's replay
+         only re-sends what's above `lastSeq` on the next `subscribe`.
+         Leaving the cursor put lets a session that attaches moments later
+         still receive it via the next reconnect's resubscribe instead of
+         losing it outright. */
+      if ((this.tabListeners.get(tabId)?.size ?? 0) > 0) {
+        this.lastSeq.set(tabId, frame.seq);
+        this.markStateDirty();
+      }
     }
 
     if (frame.t === "resync" && tabId) {

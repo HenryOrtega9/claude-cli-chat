@@ -27,6 +27,26 @@ import type { Frame } from "./frames";
 
 const STORE_DIR = ".claude-cli-chat/ios";
 
+/* SubprocessManager's TabSession (src/claude/SubprocessManager.ts) traces
+   every stream event and stderr chunk through bare `console.log`/
+   `console.warn`, unconditionally. In the Obsidian plugin those land in a
+   DevTools console that gets cleared; here they land on stdout, which the
+   launchd plist pins to an unrotated /tmp/vault-gateway.log for the whole
+   life of the daemon. With --include-partial-messages on by default (the
+   default below) that's roughly one ~500-byte line per token delta per tab,
+   forever — burying this file's own log() calls at a ratio of thousands to
+   one and growing the log without bound. Gated behind an explicit opt-in
+   rather than removed outright, since the trace is genuinely useful when
+   chasing a wire-format bug. Installed before anything can spawn a child
+   (TabRegistry/SubprocessManager are constructed further down, after this
+   module's imports have already resolved), so no event is ever traced
+   unless asked for. log() below is unaffected: it writes to stdout directly
+   rather than through console.log. */
+if (process.env.VAULT_GATEWAY_TRACE_EVENTS !== "1") {
+  console.log = () => {};
+  console.warn = () => {};
+}
+
 function log(msg: string): void {
   process.stdout.write(`[${new Date().toISOString()}] ${msg}\n`);
 }

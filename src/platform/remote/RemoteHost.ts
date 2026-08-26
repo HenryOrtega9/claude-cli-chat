@@ -244,14 +244,28 @@ export class RemoteHost implements PluginHost {
     await this.refreshCatalog(true);
   }
 
-  /* Synchronous by contract. The catalog is already in memory; a forced
-     rescan on the Mac is a separate, explicitly-awaited refreshCatalog. */
+  /* Synchronous by contract (PluginHost declares it `void`, matching the node
+     hosts' synchronous disk scan) — callers such as querySlashCommands' popup-
+     open refresh and the `/agent` slash handler are fire-and-forget and read
+     `this.catalog`/`this.skillCatalog`/`subagentCatalog` synchronously right
+     after calling this, so nothing here ever awaits the round trip anyway.
+
+     Deliberately non-forcing (`refreshCatalog(false)`): `force` bypasses BOTH
+     the daemon's 5-minute /catalog cache AND catalogInflight's de-dup (see
+     refreshCatalog above), so on this host specifically it meant every one of
+     those fire-and-forget callers — most commonly just opening the slash
+     popup — shelled out to `claude mcp list` on the Mac (server.ts documents
+     that call alone as good for a >10s stall), and did it AGAIN, concurrently,
+     on every reopen, for an interaction that discards the result anyway.
+     `?refresh=1` stays reserved for the MCP manager's explicit refresh
+     (getMcpServers(true) / refreshMcpDenyPatterns), which the user triggered
+     on purpose and which awaits its result. */
   refreshSkillCatalog(): void {
-    void this.refreshCatalog(true);
+    void this.refreshCatalog(false);
   }
 
   refreshSubagentCatalog(): void {
-    void this.refreshCatalog(true);
+    void this.refreshCatalog(false);
   }
 
   async updateMcpToolCache(grouped: Record<string, string[]>): Promise<void> {

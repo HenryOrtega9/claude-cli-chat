@@ -142,12 +142,19 @@ class NativeTransport implements GatewayTransport {
     }
   }
 
-  async wsUrl(): Promise<string | null> {
+  async wsUrl(): Promise<{ url: string | null; unauthorized: boolean }> {
     try {
-      const reply = await this.call("wsUrl") as { url?: unknown };
-      return typeof reply?.url === "string" ? reply.url : null;
+      /* NativeBridge.swift answers a bad/absent bearer token with
+         `{status:401, error:"unauthorized"}` (no `url` field) — the same
+         shape `rpc`'s replies use for a failed request. Reading `status`
+         here, not just `url`, is what lets connect() tell "the token is bad"
+         apart from "the Mac is unreachable right now" instead of collapsing
+         both into an endless retry loop. */
+      const reply = await this.call("wsUrl") as { url?: unknown; status?: unknown };
+      const url = typeof reply?.url === "string" ? reply.url : null;
+      return { url, unauthorized: reply?.status === 401 };
     } catch {
-      return null;
+      return { url: null, unauthorized: false };
     }
   }
 
@@ -241,13 +248,15 @@ class BrowserTransport implements GatewayTransport {
     return { status: res.status, json, text };
   }
 
-  async wsUrl(): Promise<string | null> {
+  async wsUrl(): Promise<{ url: string | null; unauthorized: boolean }> {
     const ticket = await this.rpc("POST", "/ws-ticket");
     const value = (ticket.json as { ticket?: unknown } | undefined)?.ticket;
-    if (ticket.status !== 200 || typeof value !== "string") return null;
+    if (ticket.status !== 200 || typeof value !== "string") {
+      return { url: null, unauthorized: ticket.status === 401 };
+    }
     const httpUrl = new URL(this.url(`/ws/${value}`));
     httpUrl.protocol = httpUrl.protocol === "https:" ? "wss:" : "ws:";
-    return httpUrl.toString();
+    return { url: httpUrl.toString(), unauthorized: false };
   }
 
   /* No native side to persist for. Mirrored into sessionStorage so the dev

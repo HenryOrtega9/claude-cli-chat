@@ -45,16 +45,19 @@ enum GatewayClient {
 
     static func request(
         path: String, method: String = "GET", body: Any? = nil,
-        scheme overrideScheme: String? = nil, port overridePort: Int? = nil
+        scheme overrideScheme: String? = nil, port overridePort: Int? = nil,
+        authenticated: Bool = true
     ) -> URLRequest? {
         let url = overrideScheme.flatMap { GatewayConfig.probeURL(path, scheme: $0, port: overridePort) }
             ?? GatewayConfig.url(path)
         guard let url else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = method.uppercased()
-        let token = GatewayConfig.token
-        if !token.isEmpty {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if authenticated {
+            let token = GatewayConfig.token
+            if !token.isEmpty {
+                req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
         }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if let body, !(body is NSNull) {
@@ -76,9 +79,17 @@ enum GatewayClient {
     }
 
     /// Explicit-https probe on the standard TLS port (443 unless
-    /// `port` is given for testing) — see `GatewayConfig.probeURL`.
+    /// `port` is given for testing) — see `GatewayConfig.probeURL`. Port 443
+    /// on a tailnet host may not be the gateway at all (captive portal, a
+    /// TLS-intercepting proxy, an unrelated service), so this leg is
+    /// unauthenticated: `isGatewayResponse` confirms identity off the 401
+    /// shape a real gateway returns to a tokenless request, and the bearer
+    /// token is never sent to a peer that hasn't been confirmed as ours.
     static func probeHTTPS(path: String = "/health", port: Int? = nil) async -> Outcome {
-        await send(request: request(path: path, scheme: "https", port: port), session: probeSession)
+        await send(
+            request: request(path: path, scheme: "https", port: port, authenticated: false),
+            session: probeSession
+        )
     }
 
     /// Explicit-http probe against the stored gateway port, regardless of

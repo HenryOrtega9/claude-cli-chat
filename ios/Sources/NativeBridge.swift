@@ -45,6 +45,11 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
     private let notificationFeedback = UINotificationFeedbackGenerator()
     private let selectionFeedback = UISelectionFeedbackGenerator()
 
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+
     // MARK: - Page → native
 
     func userContentController(
@@ -172,20 +177,34 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
         if let titles = params["tabTitles"] as? [String: String] {
             suite.set(titles, forKey: GatewayConfig.Key.tabTitles)
         }
+        // If a `.background` transition is waiting on this exact flush (the
+        // post-`suspend` round trip) to arm the background `/wait`, this is
+        // that flush landing — arm now instead of leaving it to the fallback
+        // timer. No-op the rest of the time (every other setState call).
+        TurnNotifier.shared.armIfPending()
     }
 
     private func speak(_ params: [String: Any]) {
         if params["stop"] as? Bool == true {
             synthesizer.stopSpeaking(at: .immediate)
+            deactivateAudioSessionIfIdle()
             return
         }
         guard let text = params["text"] as? String, !text.isEmpty else { return }
         try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.duckOthers])
         try? AVAudioSession.sharedInstance().setActive(true)
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: Locale.current.identifier)
+        utterance.voice = AVSpeechSynthesisVoice(language: Locale.current.identifier(.bcp47))
             ?? AVSpeechSynthesisVoice(language: "en-US")
         synthesizer.speak(utterance)
+    }
+
+    /// Releases the shared audio session once nothing is left to speak, so a
+    /// completed or cancelled utterance doesn't leave another app's audio
+    /// ducked for the rest of this app's lifetime.
+    private func deactivateAudioSessionIfIdle() {
+        guard !synthesizer.isSpeaking else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     private func noteVaultName(from health: [String: Any]) {
@@ -269,5 +288,15 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
 
     func dispatchConnectivity(_ state: ConnectivityState) {
         dispatch("connectivity", ["state": state.rawValue, "message": state.message])
+    }
+}
+
+extension NativeBridge: AVSpeechSynthesizerDelegate {
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        deactivateAudioSessionIfIdle()
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        deactivateAudioSessionIfIdle()
     }
 }

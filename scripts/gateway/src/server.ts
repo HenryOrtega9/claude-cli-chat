@@ -26,7 +26,7 @@ import { buildCatalog, type Catalog } from "./catalog";
 import { BusyError, TabEngine } from "./engine";
 import { makeFrame, type Frame } from "./frames";
 import { readVaultFile, VaultIndex } from "./files";
-import { NoCapacityError, TabRegistry } from "./registry";
+import { NoCapacityError, TAB_ID_RE, TabRegistry } from "./registry";
 import type { StateMirror } from "./state-mirror";
 import type { TokenStore } from "./token";
 import { UsageFetcher } from "./usage";
@@ -41,6 +41,13 @@ type Subscription = {
   /* "all" or an explicit id set. A client that only cares about the tab on
      screen still gets tab_status for the rest via the hello frame. */
   tabs: "all" | Set<string>;
+  /* True while handleSubscribe's own replay loop is still in flight for this
+     connection. broadcast() queues into `queue` instead of calling
+     conn.send while this is set — see the comment in handleSubscribe for
+     why "register the sub, then await the replay" alone doesn't guarantee
+     ordering. */
+  replaying: boolean;
+  queue: string[];
 };
 
 type Waiter = {
@@ -103,6 +110,7 @@ export class GatewayServer {
     for (const sub of this.subs.values()) {
       if (sub.conn.closed) { this.subs.delete(sub.conn.id); continue; }
       if (frame.tab !== null && sub.tabs !== "all" && !sub.tabs.has(frame.tab)) continue;
+      if (sub.replaying) { sub.queue.push(line); continue; }
       sub.conn.send(line);
     }
     if (frame.tab !== null && (frame.t === "turn_done" || frame.t === "approval_request")) {
@@ -248,7 +256,19 @@ export class GatewayServer {
        -open tab just returns its current projection. */
     const reopenMatch = /^\/tabs\/([^/]+)\/reopen$/.exec(path);
     if (reopenMatch && method === "POST") {
-      const engine = await this.deps.registry.reopen(decodeURIComponent(reopenMatch[1]));
+      /* The regex above matches the raw pathname, so a literal `..` segment
+         is already gone by the time WHATWG URL parsed it into `path` — but a
+         PERCENT-ENCODED one (`%2e%2e%2f`) is not, and only becomes `../..`
+         after decodeURIComponent below. registry.reopen() hands the id
+         straight to Persistence.loadTab, which has no containment check of
+         its own, so an unvalidated id here is a path-traversal read (and,
+         worse, a write: the traversal id gets persisted into tabs.json and a
+         TabEngine starts appending to a ndjson outside the vault). Validate
+         against the grammar the daemon actually mints before it ever reaches
+         the registry. */
+      const id = decodeURIComponent(reopenMatch[1]);
+      if (!TAB_ID_RE.test(id)) return sendJson(res, 404, { error: "no_such_tab" });
+      const engine = await this.deps.registry.reopen(id);
       if (!engine) return sendJson(res, 404, { error: "no_such_tab" });
       return sendJson(res, 200, engine.storedTab());
     }
@@ -392,8 +412,8 @@ export class GatewayServer {
   private async getEvents(res: ServerResponse, engine: TabEngine, url: URL): Promise<void> {
     const since = clampInt(url.searchParams.get("since"), 0, 0, Number.MAX_SAFE_INTEGER);
     const limit = clampInt(url.searchParams.get("limit"), 500, 1, 5000);
-    const { frames, evicted } = await engine.replaySince(since, limit);
-    sendJson(res, 200, { events: frames, lastSeq: engine.lastSeq, evicted });
+    const { frames, evicted, truncated } = await engine.replaySince(since, limit);
+    sendJson(res, 200, { events: frames, lastSeq: engine.lastSeq, evicted, truncated });
   }
 
   /* Long-poll mirroring the watch bridge's /wait: the phone's background
@@ -406,33 +426,64 @@ export class GatewayServer {
     const since = clampInt(url.searchParams.get("since"), 0, 0, Number.MAX_SAFE_INTEGER);
     const timeoutS = clampInt(url.searchParams.get("timeout"), 60, 1, WAIT_MAX_S);
 
-    /* Answer immediately if the event the client is waiting for already
-       happened while it was reconnecting. `since` is clamped to >= 0 above,
-       so `since - 1` underflows to -1 exactly when a client's cursor is 0
-       (a brand-new tab, or one it has never heard from). ReplayRing.since()
-       treats anything below its floor (1) as "gap older than the ring" and,
-       for -1 specifically, short-circuits straight to `evicted: true` with
-       no frames — even when the ring holds every frame the tab has ever
-       produced — because `since + 1 (0) < floor (1)` is true regardless of
-       what is actually on disk. That silently defeated this fast path for
-       every zero-cursor /wait: the exact case a phone hits parking a
-       background wait on a tab whose first turn just finished, or an
-       approval that just resolved, while it was reconnecting. Floor the
-       argument at 0 so a zero cursor reads as "everything", matching the
-       `>= since` semantics `already` below actually wants. */
-    const { frames } = await engine.replaySince(Math.max(0, since - 1), 5000);
-    const already = frames.find(f => (f.t === "turn_done" || f.t === "approval_request") && f.seq >= since);
-    if (already) return sendJson(res, 200, { frame: already, lastSeq: engine.lastSeq });
-
-    const frame = await new Promise<Frame | null>(resolve => {
+    /* The waiter is registered BEFORE the "already happened?" probe below,
+       not after: broadcast() can only wake a Waiter already sitting in
+       `this.waiters`, and the probe's own replaySince() is a real await
+       whenever it takes the disk path (or waits on a queued write). A
+       turn_done or approval_request emitted in that window used to match
+       neither the probe's snapshot nor a live waiter — the client silently
+       waited out the full (up to 300s) timeout for the exact notification
+       this endpoint exists to deliver promptly. Registering first and
+       cancelling the waiter the moment the probe finds the event closes that
+       window in both directions at no cost on the common path. */
+    let aborted = false;
+    const frame = await new Promise<Frame | null>(settle => {
+      let done = false;
+      const finish = (f: Frame | null, isAbort: boolean) => {
+        if (done) return;
+        done = true;
+        this.waiters.delete(waiter);
+        clearTimeout(waiter.timer);
+        if (isAbort) aborted = true;
+        settle(f);
+      };
       const waiter: Waiter = {
         tab: tabId,
         since,
-        resolve,
-        timer: setTimeout(() => { this.waiters.delete(waiter); resolve(null); }, timeoutS * 1000),
+        resolve: f => finish(f, false),
+        timer: setTimeout(() => finish(null, false), timeoutS * 1000),
       };
       this.waiters.add(waiter);
+
+      /* The iOS client's TurnNotifier cancels this exact request on every
+         foreground (scenePhase .active), aborting the connection without
+         either the timer or a matching broadcast() ever firing. Without this,
+         that leaves the waiter (and its timer) alive for up to WAIT_MAX_S,
+         scanned by every broadcast() in the meantime, and eventually resolves
+         into a write on a socket that's already gone. */
+      res.once("close", () => finish(null, true));
+
+      /* Answer immediately if the event being waited for already happened
+         while the client was reconnecting. `since` is clamped to >= 0 above,
+         so `since - 1` underflows to -1 exactly when a client's cursor is 0
+         (a brand-new tab, or one it has never heard from). ReplayRing.since()
+         treats anything below its floor (1) as "gap older than the ring" and,
+         for -1 specifically, short-circuits straight to `evicted: true` with
+         no frames — even when the ring holds every frame the tab has ever
+         produced — because `since + 1 (0) < floor (1)` is true regardless of
+         what is actually on disk. That silently defeated this fast path for
+         every zero-cursor /wait: the exact case a phone hits parking a
+         background wait on a tab whose first turn just finished, or an
+         approval that just resolved, while it was reconnecting. Floor the
+         argument at 0 so a zero cursor reads as "everything", matching the
+         `>= since` semantics `already` below actually wants. */
+      void engine.replaySince(Math.max(0, since - 1), 5000).then(({ frames }) => {
+        const already = frames.find(f => (f.t === "turn_done" || f.t === "approval_request") && f.seq >= since);
+        if (already) finish(already, false);
+      });
     });
+
+    if (aborted) return; // client already gone; nothing left to write to
     if (!frame) return sendJson(res, 202, { partial: true, error: "wait_timeout", lastSeq: engine.lastSeq });
     sendJson(res, 200, { frame, lastSeq: engine.lastSeq });
   }
@@ -578,11 +629,18 @@ export class GatewayServer {
     const tabs: "all" | Set<string> = wanted === "all" || wanted === undefined
       ? "all"
       : new Set((Array.isArray(wanted) ? wanted : []).filter((x): x is string => typeof x === "string"));
-    /* Register BEFORE replaying: a frame produced during the replay await must
-       land after the replayed ones, not vanish into a gap. Ordering holds
-       because both go out through conn.send on the same socket, in call
-       order, and the replay loop below is the only thing between them. */
-    this.subs.set(conn.id, { conn, tabs });
+    /* Register BEFORE replaying, with `replaying: true`: a frame produced
+       during the replay await must land after the replayed ones, not vanish
+       into a gap or jump ahead of them. "Both go out through conn.send in
+       call order" only holds when replaySince() resolves without real I/O
+       (the ring's fast path). On the disk branch it awaits `writeChain` and
+       then a real file read — genuine event-loop yields a concurrent
+       broadcast() can land inside. Queuing live frames on the sub instead of
+       sending them straight through (see broadcast()) keeps them behind
+       whatever this loop is about to replay, and the flush below sends them
+       once every target has been replayed. */
+    const sub: Subscription = { conn, tabs, replaying: true, queue: [] };
+    this.subs.set(conn.id, sub);
 
     const since = (msg.since && typeof msg.since === "object" ? msg.since : {}) as Record<string, number>;
     const targets = this.deps.registry.list().filter(t => tabs === "all" || tabs.has(t.id));
@@ -609,8 +667,12 @@ export class GatewayServer {
     for (const engine of targets) {
       const cursor = Number.isFinite(since[engine.id]) ? Number(since[engine.id]) : 0;
       if (cursor >= engine.lastSeq) continue;
-      const { frames, evicted } = await engine.replaySince(cursor);
-      if (evicted) {
+      const { frames, evicted, truncated } = await engine.replaySince(cursor);
+      /* Truncated (more frames existed above `cursor` than the replay's
+         limit covers) must be treated exactly like evicted: rendering a
+         partial replay as a complete one silently drops the tail of the gap
+         with no signal to the client at all. */
+      if (evicted || truncated) {
         conn.send(JSON.stringify(makeFrame("resync", engine.id, engine.lastSeq, { reason: "buffer_evicted" })));
         continue;
       }
@@ -618,6 +680,17 @@ export class GatewayServer {
         if (conn.closed) return;
         conn.send(JSON.stringify(frame));
       }
+    }
+
+    /* Every target's replay has now been read back and sent; live frames for
+       this subscription queued in the meantime (see broadcast()) are safely
+       newer than all of it. Stop queuing and flush them in arrival order. */
+    sub.replaying = false;
+    const queued = sub.queue;
+    sub.queue = [];
+    for (const line of queued) {
+      if (conn.closed) return;
+      conn.send(line);
     }
   }
 

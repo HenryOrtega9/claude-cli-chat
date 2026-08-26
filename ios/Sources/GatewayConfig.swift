@@ -80,13 +80,43 @@ enum GatewayConfig {
         // reach the setter, so a bad stored value degrades to the existing
         // "Bad gateway URL. Check Settings." failure instead of a crash loop.
         let host = effectiveHost
-        guard !host.isEmpty, (1...65535).contains(port) else { return nil }
+        let isHTTPS = scheme == "https"
+        // The stored `port` is meaningful only for http — Tailscale HTTPS
+        // terminates on the standard 443, not the daemon's own port (see
+        // `probeURL`'s comment). Omitting it here lets URLSession default to
+        // 443, the same way `probeURL` and `webSocketOrigin` already do, so
+        // switching Settings to https never has to touch (and thereby
+        // clobber) the http port.
+        guard !host.isEmpty, isHTTPS || (1...65535).contains(port) else { return nil }
+        // `path` is page-supplied (`NativeBridge.rpc`'s `params["path"]`).
+        // `URL(string:relativeTo:)` discards `base` entirely for an absolute
+        // or protocol-relative reference ("https://evil/x", "//evil/x" — RFC
+        // 3986 reference resolution), which would carry the Keychain bearer
+        // token (attached unconditionally in `GatewayClient.request`) to
+        // whatever host it names. Reject anything that isn't a plain
+        // same-origin path before resolving, and re-check the resolved
+        // authority matches as a second line of defense.
+        guard isRelativePath(path) else { return nil }
         var components = URLComponents()
-        components.scheme = scheme == "https" ? "https" : "http"
+        components.scheme = isHTTPS ? "https" : "http"
         components.host = host
-        components.port = port
-        guard let base = components.url else { return nil }
-        return URL(string: path, relativeTo: base)?.absoluteURL
+        if !isHTTPS { components.port = port }
+        guard let base = components.url,
+              let resolved = URL(string: path, relativeTo: base)?.absoluteURL,
+              resolved.host == components.host, resolved.scheme == components.scheme,
+              resolved.port == components.port
+        else { return nil }
+        return resolved
+    }
+
+    /// True when `path` can only ever resolve relative to the app's own
+    /// `base` — rejects an absolute URL or a protocol-relative one
+    /// ("//host/x"), either of which `URL(string:relativeTo:)` would resolve
+    /// against its own authority instead of `base`. The single choke point
+    /// every gateway request is built through (`url(_:)` and `probeURL`), so
+    /// nothing downstream needs to re-derive this.
+    private static func isRelativePath(_ path: String) -> Bool {
+        path.hasPrefix("/") && !path.hasPrefix("//")
     }
 
     /// Builds a probe URL that forces `probeScheme` instead of the stored
@@ -103,7 +133,7 @@ enum GatewayConfig {
     /// daemon's port and there is no separate "http override".
     static func probeURL(_ path: String, scheme probeScheme: String, port overridePort: Int? = nil) -> URL? {
         let host = effectiveHost
-        guard !host.isEmpty else { return nil }
+        guard !host.isEmpty, isRelativePath(path) else { return nil }
         var components = URLComponents()
         components.scheme = probeScheme == "https" ? "https" : "http"
         if let overridePort {
@@ -114,14 +144,21 @@ enum GatewayConfig {
             components.port = port
         }
         components.host = host
-        guard let base = components.url else { return nil }
-        return URL(string: path, relativeTo: base)?.absoluteURL
+        guard let base = components.url,
+              let resolved = URL(string: path, relativeTo: base)?.absoluteURL,
+              resolved.host == components.host, resolved.scheme == components.scheme,
+              resolved.port == components.port
+        else { return nil }
+        return resolved
     }
 
-    /// `ws(s)://host:port` prefix for `wsUrl`.
+    /// `ws(s)://host[:port]` prefix for `wsUrl`. Mirrors `url(_:)`: the
+    /// stored `port` is the http daemon's port and means nothing for wss, so
+    /// https omits it and lets the standard 443 apply, the same way
+    /// `probeURL` already does for the https probe leg.
     static var webSocketOrigin: String {
-        let wsScheme = scheme == "https" ? "wss" : "ws"
-        return "\(wsScheme)://\(effectiveHost):\(port)"
+        if scheme == "https" { return "wss://\(effectiveHost)" }
+        return "ws://\(effectiveHost):\(port)"
     }
 
     static var appVersion: String {

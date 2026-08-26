@@ -294,7 +294,19 @@ async function boot(): Promise<void> {
     switch (name) {
       case "suspend":
         /* Close the socket and hand native the cursor snapshot synchronously —
-           the app is backgrounding and no timer of ours will fire again. */
+           the app is backgrounding and no timer of ours will fire again.
+           Composer draft text sits behind TWO debounces (InputBox's own
+           500ms, then Persistence.scheduleSaveTab's separate 500ms) and
+           neither one fires once backgrounded — this WebView's timers are
+           suspended the instant the app leaves the foreground, and
+           Persistence.flushSync() (the desktop quit-time escape hatch) is a
+           no-op here since RemoteFileStorage has no basePath. Drain both,
+           in order, before the socket goes down: flushActiveDraft() forces
+           the composer's debounce out synchronously (arming
+           Persistence.scheduleSaveTab's pending write), then flush() fires
+           that write immediately instead of waiting on its own timer. */
+        shell.flushActiveDraft();
+        void persistence.flush();
         conn.suspend();
         return;
       case "resume":
@@ -332,8 +344,13 @@ async function boot(): Promise<void> {
   await conn.connect();
 
   /* The page going away without a `suspend` (dev reload, a WebView the OS
-     reclaimed) still owes native its cursor snapshot. */
-  window.addEventListener("pagehide", () => conn.suspend());
+     reclaimed) still owes native its cursor snapshot — and the same
+     draft-flush the "suspend" dispatch does above, for the same reason. */
+  window.addEventListener("pagehide", () => {
+    shell.flushActiveDraft();
+    void persistence.flush();
+    conn.suspend();
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") conn.resume();
   });
