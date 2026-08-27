@@ -45,6 +45,7 @@ import {
 import type { Persistence } from "../../src/storage/Persistence";
 import type { GatewayConnection, LinkState } from "../../src/platform/remote/GatewayConnection";
 import { isNativeHost, onSwitchTab, type PendingTabSwitch } from "./native";
+import { showUsageSheet } from "./usage";
 import type { RemoteHost } from "../../src/platform/remote/RemoteHost";
 import type { RemoteFileStorage } from "../../src/platform/remote/RemoteFileStorage";
 import type { GatewayTransport } from "../../src/platform/remote/transport";
@@ -249,6 +250,15 @@ export class IosChatShell {
     for (const label of HIDDEN_HEADER_BUTTONS) {
       actions.querySelector<HTMLElement>(`[aria-label="${label}"]`)?.remove();
     }
+    const usage = actions.createSpan({
+      cls: "claudian-header-btn",
+      attr: { "aria-label": "Usage", title: "Usage" },
+    });
+    platform.setIcon(usage, "gauge");
+    usage.addEventListener("click", () => {
+      this.transport.haptic("selection");
+      showUsageSheet();
+    });
     const settings = actions.createSpan({
       cls: "claudian-header-btn",
       attr: { "aria-label": "Settings", title: "Settings" },

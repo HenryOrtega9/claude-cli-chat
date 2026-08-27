@@ -36,7 +36,11 @@
   --vgw-glass-bg: rgba(22, 27, 34, 0.55);
   --vgw-glass-border: rgba(255, 255, 255, 0.12);
   --vgw-glass-highlight: rgba(255, 255, 255, 0.06);
-  --vgw-blur: blur(24px) saturate(160%);
+  /* 14px, down from 24px: over this gradient the two are visually near
+     identical, and blur radius is the single biggest per-frame cost of the
+     glass surfaces WebKit re-rasters while the stream scrolls under them.
+     The dropped frames read as animation jitter everywhere at once. */
+  --vgw-blur: blur(14px) saturate(150%);
 }
 
 /* ---- Ground -------------------------------------------------
@@ -109,6 +113,9 @@ body {
   backdrop-filter: var(--vgw-blur);
   border-bottom: 1px solid var(--vgw-glass-border);
   box-shadow: inset 0 1px 0 0 var(--vgw-glass-highlight);
+  /* Own compositor layer: sticky repositioning during scroll otherwise
+     re-rasters the blurred header every frame. */
+  transform: translateZ(0);
 }
 
 #app .claudian-title-text {
@@ -270,7 +277,12 @@ body {
      of the home indicator, so max() rather than a sum — adding
      both would double-count the safe area. */
   padding-bottom: max(var(--kb-inset), var(--vgw-safe-bottom));
-  transition: padding-bottom 120ms ease-out;
+  /* --kb-inset is sampled from visualViewport events DURING the native
+     keyboard animation, so the value already moves on the system curve.
+     An eased transition on top restarted its easing at every sample and
+     rubber-banded the composer; a short linear smoothing only bridges the
+     gaps between samples without adding its own velocity curve. */
+  transition: padding-bottom 80ms linear;
 }
 
 #app .claudian-input,
@@ -883,5 +895,168 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* ---- Usage sheet ---------------------------------------------
+   Bottom sheet listing the account's usage meters (the `limits`
+   array the Mac menu-bar app renders), opened from the header's
+   gauge button. Glass treatment matches the composer; meter
+   colors go green/yellow/red at the 50/80% thresholds the watch
+   complications use. */
+.vaultgw-usage-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-end;
+}
+
+.vaultgw-usage-sheet {
+  width: 100%;
+  max-height: 70vh;
+  overflow-y: auto;
+  border-radius: 20px 20px 0 0;
+  padding: 14px 18px calc(var(--vgw-safe-bottom, 0px) + 18px);
+  background: var(--vgw-glass-bg);
+  -webkit-backdrop-filter: var(--vgw-blur);
+  backdrop-filter: var(--vgw-blur);
+  border-top: 1px solid var(--vgw-glass-border);
+}
+
+.vaultgw-usage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.vaultgw-usage-title {
+  font-family: "Copernicus", "Tiempos Headline", Georgia, serif;
+  font-size: 17px;
+  font-weight: 500;
+  color: var(--text-normal);
+}
+
+.vaultgw-usage-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 15px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.vaultgw-usage-close .svg-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.vaultgw-usage-row {
+  padding: 9px 0;
+}
+
+.vaultgw-usage-row-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 5px;
+}
+
+.vaultgw-usage-label {
+  font-size: 13px;
+  color: var(--text-normal);
+}
+
+.vaultgw-usage-pct {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.vaultgw-usage-track {
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.vaultgw-usage-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+
+.vaultgw-usage-fill.is-ok { background: #4cc38a; }
+.vaultgw-usage-fill.is-warning { background: #e5b567; }
+.vaultgw-usage-fill.is-critical { background: #f47067; }
+
+.vaultgw-usage-reset {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.vaultgw-usage-extra,
+.vaultgw-usage-empty {
+  padding: 10px 0 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ---- Entrance motion ----------------------------------------
+   Surfaces that hard-cut into view read as stutter next to the
+   native transitions around them. Transform + opacity only, so
+   every one of these runs on the compositor and cannot drop
+   frames on layout. The Apple sheet curve for the bottom sheet,
+   quick ease-out for the small chrome. */
+@keyframes vaultgw-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes vaultgw-sheet-up {
+  from { transform: translateY(28px); opacity: 0.6; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
+@keyframes vaultgw-rise-in {
+  from { transform: translateY(6px) scale(0.98); opacity: 0; }
+  to   { transform: translateY(0)   scale(1);    opacity: 1; }
+}
+
+.vaultgw-usage-overlay {
+  animation: vaultgw-fade-in 160ms ease-out;
+}
+
+.vaultgw-usage-sheet {
+  animation: vaultgw-sheet-up 260ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* Modals mount into `body > .modal-container`, outside #app. */
+.modal-container .modal,
+.prompt {
+  animation: vaultgw-rise-in 170ms ease-out;
+}
+
+.modal-container .modal-bg {
+  animation: vaultgw-fade-in 170ms ease-out;
+}
+
+#app .claudian-popup {
+  animation: vaultgw-rise-in 140ms ease-out;
+}
+
+/* The reduced-motion block above only reaches #app descendants;
+   these surfaces live on body. */
+@media (prefers-reduced-motion: reduce) {
+  .vaultgw-usage-overlay,
+  .vaultgw-usage-sheet,
+  .modal-container .modal,
+  .modal-container .modal-bg,
+  .prompt {
+    animation-duration: 0.001ms !important;
   }
 }
