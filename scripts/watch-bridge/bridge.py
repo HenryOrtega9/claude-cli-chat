@@ -65,6 +65,7 @@ interface.
 State changes mirror to /tmp/claude_state (same token format as the plugin's
 StateEmitter) so the TC001 animator reflects watch activity for free.
 """
+import calendar
 import fcntl
 import hmac
 import json
@@ -74,6 +75,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -247,6 +249,11 @@ class ClaudeSession:
     def __init__(self, claude_path):
         self.claude_path = claude_path
         self.lock = threading.Lock()
+        # Serializes the whole paste+settle+CR write sequence in send() (and
+        # the CR write in nudge_submit()) so two writers can never interleave
+        # their bytes into the composer. self.lock only ever guards short
+        # metadata snapshots and must stay separate from this.
+        self.write_lock = threading.Lock()
         self.pid = -1
         self.fd = -1
         self.spawn_epoch = 0.0
@@ -316,7 +323,12 @@ class ClaudeSession:
             if gen != self._gen:
                 break  # stale reader: fall through to unconditional cleanup
             try:
-                rlist, _, _ = select.select([fd], [], [], 0.1)
+                # select() returns as soon as data is available regardless of
+                # this timeout, so PTY-output responsiveness is unaffected;
+                # only the idle waitpid/gen-staleness poll cadence slows,
+                # which the exit path already tolerates (the 5s reap loop
+                # below).
+                rlist, _, _ = select.select([fd], [], [], 1.0)
             except (OSError, ValueError):
                 break
             if fd in rlist:
@@ -344,6 +356,16 @@ class ClaudeSession:
         # regardless of generation: a slow-dying child reaches EOF here after a
         # respawn has already bumped self._gen, so a gen-gated close/reap would
         # leak the old PTY master fd and leave a zombie.
+        # Invalidate the shared handle first (only if it still points at what
+        # we're closing — a respawn may already have overwritten it with a
+        # new fd/pid, in which case leave those alone). Without this, a
+        # number the kernel later reuses for an unrelated HTTP client socket
+        # can silently receive a write meant for the PTY.
+        with self.lock:
+            if self.fd == fd:
+                self.fd = -1
+            if self.pid == pid:
+                self.pid = -1
         try:
             os.close(fd)
         except OSError:
@@ -358,7 +380,12 @@ class ClaudeSession:
             time.sleep(0.1)
 
     def _handle_output(self, chunk, fd):
-        self.stdout_tail = (self.stdout_tail + strip_ansi(chunk))[-65536:]
+        # Append unconditionally and only truncate once a high-water mark is
+        # crossed, instead of reslicing a ~64KB string on every 4KB chunk.
+        # Same steady-state cap (65536), amortized instead of per-chunk.
+        self.stdout_tail += strip_ansi(chunk)
+        if len(self.stdout_tail) > 98304:
+            self.stdout_tail = self.stdout_tail[-65536:]
         if not self._bypass_confirmed and BYPASS_PROMPT_RE.search(self.stdout_tail):
             # the dialog defaults to "1. No, exit"; select "2. Yes, I accept"
             self._bypass_confirmed = True
@@ -382,6 +409,13 @@ class ClaudeSession:
                 os.write(fd, b"\r")
             except OSError:
                 pass
+            # Consume the matched text: without this, the "history gets
+            # re-read" / "1. Yes" markers can survive well past the 3s
+            # debounce inside the rolling 1500-char window (ANSI-stripped
+            # repaints add only a few hundred visible chars), so the next
+            # spinner frame or status tick re-satisfies the condition and
+            # writes a stray "1"+CR into what is now an empty composer.
+            self.stdout_tail = ""
         if not self._trust_confirmed and TRUST_PROMPT_RE.search(self.stdout_tail):
             self._trust_confirmed = True
             log("auto-confirming trust prompt")
@@ -488,12 +522,17 @@ class ClaudeSession:
         # freshly spawned child and inject a stray submit into its startup TUI.
         with self.lock:
             fd, gen = self.fd, self._gen
-        os.write(fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
-        time.sleep(0.2)
-        with self.lock:
-            if self._gen != gen:
-                return  # respawned mid-send; don't submit into the new child
-        os.write(fd, b"\r")
+        # Hold write_lock across the whole paste+settle+CR sequence: without
+        # it, a concurrent writer (another /chat, a /command, a sticky
+        # replay) can interleave its own paste between this paste and this
+        # CR, and the single CR then submits the concatenation as one turn.
+        with self.write_lock:
+            os.write(fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
+            time.sleep(0.2)
+            with self.lock:
+                if self._gen != gen:
+                    return  # respawned mid-send; don't submit into the new child
+            os.write(fd, b"\r")
 
     def nudge_submit(self, expected_gen=None):
         """Extra CR a moment after a send: a TUI mid-redraw can eat the
@@ -508,10 +547,11 @@ class ClaudeSession:
             fd, gen = self.fd, self._gen
         if expected_gen is not None and gen != expected_gen:
             return
-        try:
-            os.write(fd, b"\r")
-        except OSError:
-            pass
+        with self.write_lock:
+            try:
+                os.write(fd, b"\r")
+            except OSError:
+                pass
 
     def respawn(self):
         with self.lock:
@@ -571,15 +611,22 @@ class TranscriptTailer:
 
     def _loop(self):
         while True:
-            path = self.session.session_file
-            with self.lock:
-                if path != self.path:
-                    self._reset(path or "")
-            if path:
-                try:
+            try:
+                path = self.session.session_file
+                with self.lock:
+                    if path != self.path:
+                        self._reset(path or "")
+                if path:
                     self._read_new(path)
-                except OSError:
-                    pass
+            except OSError:
+                pass
+            except Exception as e:
+                # A malformed record (e.g. a JSONL line that parses but isn't
+                # an object) must not kill this thread permanently: nothing
+                # supervises or restarts it, and every subsequent turn would
+                # see a frozen tailer, burn the 45s never-landed abort, and
+                # return an empty reply.
+                log(f"tailer: unexpected error, continuing: {e}")
             time.sleep(0.25)
 
     def _read_new(self, path):
@@ -608,6 +655,8 @@ class TranscriptTailer:
             rec = json.loads(line)
         except json.JSONDecodeError:
             return
+        if not isinstance(rec, dict):
+            return  # valid JSON but not an object (e.g. a truncated/racy write)
         uuid = rec.get("uuid")
         if isinstance(uuid, str):
             if uuid in self.seen_uuids:
@@ -676,7 +725,8 @@ class TurnManager:
         self.busy = threading.Lock()
         self.last_reply = None
         self.last_session_id = None
-        self.last_completed_at = 0.0  # bridge clock, drives GET /wait
+        self.last_completed_at = 0.0  # bridge clock, deprecated GET /wait fallback
+        self.turn_seq = 0  # monotonic completion counter; the reliable GET /wait key
 
     def run_turn(self, message, budget_s):
         """Returns (status_code, payload). 409 if a turn is in flight; 202 with
@@ -702,6 +752,11 @@ class TurnManager:
                 self.busy.release()
                 emit_state("ready")
                 return 503, {"error": f"send_failed: {e}"}
+            # Snapshot the generation this message was sent into so the 10s
+            # wedge nudge (below) can be routed through the same gen-guarded
+            # path as every other write instead of hitting self.session.fd
+            # directly, which can be a stale/recycled descriptor by then.
+            turn_gen = self.session.current_gen()
 
             done = threading.Event()
             result = {}
@@ -709,10 +764,12 @@ class TurnManager:
             def wait_for_completion():
                 try:
                     nudged = False
+                    aborted_reason = None
                     while True:
                         if self._stop_signaled(start) or self.tailer.idle_complete(mark):
                             break
                         if not self.session.alive:
+                            aborted_reason = "session_dead"
                             break
                         waited = time.time() - start
                         landed = self.tailer.mark() > mark
@@ -723,15 +780,14 @@ class TurnManager:
                             # a slow-but-real turn is harmless.
                             nudged = True
                             log("turn: no assistant text 10s after send, re-sending CR")
-                            try:
-                                os.write(self.session.fd, b"\r")
-                            except OSError:
-                                pass
+                            self.session.nudge_submit(expected_gen=turn_gen)
                         if not landed and waited > 45:
                             log("turn: message never landed in transcript, aborting turn")
+                            aborted_reason = "never_landed"
                             break
                         if waited > budget_s * 4:
                             log("turn: absolute ceiling reached, aborting turn")
+                            aborted_reason = "ceiling"
                             break
                         time.sleep(0.25)
                     # the stop hook can fire before the tailer's next 250ms
@@ -744,20 +800,35 @@ class TurnManager:
                     time.sleep(0.3)
                     reply = self.tailer.reply_since(mark) or ""
                     result["reply"] = reply
-                    self.last_reply = {
-                        "reply": reply,
-                        "session_id": self.session.session_id,
-                        "elapsed_ms": int((time.time() - start) * 1000),
-                        "partial": False,
-                    }
-                    self.last_completed_at = time.time()
-                    emit_state("complete")
+                    if aborted_reason and not reply:
+                        # A dead child / never-landed message / absolute
+                        # ceiling with no assistant text is a failed turn, not
+                        # a completed one: don't stamp last_reply/
+                        # last_completed_at/turn_seq over the last GOOD reply,
+                        # or /last and a background /wait hand the watch an
+                        # empty "reply" it renders as a real (blank) answer.
+                        result["aborted"] = aborted_reason
+                        log(f"turn: aborted ({aborted_reason}), not recording as completed")
+                        emit_state("ready")
+                    else:
+                        self.last_reply = {
+                            "reply": reply,
+                            "session_id": self.session.session_id,
+                            "elapsed_ms": int((time.time() - start) * 1000),
+                            "partial": False,
+                        }
+                        self.last_completed_at = time.time()
+                        self.turn_seq += 1
+                        self.last_reply["turn_seq"] = self.turn_seq
+                        emit_state("complete")
                 finally:
                     done.set()
                     self.busy.release()
 
             threading.Thread(target=wait_for_completion, daemon=True).start()
             if done.wait(timeout=budget_s):
+                if result.get("aborted"):
+                    return 503, {"error": "turn_aborted", "reason": result["aborted"]}
                 return 200, dict(self.last_reply)
             partial = self.tailer.reply_since(mark)
             return 202, {
@@ -815,10 +886,12 @@ def _run(argv, timeout=5):
         return None
 
 
-def extract_messages(path, limit=30):
+def extract_messages(path, limit=30, tail_bytes=262144):
     """Last `limit` user/assistant text messages from a session JSONL. Reads
-    only the file tail (256KB) so huge transcripts stay cheap. Tool results,
-    meta records, and harness-injected user content are skipped."""
+    only the file tail (`tail_bytes`) so huge transcripts stay cheap. Tool
+    results, meta records, and harness-injected user content are skipped.
+    Widens to the full 256KB tail if a smaller `tail_bytes` window (e.g. the
+    session-list preview path) came up short of `limit` messages."""
     try:
         size = os.stat(path).st_size
     except OSError:
@@ -826,8 +899,8 @@ def extract_messages(path, limit=30):
     msgs = []
     try:
         with open(path, "rb") as f:
-            if size > 262144:
-                f.seek(size - 262144)
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
                 f.readline()  # drop the partial line at the seek point
             data = f.read()
     except OSError:
@@ -839,6 +912,8 @@ def extract_messages(path, limit=30):
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
             continue
         if rec.get("isMeta"):
             continue
@@ -877,7 +952,10 @@ def extract_messages(path, limit=30):
             "text": text,
             "ts": rec.get("timestamp"),
         })
-    return msgs[-limit:]
+    msgs = msgs[-limit:]
+    if len(msgs) < limit and tail_bytes < min(size, 262144):
+        return extract_messages(path, limit, 262144)
+    return msgs
 
 
 class SessionDirectory:
@@ -889,7 +967,12 @@ class SessionDirectory:
     remote-control claude running inside a tmux pane is attachable via `tmux
     send-keys`; otherwise it is view-only."""
 
-    CACHE_S = 5.0
+    # Above SessionsView's 3s poll period so a normal poll is a cache hit.
+    CACHE_S = 15.0
+    # A cache hit still missing its transcript (a just-spawned session with
+    # no JSONL yet) gets a tighter TTL so the file is picked up promptly
+    # without forcing every other poll into a full rescan.
+    PENDING_FILE_CACHE_S = 5.0
     # Fallback-mapping guard: a session writes its transcript within seconds of
     # spawning, so a JSONL born much later than the process belongs to a
     # different session in the same cwd. Used only when no ~/.claude/sessions
@@ -900,6 +983,7 @@ class SessionDirectory:
         self.session = session
         self.turns = turns
         self.lock = threading.Lock()
+        self._refresh_lock = threading.Lock()  # single-flights refresh()
         self._cached_at = 0.0
         self._sessions = []
         self._by_id = {}
@@ -1070,7 +1154,7 @@ class SessionDirectory:
                     s["last_activity"] = int(os.stat(s["file"]).st_mtime)
                 except OSError:
                     pass
-                tail = extract_messages(s["file"], limit=1)
+                tail = extract_messages(s["file"], limit=1, tail_bytes=16384)
                 if tail:
                     s["preview"] = tail[-1]["text"][:120]
         with self.lock:
@@ -1079,21 +1163,33 @@ class SessionDirectory:
             self._by_id = {s["id"]: s for s in sessions}
         return sessions
 
+    def _refresh_once(self):
+        """Single-flight refresh(): concurrent callers (the app plus the
+        widget timeline refresh) await one in-progress scan instead of each
+        launching their own ps/tmux/lsof sweep."""
+        if self._refresh_lock.acquire(blocking=False):
+            try:
+                return self.refresh()
+            finally:
+                self._refresh_lock.release()
+        with self._refresh_lock:  # blocks until the in-flight scan finishes
+            with self.lock:
+                return list(self._sessions)
+
     def list_sessions(self):
         with self.lock:
             fresh = time.time() - self._cached_at < self.CACHE_S
             cached = list(self._sessions)
-        return cached if fresh else self.refresh()
+        return cached if fresh else self._refresh_once()
 
     def resolve(self, sid):
         with self.lock:
-            fresh = time.time() - self._cached_at < self.CACHE_S
+            age = time.time() - self._cached_at
             hit = self._by_id.get(sid)
-        # A hit without a transcript yet (or a stale cache) gets re-scanned so
-        # the session file is picked up as soon as it exists.
-        if hit and fresh and hit.get("file"):
+        ttl = self.PENDING_FILE_CACHE_S if (hit and not hit.get("file")) else self.CACHE_S
+        if hit and age < ttl:
             return hit
-        self.refresh()
+        self._refresh_once()
         with self.lock:
             found = self._by_id.get(sid)
             if found:
@@ -1177,31 +1273,71 @@ class UsageFetcher:
     CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     CACHE_S = 60.0
 
+    FAIL_CACHE_S = 30.0
+
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # protects cache + failure state only
+        self._fetch_lock = threading.Lock()  # single-flights the actual network I/O
         self._cached_at = 0.0
         self._cached = None
+        self._last_error = None
+        self._last_error_at = 0.0
+        self._last_refresh_fail_log = 0.0
         self._ctx = _https_context()
 
     def fetch(self):
         with self.lock:
-            if self._cached is not None and time.time() - self._cached_at < self.CACHE_S:
-                return 200, self._cached
-            creds = self._load_creds()
-            if not creds or not creds.get("accessToken"):
-                return 503, {"error": "usage_credentials_missing"}
-            if self._needs_refresh(creds):
-                creds = self._refresh(creds) or creds
+            hit = self._fresh_hit_locked()
+            if hit is not None:
+                return hit
+        # Network I/O happens outside self.lock; _fetch_lock coalesces
+        # concurrent callers (both widget kinds refresh around the same time)
+        # onto one in-flight request instead of each holding a lock across
+        # up to 45s of urlopen calls.
+        with self._fetch_lock:
+            with self.lock:
+                hit = self._fresh_hit_locked()
+                if hit is not None:
+                    return hit
+            code, payload = self._do_fetch()
+            with self.lock:
+                if code == 200:
+                    self._cached_at = time.time()
+                    self._cached = payload
+                    self._last_error = None
+                else:
+                    self._last_error = payload
+                    self._last_error_at = time.time()
+                    if self._cached is not None:
+                        return 200, dict(self._cached, stale=True)
+                return code, payload
+
+    def _fresh_hit_locked(self):
+        """Called with self.lock held. Returns a (code, payload) to serve
+        immediately, or None if a real fetch is needed."""
+        if self._cached is not None and time.time() - self._cached_at < self.CACHE_S:
+            return 200, self._cached
+        if self._last_error is not None and time.time() - self._last_error_at < self.FAIL_CACHE_S:
+            if self._cached is not None:
+                return 200, dict(self._cached, stale=True)
+            return 503, self._last_error
+        return None
+
+    def _do_fetch(self):
+        creds = self._load_creds()
+        if not creds or not creds.get("accessToken"):
+            return 503, {"error": "usage_credentials_missing"}
+        if self._needs_refresh(creds):
+            # Proactive refresh: the existing access token still works, so a
+            # failure here is noise, not a user-visible problem. Rate-limit it.
+            creds = self._refresh(creds, quiet=True) or creds
+        code, payload = self._get_usage(creds["accessToken"])
+        if code == 401:
+            creds = self._refresh(creds)
+            if not creds:
+                return 503, {"error": "usage_auth_expired"}
             code, payload = self._get_usage(creds["accessToken"])
-            if code == 401:
-                creds = self._refresh(creds)
-                if not creds:
-                    return 503, {"error": "usage_auth_expired"}
-                code, payload = self._get_usage(creds["accessToken"])
-            if code == 200:
-                self._cached_at = time.time()
-                self._cached = payload
-            return code, payload
+        return code, payload
 
     def _load_creds(self):
         try:
@@ -1216,7 +1352,11 @@ class UsageFetcher:
             return 0
         for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
             try:
-                return time.mktime(time.strptime(value, fmt)) - time.timezone
+                # calendar.timegm treats the struct as UTC (the value is
+                # explicitly a "Z" stamp); time.mktime treats it as LOCAL time
+                # and, combined with a non-DST `- time.timezone` correction,
+                # is off by an hour for roughly eight months of the year.
+                return calendar.timegm(time.strptime(value, fmt))
             except ValueError:
                 continue
         return 0
@@ -1237,7 +1377,12 @@ class UsageFetcher:
         except (OSError, json.JSONDecodeError, ValueError) as e:
             return 502, {"error": f"usage_fetch_failed: {e}"}
 
-    def _refresh(self, creds):
+    def _refresh(self, creds, quiet=False):
+        """quiet=True is for the proactive (not-yet-expired) refresh path: the
+        existing access token still works there, so a failure is noise, not a
+        user-visible problem, and is rate-limited to at most once an hour so a
+        genuine auth expiry (quiet=False, from the reactive 401 path) stays
+        distinguishable from it in the log."""
         refresh_token = creds.get("refreshToken")
         if not refresh_token:
             return None
@@ -1259,31 +1404,43 @@ class UsageFetcher:
             with urllib.request.urlopen(req, timeout=15, context=self._ctx) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
         except (OSError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
-            log(f"usage token refresh failed: {e}")
+            if quiet:
+                now = time.time()
+                if now - self._last_refresh_fail_log > 3600:
+                    self._last_refresh_fail_log = now
+                    log(f"usage token proactive refresh failed (access token still valid): {e}")
+            else:
+                log(f"usage token refresh failed: {e}")
             return None
         access = data.get("access_token")
         if not access:
             return None
         expires_in = data.get("expires_in") or 3600
-        updated = {
+        new_scope = data.get("scope")
+        updated_fields = {
             "accessToken": access,
             "refreshToken": data.get("refresh_token") or refresh_token,
             "expiresAt": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + float(expires_in))
             ),
-            "scopes": scopes,
+            "scopes": new_scope.split() if isinstance(new_scope, str) and new_scope else scopes,
         }
+        # Merge onto the current on-disk file rather than overwriting it:
+        # ClaudeUsageBar shares this file and persists other keys (account
+        # metadata, etc.) that a from-scratch write would silently destroy.
+        merged = self._load_creds() or {}
+        merged.update(updated_fields)
         try:
             tmp = self.CRED_PATH + ".watch-bridge.tmp"
             with open(tmp, "w") as f:
-                json.dump(updated, f, indent=2)
+                json.dump(merged, f, indent=2)
                 f.write("\n")
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.CRED_PATH)
             log("usage token refreshed")
         except OSError as e:
             log(f"usage credentials save failed: {e}")
-        return updated
+        return merged
 
 
 # ---------------------------------------------------------------- http
@@ -1424,13 +1581,26 @@ SESSION_SEND_RE = re.compile(r"^/sessions/([A-Za-z0-9._-]+)/send$")
 
 def make_handler(token, session, turns, sticky, guard, directory, usage, started_at):
     class Handler(BaseHTTPRequestHandler):
+        # Keep-alive: every response sets an accurate Content-Length (see
+        # _send below, the sole response path), so HTTP/1.1 is safe here and
+        # saves a TCP handshake per poll over the tailnet. `timeout` bounds an
+        # abandoned keep-alive connection (well above the /wait ceiling) so
+        # it can't pin a ThreadingHTTPServer thread forever.
+        protocol_version = "HTTP/1.1"
+        timeout = 620
+
         def log_message(self, fmt, *args):
             log(f"http {self.address_string()} {fmt % args}")
 
         def _authed(self):
             header = self.headers.get("Authorization", "")
             supplied = header[7:] if header.startswith("Bearer ") else ""
-            return hmac.compare_digest(supplied, token)
+            # http.client decodes headers as latin-1, so a mistyped/mangled
+            # token can carry non-ASCII codepoints; hmac.compare_digest raises
+            # TypeError on those instead of just comparing unequal. Encoding
+            # first keeps a bad token a clean auth failure, not a dropped
+            # connection with no response.
+            return hmac.compare_digest(supplied.encode("utf-8", "ignore"), token.encode())
 
         def _send(self, code, payload):
             body = json.dumps(payload).encode()
@@ -1471,17 +1641,41 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     since = float(qs.get("since", "0"))
                 except ValueError:
                     since = 0.0
+                # since (a client wall-clock timestamp) is a deprecated
+                # fallback: clock skew between the watch and this Mac can make
+                # it match instantly (stale reply) or never (full timeout).
+                # after_seq matches on TurnManager's monotonic completion
+                # counter instead, which skew can't affect.
+                after_seq = None
+                if "after_seq" in qs:
+                    try:
+                        after_seq = int(qs["after_seq"])
+                    except ValueError:
+                        after_seq = None
                 try:
                     hold = max(1.0, min(float(qs.get("timeout", "600")), 1500.0))
                 except ValueError:
                     hold = 600.0
                 deadline = time.time() + hold
                 # One blocked thread per waiter (ThreadingHTTPServer); the
-                # watch holds at most one of these at a time.
+                # watch holds at most one of these at a time. The watch also
+                # cancels waits aggressively (every arm/activation), so poll
+                # the connection for EOF instead of blind time.sleep(0.5) —
+                # an aborted wait then frees this thread within one tick
+                # instead of pinning it for the full hold.
                 while time.time() < deadline:
-                    if turns.last_reply is not None and turns.last_completed_at >= since:
-                        return self._send(200, dict(turns.last_reply))
-                    time.sleep(0.5)
+                    if turns.last_reply is not None:
+                        if after_seq is not None:
+                            if turns.turn_seq > after_seq:
+                                return self._send(200, dict(turns.last_reply))
+                        elif turns.last_completed_at >= since:
+                            return self._send(200, dict(turns.last_reply))
+                    try:
+                        r, _, _ = select.select([self.connection], [], [], 0.5)
+                        if r and self.connection.recv(1, socket.MSG_PEEK) == b"":
+                            return  # client disconnected; free the thread quietly
+                    except OSError:
+                        return
                 return self._send(202, {"reply": None, "partial": True, "error": "wait_timeout"})
             if self.path == "/usage":
                 return self._send(*usage.fetch())
@@ -1533,24 +1727,30 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     for p in COMMAND_ALLOWLIST
                 ):
                     return self._send(400, {"error": "command_not_allowed"})
-                if turns.busy.locked():
+                # A real non-blocking acquire (not a TOCTOU .locked() peek) so
+                # a concurrent POST /chat can't slip in between the check and
+                # the send and interleave its paste into this composer.
+                if not turns.busy.acquire(blocking=False):
                     return self._send(409, {"error": "turn_in_flight"})
-                guard.guard()
                 try:
-                    session.send(command)
-                except (OSError, RuntimeError) as e:
-                    return self._send(503, {"error": f"send_failed: {e}"})
-                # The submit nudge fires 0.8s later, outside any turn lock, so a
-                # respawn (auto-reset / watchdog / /reset) can swap the child in
-                # between. Pin it to the generation we just sent into so a
-                # deferred CR can't inject a stray submit into a fresh child.
-                sent_gen = session.current_gen()
-                timer = threading.Timer(0.8, lambda: session.nudge_submit(sent_gen))
-                timer.daemon = True
-                timer.start()
-                sticky.remember(command)
-                log(f"slash command sent: {command}")
-                return self._send(200, {"ok": True, "command": command})
+                    guard.guard()
+                    try:
+                        session.send(command)
+                    except (OSError, RuntimeError) as e:
+                        return self._send(503, {"error": f"send_failed: {e}"})
+                    # The submit nudge fires 0.8s later, outside any turn lock, so a
+                    # respawn (auto-reset / watchdog / /reset) can swap the child in
+                    # between. Pin it to the generation we just sent into so a
+                    # deferred CR can't inject a stray submit into a fresh child.
+                    sent_gen = session.current_gen()
+                    timer = threading.Timer(0.8, lambda: session.nudge_submit(sent_gen))
+                    timer.daemon = True
+                    timer.start()
+                    sticky.remember(command)
+                    log(f"slash command sent: {command}")
+                    return self._send(200, {"ok": True, "command": command})
+                finally:
+                    turns.busy.release()
             m = SESSION_SEND_RE.match(self.path)
             if m:
                 try:
