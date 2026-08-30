@@ -270,12 +270,12 @@ code {
 }
 
 /* ---- Toasts (platform.notify) ------------------------------
-   Contract fixes only the item class `claudesk-toast`, not
-   whether the platform layer wraps them. Both shapes are
-   handled: a lone toast positions itself at the bottom center,
-   and any wrapper element holding toasts becomes the stacking
-   column (column-reverse so the newest sits nearest the bottom
-   edge and older ones ride upward). */
+   Contract fixes only the item class `claudesk-toast`. The wrapper
+   is `.claudesk-toast-container` (desktop-overlays.ts), which sets
+   its own position/flex/pointer-events inline, so this file only
+   has to override how a toast sits once it's inside that column
+   (static instead of fixed-center, and a plain-Y slide-in instead
+   of the lone-toast translateX keyframe). */
 .claudesk-toast {
   position: fixed;
   left: 50%;
@@ -298,22 +298,7 @@ code {
   animation: claudesk-toast-in 140ms ease-out;
 }
 
-*:has(> .claudesk-toast):not(body):not(#app) {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 18px;
-  z-index: 200;
-  display: flex;
-  flex-direction: column-reverse;
-  align-items: center;
-  gap: 8px;
-  /* The column spans the panel width; only the toasts inside it
-     should intercept clicks. */
-  pointer-events: none;
-}
-
-*:has(> .claudesk-toast):not(body):not(#app) > .claudesk-toast {
+.claudesk-toast-container > .claudesk-toast {
   position: static;
   transform: none;
   left: auto;
@@ -333,7 +318,7 @@ code {
 
 /* The keyframe's translateX is wrong for a statically-positioned
    toast inside a stacking column, so that case gets its own. */
-*:has(> .claudesk-toast):not(body):not(#app) > .claudesk-toast {
+.claudesk-toast-container > .claudesk-toast {
   animation: claudesk-toast-in-stacked 140ms ease-out;
 }
 
@@ -421,7 +406,6 @@ code {
   position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(1px);
 }
 
 .modal {

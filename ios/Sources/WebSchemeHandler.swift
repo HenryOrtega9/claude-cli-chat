@@ -114,23 +114,36 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
             }
             task.didReceive(response)
             // Feed the body in slices rather than one multi-megabyte message,
-            // re-checking `stop` between each so a reload that cancels this
-            // task mid-flight (webViewWebContentProcessDidTerminate) stops
-            // pushing bytes into it instead of running to the end regardless.
-            var offset = 0
-            while offset < data.count {
-                guard !self.isStopped(key) else {
-                    self.clearStopped(key)
-                    return
-                }
-                let end = min(offset + Self.chunkSize, data.count)
-                task.didReceive(data.subdata(in: offset..<end))
-                offset = end
-            }
+            // re-checking `stop` between each and hopping back through the
+            // main run loop between chunks (rather than looping through them
+            // all in one block) so touch delivery, CADisplayLink, and the
+            // SwiftUI layout pass aren't starved for the whole transfer. A
+            // reload that cancels this task mid-flight
+            // (webViewWebContentProcessDidTerminate) then also stops pushing
+            // bytes into it instead of running to the end regardless.
+            self.pump(task, key: key, data: data, offset: 0)
+        }
+    }
+
+    /// Sends one chunk of `data` to `task` starting at `offset`, then
+    /// reschedules itself on the main queue for the next chunk. `task` is
+    /// held strongly for the duration via this parameter.
+    private func pump(_ task: any WKURLSchemeTask, key: ObjectIdentifier, data: Data, offset: Int) {
+        guard !isStopped(key) else {
+            clearStopped(key)
+            return
+        }
+        guard offset < data.count else {
             task.didFinish()
-            self.lock.lock()
-            self.stopped.remove(key)
-            self.lock.unlock()
+            lock.lock()
+            stopped.remove(key)
+            lock.unlock()
+            return
+        }
+        let end = min(offset + Self.chunkSize, data.count)
+        task.didReceive(data.subdata(in: offset..<end))
+        DispatchQueue.main.async { [weak self] in
+            self?.pump(task, key: key, data: data, offset: end)
         }
     }
 

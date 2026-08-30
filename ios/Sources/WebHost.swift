@@ -4,9 +4,11 @@ import WebKit
 /// The WKWebView that hosts the page, wired to `NativeBridge` and the
 /// `vaultgw://` scheme handler.
 ///
-/// The web view is transparent on purpose: the native dark gradient behind it
-/// is what the page's glass (`backdrop-filter`) blurs against, so the chrome
-/// looks like one surface instead of a web view pasted onto a background.
+/// The web view is opaque: `body` in ios-web/ios.css paints its own solid
+/// `#0d1117` background plus gradients, so it fully occludes the native
+/// SwiftUI background behind it (which WKWebView cannot backdrop-blur
+/// through in any case). `backgroundColor` below only covers the launch
+/// flash and the post-jetsam reload flash before that CSS has painted.
 struct WebHost: UIViewRepresentable {
     let bridge: NativeBridge
     var inspectable: Bool
@@ -47,9 +49,12 @@ struct WebHost: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.overrideUserInterfaceStyle = .dark
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
+        // Opaque, matching body's own #0d1117 background (ios-web/ios.css):
+        // the page fully occludes the native gradient behind it, so leaving
+        // the web view non-opaque only paid alpha-blending cost on every
+        // composited frame for a layer nobody can see. This color is just the
+        // launch flash / content-process-crash reload flash color.
+        webView.backgroundColor = UIColor(red: 0.051, green: 0.067, blue: 0.09, alpha: 1)
         webView.scrollView.bounces = false
         webView.scrollView.alwaysBounceVertical = false
         webView.scrollView.contentInsetAdjustmentBehavior = .never

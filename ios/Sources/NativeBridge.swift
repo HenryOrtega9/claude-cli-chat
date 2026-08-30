@@ -160,7 +160,12 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
         case "success": notificationFeedback.notificationOccurred(.success)
         case "warning": notificationFeedback.notificationOccurred(.warning)
         case "error": notificationFeedback.notificationOccurred(.error)
-        case "selection": selectionFeedback.selectionChanged()
+        case "selection":
+            selectionFeedback.selectionChanged()
+            // Re-warm immediately: the Taptic Engine idles down after firing,
+            // and without a `prepare()` standing by, the next selection tap
+            // pays cold-start latency again.
+            selectionFeedback.prepare()
         default: impactLight.impactOccurred()
         }
     }
@@ -259,6 +264,9 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
         let pending = pendingDispatches
         pendingDispatches.removeAll()
         for item in pending { rawDispatch(item.name, item.payload) }
+        // Warms the Taptic Engine ahead of the first tap; `selection` is the
+        // only kind the page currently sends (ios-web/src/shell.ts).
+        selectionFeedback.prepare()
     }
 
     /// Called when the page is about to go away and come back with fresh JS

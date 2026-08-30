@@ -74,6 +74,11 @@ export class MessageListRenderer {
   private subagentEventsOpenOverride = new Map<string, boolean>();
   private stickToBottom = true;
   private resizeObserver: ResizeObserver | null = null;
+  /* rAF handle for the resize-triggered pin below. Coalesces the resize
+     notification with doUpsert's own synchronous pinIfSticky() (see the
+     comment on the ResizeObserver construction) so the pair collapses into
+     one forced layout per frame instead of firing twice per upsert. */
+  private resizeRafHandle: number | null = null;
   private intersectionObserver: IntersectionObserver | null = null;
   private actionCallbacks: MessageActionCallbacks | null = null;
   /* Optional element kept positioned immediately before bottomSentinel on
@@ -117,7 +122,16 @@ export class MessageListRenderer {
     this.bottomSentinel = container.createDiv({ cls: "claudian-bottom-sentinel" });
 
     if (typeof ResizeObserver !== "undefined") {
-      this.resizeObserver = new ResizeObserver(() => this.pinIfSticky());
+      /* doUpsert ends every render with a synchronous pinIfSticky() (via
+         scrollToBottom), and the DOM growth from that same render then fires
+         this observer again for the same frame — mutating the observed
+         subtree (appendChild/insertBefore in pinIfSticky's own reordering)
+         from inside the callback also makes WebKit defer/replay the
+         notification. Routing the callback through rAF coalesces all of
+         that into a single pinIfSticky() per frame rather than one per
+         streaming tick; forceStickToBottom() below still pins synchronously
+         on Send, which is unaffected by this. */
+      this.resizeObserver = new ResizeObserver(() => this.scheduleResizePin());
       this.resizeObserver.observe(this.container);
     }
     /* Threshold 0.01 means "any pixel of the sentinel is visible" — that
@@ -183,6 +197,10 @@ export class MessageListRenderer {
   destroy() {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    if (this.resizeRafHandle !== null) {
+      cancelAnimationFrame(this.resizeRafHandle);
+      this.resizeRafHandle = null;
+    }
     this.intersectionObserver?.disconnect();
     this.intersectionObserver = null;
     /* Lives outside `container`, so container.empty()/detach() elsewhere in
@@ -198,6 +216,14 @@ export class MessageListRenderer {
   reset() {
     this.container.empty();
     this.bottomSentinel = this.container.createDiv({ cls: "claudian-bottom-sentinel" });
+    /* A resize notification queued just before reset() would otherwise fire
+       its rAF afterward and pin against whatever container state exists at
+       that point instead of the freshly-reset one above. Cancel it outright,
+       same rationale as the renderChains/streamRenderTimers cleanup below. */
+    if (this.resizeRafHandle !== null) {
+      cancelAnimationFrame(this.resizeRafHandle);
+      this.resizeRafHandle = null;
+    }
     this.intersectionObserver?.disconnect();
     this.observeSentinel();
     /* Lives on the wrapper, not `container`, so the empty() above left it
@@ -257,6 +283,17 @@ export class MessageListRenderer {
   forceStickToBottom() {
     this.stickToBottom = true;
     this.pinIfSticky();
+  }
+
+  /* Coalesces a burst of ResizeObserver notifications (which fire once per
+     mutation of the observed subtree, including ones pinIfSticky itself
+     causes) into a single pinIfSticky() call per animation frame. */
+  private scheduleResizePin() {
+    if (this.resizeRafHandle !== null) return;
+    this.resizeRafHandle = requestAnimationFrame(() => {
+      this.resizeRafHandle = null;
+      this.pinIfSticky();
+    });
   }
 
   private pinIfSticky() {
@@ -424,14 +461,30 @@ export class MessageListRenderer {
     subjectEl.setText(subject ?? "");
     subjectEl.toggleClass("is-empty", !subject);
 
+    /* stateKey/stateChanged are computed here (rather than down by the
+       expand/collapse rules that also need them) because the status icon
+       rebuild right below is the expensive part: renderIcon builds an SVG
+       node-by-node via createElementNS, and upsertTool re-runs for every
+       tool on every streaming delta of the message. Skipping the rebuild
+       when the tool's error/status hasn't actually transitioned avoids that
+       allocation at the stream's tick rate. The expand/collapse rules further
+       down reuse this same stateChanged rather than recomputing it — recomputing
+       after data-state is already written below would always read "unchanged"
+       and silently disable those transitions. */
+    const stateKey = tool.isError ? "error" : tool.status;
+    const stateChanged = toolEl.getAttribute("data-state") !== stateKey;
+    toolEl.setAttribute("data-state", stateKey);
+
     const statusEl = toolEl.querySelector(".claudian-tool-status") as HTMLElement;
-    statusEl.empty();
-    /* Drop any prior status-* class so the color resets between transitions. */
-    statusEl.className = "claudian-tool-status";
-    statusEl.addClass(`status-${tool.status}`);
-    const statusIcon = this.iconForStatus(tool.status, tool.isError);
-    if (statusIcon) platform.setIcon(statusEl, statusIcon);
-    statusEl.setAttr("aria-label", this.labelForStatus(tool.status));
+    if (stateChanged) {
+      statusEl.empty();
+      /* Drop any prior status-* class so the color resets between transitions. */
+      statusEl.className = "claudian-tool-status";
+      statusEl.addClass(`status-${tool.status}`);
+      const statusIcon = this.iconForStatus(tool.status, tool.isError);
+      if (statusIcon) platform.setIcon(statusEl, statusIcon);
+      statusEl.setAttr("aria-label", this.labelForStatus(tool.status));
+    }
 
     /* Auto-expand on first sight while running (so the user sees what's about
        to execute) and on error (so they don't have to click to find what
@@ -444,11 +497,8 @@ export class MessageListRenderer {
        upsertTool re-runs for the whole message every time any sibling tool or
        subagent updates, so an unconditional "collapse when completed" would
        snap a row shut every re-render while the user is trying to read it.
-       Track the last-seen state on the element and only let the system
-       override the user's toggle at the moment the state actually changes. */
-    const stateKey = tool.isError ? "error" : tool.status;
-    const stateChanged = toolEl.getAttribute("data-state") !== stateKey;
-    toolEl.setAttribute("data-state", stateKey);
+       stateChanged (computed above alongside the status-icon guard) already
+       tracks exactly that transition. */
     /* A terminal transition (error or completion) is a fresh system-driven
        state change, so clear the user's running-tool toggle intent and let the
        error/complete rules below decide expansion. On later upserts of the

@@ -148,6 +148,10 @@ export class IosChatShell {
   /* Tabs this client just cleared, so the daemon's own `resync` for that clear
      is not answered with a rebuild we have already done in place. */
   private readonly selfCleared = new Set<string>();
+  /* tab id -> that tab's bypass-mode-guard MutationObserver (see
+     installBypassModeGuard), so a tab's teardown can disconnect its own
+     observer instead of leaking one per tab for the life of the app. */
+  private readonly bypassGuardObservers = new Map<string, MutationObserver>();
   /* True once mount() has finished restoreTabs(). Guards switchTab deep
      links: one arriving before this is true would find `this.tabs` empty
      (or mid-build) and either no-op or race restoreTabs' own mounting, so it
@@ -222,7 +226,6 @@ export class IosChatShell {
       const match = this.tabs.find(t => t.state.messages.find(m => m.role === "user")?.content === userMessage);
       return match?.state.id ?? null;
     });
-    this.installBypassModeGuard();
     this.conn.onLinkState(state => this.renderLinkState(state));
     this.conn.onResync((tabId, reason) => void this.resyncTab(tabId, reason));
 
@@ -279,24 +282,49 @@ export class IosChatShell {
      the popup iterates rather than by its label text.
 
      A MutationObserver rather than a fork of InputBox: src/view is not this
-     change's to edit, and the popup is created fresh on every open. */
-  private installBypassModeGuard(): void {
+     change's to edit, and the popup is created fresh on every open.
+
+     Scoped per-tab to `.claudian-input-wrapper` (InputBox.ts builds `wrapper`
+     directly off the tab's own root, and every popup is `wrapper.createDiv`),
+     not to document.body: InputBox.createPopup always adds the popup as a
+     direct child of that wrapper, so `childList` without `subtree` already
+     sees it — no document-wide subtree walk, and no querySelectorAll over
+     every node a streaming render adds anywhere else in the tab. Installed
+     once per mounted tab (see mountTab) and disconnected on that tab's
+     teardown (removeLocalTab, resyncTab, destroy) via bypassGuardObservers so
+     this never accumulates one live observer per tab for the life of the app.
+
+     If src/view ever reparents a popup out of the wrapper (e.g. to
+     document.body for viewport-aware positioning), this stops stripping the
+     row and the bypassPermissions option reappears in the picker — cosmetic
+     only, since CONTRACTS.md has the daemon coerce and ignore that mode. */
+  private installBypassModeGuard(root: HTMLElement, tabId: string): void {
     const index = (PERMISSION_MODE_ORDER as readonly string[]).indexOf("bypassPermissions");
     if (index === -1) return;
+    const wrapper = root.querySelector<HTMLElement>(".claudian-input-wrapper");
+    if (!wrapper) return;
     const strip = (popup: Element) => {
       const rows = popup.querySelectorAll(".claudian-popup-row");
       rows[index]?.remove();
     };
-    for (const popup of Array.from(document.querySelectorAll(".claudian-popup-mode"))) strip(popup);
-    new MutationObserver(records => {
+    const observer = new MutationObserver(records => {
       for (const record of records) {
         for (const node of Array.from(record.addedNodes)) {
-          if (!(node instanceof Element)) continue;
-          if (node.classList.contains("claudian-popup-mode")) strip(node);
-          else for (const popup of Array.from(node.querySelectorAll?.(".claudian-popup-mode") ?? [])) strip(popup);
+          if (node instanceof Element && node.classList.contains("claudian-popup-mode")) strip(node);
         }
       }
-    }).observe(document.body, { childList: true, subtree: true });
+    });
+    observer.observe(wrapper, { childList: true });
+    this.bypassGuardObservers.set(tabId, observer);
+  }
+
+  /* Counterpart to installBypassModeGuard: disconnects and forgets the given
+     tab's observer. Call on every path that discards a mounted controller
+     (removeLocalTab, resyncTab's rebuild, destroy) so a closed or replaced
+     tab does not leave its observer watching a detached wrapper forever. */
+  private teardownBypassModeGuard(tabId: string): void {
+    this.bypassGuardObservers.get(tabId)?.disconnect();
+    this.bypassGuardObservers.delete(tabId);
   }
 
   /* ----- tab lifecycle ---------------------------------------------------- */
@@ -448,6 +476,7 @@ export class IosChatShell {
        a fresh edit the first time onStateChange fires. */
     this.pushedDraft.set(state.id, state.draft ?? "");
     this.tabs.push(controller);
+    this.installBypassModeGuard(controller.root, state.id);
     if (!opts.silent) this.renderTabBar();
     return controller;
   }
@@ -511,6 +540,7 @@ export class IosChatShell {
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
     const [removed] = this.tabs.splice(idx, 1);
+    this.teardownBypassModeGuard(tabId);
     await removed.destroy();
     this.conn.forgetTab(tabId);
     this.pushedConfig.delete(tabId);
@@ -692,6 +722,7 @@ export class IosChatShell {
     const idx = this.tabs.findIndex(t => t.state.id === tabId);
     if (idx === -1) return;
     const [old] = this.tabs.splice(idx, 1);
+    this.teardownBypassModeGuard(tabId);
     const wasActive = this.activeTabId === tabId;
     const localDraft = old.root.querySelector<HTMLTextAreaElement>("textarea.claudian-input")?.value ?? "";
     /* { abort: false }: this is a client-side catch-up (replay ring rolled
@@ -968,6 +999,8 @@ export class IosChatShell {
   async destroy(): Promise<void> {
     if (this.torndown) return;
     this.torndown = true;
+    for (const observer of this.bypassGuardObservers.values()) observer.disconnect();
+    this.bypassGuardObservers.clear();
     await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs.length = 0;
   }

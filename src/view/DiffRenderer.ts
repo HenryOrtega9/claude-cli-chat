@@ -28,6 +28,25 @@ export function diffLinesFromEdit(op: EditOp): DiffLine[] {
   return lines;
 }
 
+/* Same count diffLinesFromEdit(op).length would produce, without allocating
+   the line array — used only for the truncation-budget pre-pass in
+   renderDiff, which previously called diffLinesFromEdit purely for its
+   `.length` and then called it again for the actual render, materializing
+   every line of a MultiEdit's oldString/newString twice. Matches
+   `s.split("\n").length` exactly (newline count + 1 for a non-empty string)
+   and, like diffLinesFromEdit's own guards, counts 0 for an empty side. */
+function countEditLines(op: EditOp): number {
+  const countSide = (s: string): number => {
+    if (!s.length) return 0;
+    let n = 1;
+    for (let i = 0; i < s.length; i++) {
+      if (s.charCodeAt(i) === 10) n++;
+    }
+    return n;
+  };
+  return countSide(op.oldString) + countSide(op.newString);
+}
+
 export type DiffRenderOptions = {
   /* Optional filepath header rendered above the diff. */
   filePath?: string;
@@ -50,7 +69,7 @@ export function renderDiff(target: HTMLElement, ops: EditOp[], opts: DiffRenderO
      subsequent rendering stops when we hit MAX_LINES and appends a single
      truncation note. */
   let totalLines = 0;
-  for (const op of ops) totalLines += diffLinesFromEdit(op).length;
+  for (const op of ops) totalLines += countEditLines(op);
 
   let rendered = 0;
   let truncated = false;

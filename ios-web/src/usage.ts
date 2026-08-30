@@ -41,6 +41,11 @@ type UsagePayload = {
 
 type MeterRow = { label: string; percent: number | undefined; resetsAt: string | undefined };
 
+/* The currently-open sheet's close(), if any — lets the singleton branch
+   below actually tear down the previous sheet's interval instead of just
+   detaching its DOM, which used to leak a 60s poll per open/close cycle. */
+let activeClose: (() => void) | null = null;
+
 /* Mirrors ClaudeUsageBar's LimitEntry.displayLabel so the two surfaces
    name the same bucket the same way. */
 function limitLabel(entry: LimitEntry): string {
@@ -93,9 +98,12 @@ function levelClass(percent: number): string {
 }
 
 export function showUsageSheet(): void {
-  /* Singleton: a second tap on the header button while open just closes. */
+  /* Singleton: a second tap on the header button while open just closes.
+     Route through the sheet's own close() so its polling interval is
+     cleared too — removing the element alone leaked the interval forever. */
   const existing = document.querySelector<HTMLElement>(".vaultgw-usage-overlay");
   if (existing) {
+    activeClose?.();
     existing.remove();
     return;
   }
@@ -123,7 +131,9 @@ export function showUsageSheet(): void {
     closed = true;
     window.clearInterval(timer);
     overlay.remove();
+    if (activeClose === close) activeClose = null;
   }
+  activeClose = close;
 
   async function load(): Promise<void> {
     let payload: UsagePayload;

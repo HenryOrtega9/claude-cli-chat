@@ -327,6 +327,12 @@ mark.claudian-search-mark.is-active {
   max-height: 360px;
   overflow-y: auto;
   background: var(--background-primary);
+  /* Contain vertical scroll so a touch drag that reaches the end of this
+     block hands off to the outer transcript scroller cleanly instead of
+     chaining mid-flick (matches .claudian-thinking-body below). Scoped to
+     the Y axis only, since this file is shared with the desktop apps and
+     horizontal wheel-chaining out of a wide diff is expected there. */
+  overscroll-behavior-y: contain;
 }
 .claudian-diff-line {
   display: flex;
@@ -1025,10 +1031,12 @@ mark.claudian-search-mark.is-active {
    (parallel Bash fan-out is the canonical case), the 10px .claudian-messages
    gap reads as an awkward break against the ~2px intra-bubble tool margin
    below it. Pull the lower wrapper up so the row-to-row rhythm matches the
-   rest of the tool stack. Scoped via :has() to assistant-after-assistant
-   pairs whose lower bubble has tool calls but no rendered text or thinking;
-   prose continuations keep the full gap. */
-.claudian-message-wrapper-assistant + .claudian-message-wrapper-assistant:has(> .claudian-message > .claudian-tool-call):not(:has(> .claudian-message > .claudian-message-content > .claudian-text-block:not(:empty))):not(:has(> .claudian-message > .claudian-message-content > .claudian-thinking-block)) {
+   rest of the tool stack. `.is-tool-continuation` is toggled by
+   MessageRenderer once a message settles (see doUpsert); it replaces a
+   sibling `:has()` chain that WebKit re-evaluated across the whole
+   ancestor chain on every streamed token, which was expensive on iOS.
+   Prose continuations never get the class, so they keep the full gap. */
+.claudian-message-wrapper-assistant + .claudian-message-wrapper-assistant.is-tool-continuation {
   margin-top: -8px;
 }
 .claudian-message-content {
@@ -1167,6 +1175,9 @@ mark.claudian-search-mark.is-active {
      can scroll inside the block to see the rest. */
   max-height: 320px;
   overflow-y: auto;
+  /* See .claudian-diff-block above: contain vertical touch-scroll chaining
+     without disturbing the desktop horizontal wheel case. */
+  overscroll-behavior-y: contain;
 }
 .claudian-tool-call.is-expanded .claudian-tool-content {
   display: block;

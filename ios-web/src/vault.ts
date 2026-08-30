@@ -68,11 +68,16 @@ export class RemoteVaultFeatures implements VaultFeatures {
     this.refreshing = true;
     try {
       const res = await this.conn.rpc("GET", `/files?limit=${FILE_LIMIT}`);
+      /* Arm the throttle on any answer, success or not — a non-200 (gateway
+         asleep/unreachable, a routine state for a phone off the Mac's
+         network) used to leave lastRefreshAt untouched, so the focus
+         listener re-issued this RPC on every focus, including every
+         keyboard dismissal while typing. */
+      this.lastRefreshAt = Date.now();
       if (res.status !== 200) return;
       const rows = (res.json as { files?: unknown } | undefined)?.files;
       if (!Array.isArray(rows)) return;
       this.rebuild(rows as FileRow[]);
-      this.lastRefreshAt = Date.now();
       for (const cb of this.listeners) {
         try { cb(); } catch { /* a listener must not break the refresh */ }
       }

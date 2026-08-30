@@ -388,6 +388,12 @@ export class InputBox {
     triggerStart: number;  // index in textarea.value where the trigger char sits
     items: Suggestion[];
     activeIndex: number;
+    /* Row elements from the last renderSuggestionRows(), index-aligned with
+       `items`, reused across renders instead of rebuilt every keystroke. */
+    rows: HTMLElement[];
+    /* activeIndex as of the last actual scrollIntoView(), so renders that
+       don't move the highlight don't re-trigger the scroll. */
+    renderedActiveIndex: number;
   } | null = null;
   /* destroy() flips this so late-firing callbacks (FileReader.onload after a
      tab close, deferred setTimeout handlers, etc.) can no-op safely. */
@@ -1787,53 +1793,89 @@ export class InputBox {
     }
     this.hideSuggestion();
     const el = this.wrapper.createDiv({ cls: `claudian-suggestion-popup claudian-suggestion-${trigger === "@" ? "mention" : "slash"}` });
-    this.suggestion = { el, trigger, triggerStart, items, activeIndex: 0 };
+    this.suggestion = { el, trigger, triggerStart, items, activeIndex: 0, rows: [], renderedActiveIndex: -1 };
     this.renderSuggestionRows();
   }
 
   private renderSuggestionRows() {
     if (!this.suggestion) return;
-    const { el, items, activeIndex } = this.suggestion;
+    const { el, items, activeIndex, rows } = this.suggestion;
     /* The @ / slash list is CSS-anchored to the wrapper's top edge and grows
        upward, so it needs the same headroom hint as the click-driven popups.
        Recomputed on every render because the wrapper moves as the textarea
        grows. */
     this.publishPopupHeadroom(el, this.wrapper.getBoundingClientRect().top);
-    el.empty();
-    let activeRow: HTMLElement | null = null;
+    /* Patch existing rows in place by index rather than emptying and
+       rebuilding the whole list (and its inline SVG icons) on every
+       keystroke. A row's mousedown handler closes over its index, not its
+       item, and acceptSuggestion() always reads `items[activeIndex]` fresh —
+       so a row reused at the same index stays correct even once the item
+       behind it has changed; only its label/icon content needs refreshing,
+       and only when the item id at that index actually changed. */
     items.forEach((item, i) => {
-      const row = el.createDiv({
-        cls: "claudian-suggestion-row" + (i === activeIndex ? " is-active" : ""),
-      });
-      if (i === activeIndex) activeRow = row;
-      if (item.icon) {
-        const iconEl = row.createSpan({ cls: "claudian-suggestion-icon" });
-        platform.setIcon(iconEl, item.icon);
+      let row = rows[i];
+      if (!row) {
+        row = el.createDiv({ cls: "claudian-suggestion-row" });
+        /* mousedown not click — by the time click fires the textarea's blur
+           handler has already torn down the popup. Bound once at creation;
+           never rebound on reuse (see comment above). */
+        row.addEventListener("mousedown", e => {
+          e.preventDefault();
+          if (!this.suggestion) return;
+          this.suggestion.activeIndex = i;
+          this.acceptSuggestion();
+        });
+        rows[i] = row;
       }
-      const labels = row.createDiv({ cls: "claudian-suggestion-labels" });
-      labels.createDiv({ cls: "claudian-suggestion-primary", text: item.primary });
-      if (item.secondary) {
-        labels.createDiv({ cls: "claudian-suggestion-secondary", text: item.secondary });
+      if (row.dataset.suggestionId !== item.id) {
+        row.dataset.suggestionId = item.id;
+        row.empty();
+        if (item.icon) {
+          const iconEl = row.createSpan({ cls: "claudian-suggestion-icon" });
+          platform.setIcon(iconEl, item.icon);
+        }
+        const labels = row.createDiv({ cls: "claudian-suggestion-labels" });
+        labels.createDiv({ cls: "claudian-suggestion-primary", text: item.primary });
+        if (item.secondary) {
+          labels.createDiv({ cls: "claudian-suggestion-secondary", text: item.secondary });
+        }
       }
-      /* mousedown not click — by the time click fires the textarea's blur
-         handler has already torn down the popup. */
-      row.addEventListener("mousedown", e => {
-        e.preventDefault();
-        if (!this.suggestion) return;
-        this.suggestion.activeIndex = i;
-        this.acceptSuggestion();
-      });
+      row.toggleClass("is-active", i === activeIndex);
     });
+    /* Drop any leftover rows from a longer previous list. */
+    for (let i = items.length; i < rows.length; i++) {
+      rows[i].remove();
+    }
+    rows.length = items.length;
+
     /* Keep the active row visible when the user arrow-keys past the fold.
-       `nearest` block avoids jumpiness when the row is already on-screen. */
-    if (activeRow) (activeRow as HTMLElement).scrollIntoView({ block: "nearest" });
+       `nearest` block avoids jumpiness when the row is already on-screen.
+       Gated on the active index having actually moved since the last
+       render, so a same-index re-render triggered by typing doesn't force
+       a scroll (and the forced layout that comes with it). */
+    if (activeIndex !== this.suggestion.renderedActiveIndex) {
+      this.suggestion.renderedActiveIndex = activeIndex;
+      rows[activeIndex]?.scrollIntoView({ block: "nearest" });
+    }
   }
 
   private moveSuggestion(delta: number) {
     if (!this.suggestion) return;
-    const len = this.suggestion.items.length;
-    this.suggestion.activeIndex = (this.suggestion.activeIndex + delta + len) % len;
-    this.renderSuggestionRows();
+    const { rows, items } = this.suggestion;
+    const len = items.length;
+    const prevIndex = this.suggestion.activeIndex;
+    const nextIndex = (prevIndex + delta + len) % len;
+    this.suggestion.activeIndex = nextIndex;
+    this.suggestion.renderedActiveIndex = nextIndex;
+    /* Swap the highlight directly instead of routing through
+       renderSuggestionRows(): only which row carries `is-active` changed
+       here, so rebuilding rows or republishing popup headroom (no geometry
+       moved) on every held-down arrow-key repeat would be wasted work.
+       Mirrors DomSuggestModalHost.setSelection's handling of the sibling
+       desktop suggest overlay (src/platform/dom/desktop-overlays.ts). */
+    rows[prevIndex]?.removeClass("is-active");
+    rows[nextIndex]?.addClass("is-active");
+    rows[nextIndex]?.scrollIntoView({ block: "nearest" });
   }
 
   private acceptSuggestion() {

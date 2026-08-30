@@ -44,7 +44,12 @@ final class ConnectivityMonitor: ObservableObject {
                 outcome = .http(status: 401, data: Data())
             }
             guard let self, !Task.isCancelled else { return }
-            self.state = ConnectivityState.from(outcome)
+            // `@Published` fires on every assignment regardless of whether
+            // the value differs, so an unconditional write here republishes
+            // (and invalidates RootView's whole body) every 20s even in the
+            // steady .ok case. Guard it since ConnectivityState is Equatable.
+            let next = ConnectivityState.from(outcome)
+            if next != self.state { self.state = next }
             self.probeTask = nil
         }
     }

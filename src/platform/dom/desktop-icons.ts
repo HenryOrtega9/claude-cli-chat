@@ -12,14 +12,85 @@
    gets that viewBox here rather than lucide's 0 0 24 24, and paints with
    fill instead of stroke. */
 
-import { icons } from "lucide";
+import {
+  Check, CheckCircle2, ChevronDown, ChevronUp, Circle, CircleHelp, CircleX, Copy,
+  ExternalLink, File, FileEdit, FilePlus, FileSpreadsheet, FileText, Folder,
+  FolderOpen, Gauge, GitBranch, Globe, History, Image, Layers, LayoutGrid,
+  ListChecks, LoaderCircle, LocateFixed, Paperclip, Pause, Pin, Play, PlugZap,
+  Plus, Presentation, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck,
+  ShieldOff, Smartphone, Sparkles, Square, SquarePen, SquarePlus, Terminal,
+  TerminalSquare, TextCursor, Trash2, Users, Volume2, Wrench, X, Zap,
+} from "lucide";
 import { CLAUDE_ASTERISK_ICON_SVG } from "../../view/Welcome";
 
-/* lucide types `icons` as a namespace object of named exports, so a runtime
-   lookup by id needs the index signature its own internal `Icons` type has
-   (not exported). IconNode is likewise internal — restated here. */
+/* IconNode is internal to lucide (not exported), restated here. */
 type IconNode = [tag: string, attrs: Record<string, string | number | undefined>][];
-const iconMap = icons as unknown as Record<string, IconNode | undefined>;
+
+/* Curated ids only — one named import per icon actually reachable from
+   setIcon() call sites, iconForTool/iconForStatus/iconForTodoStatus,
+   officeIconName, and the slash-command catalog. Importing the whole
+   `icons` namespace (as this file used to) makes every one of lucide's ~1600
+   icons reachable and defeats esbuild's tree-shaking — this way only the ids
+   below are bundled. Keep sorted by kebab id; add a new entry (import above,
+   plus a line here) whenever a new icon id is passed to setIcon anywhere in
+   the app. A missing id still fails safely: renderIcon warns once and
+   renders nothing, exactly as an unresolved icon did before. */
+const iconMap: Record<string, IconNode | undefined> = {
+  "check": Check,
+  "check-circle-2": CheckCircle2,
+  "chevron-down": ChevronDown,
+  "chevron-up": ChevronUp,
+  "circle": Circle,
+  "circle-help": CircleHelp,
+  "circle-x": CircleX,
+  "copy": Copy,
+  "external-link": ExternalLink,
+  "file": File,
+  "file-edit": FileEdit,
+  "file-plus": FilePlus,
+  "file-spreadsheet": FileSpreadsheet,
+  "file-text": FileText,
+  "folder": Folder,
+  "folder-open": FolderOpen,
+  "gauge": Gauge,
+  "git-branch": GitBranch,
+  "globe": Globe,
+  "history": History,
+  "image": Image,
+  "layers": Layers,
+  "layout-grid": LayoutGrid,
+  "list-checks": ListChecks,
+  "loader-circle": LoaderCircle,
+  "locate-fixed": LocateFixed,
+  "paperclip": Paperclip,
+  "pause": Pause,
+  "pin": Pin,
+  "play": Play,
+  "plug-zap": PlugZap,
+  "plus": Plus,
+  "presentation": Presentation,
+  "refresh-cw": RefreshCw,
+  "rotate-ccw": RotateCcw,
+  "search": Search,
+  "send": Send,
+  "settings": Settings,
+  "shield-check": ShieldCheck,
+  "shield-off": ShieldOff,
+  "smartphone": Smartphone,
+  "sparkles": Sparkles,
+  "square": Square,
+  "square-pen": SquarePen,
+  "square-plus": SquarePlus,
+  "terminal": Terminal,
+  "terminal-square": TerminalSquare,
+  "text-cursor": TextCursor,
+  "trash-2": Trash2,
+  "users": Users,
+  "volume-2": Volume2,
+  "wrench": Wrench,
+  "x": X,
+  "zap": Zap,
+};
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -31,15 +102,6 @@ const CLAUDE_ICON_ID = "claude-asterisk";
 /* Ids that resolved to nothing, so a typo warns once instead of per frame
    (setIcon runs inside streaming render loops). */
 const warned = new Set<string>();
-
-/* "chevron-down" -> "ChevronDown", matching lucide's export naming. */
-function toPascalCase(iconId: string): string {
-  return iconId
-    .split(/[-_]/)
-    .filter(part => part.length > 0)
-    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
-    .join("");
-}
 
 function newIconSvg(cls: string, viewBox: string): SVGSVGElement {
   const svg = document.createElementNS(SVG_NS, "svg");
@@ -66,7 +128,7 @@ export function renderIcon(el: HTMLElement, iconId: string): void {
     return;
   }
 
-  const node = iconMap[toPascalCase(iconId)];
+  const node = iconMap[iconId];
   if (!node) {
     if (!warned.has(iconId)) {
       warned.add(iconId);

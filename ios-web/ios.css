@@ -847,9 +847,9 @@ body {
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background: var(--vgw-glass-bg);
-  -webkit-backdrop-filter: var(--vgw-blur);
-  backdrop-filter: var(--vgw-blur);
+  /* Flat, opaque fill: a backdrop-filter here re-blurs the message list under
+     the button on every scrolled frame. */
+  background: rgba(22, 27, 34, 0.96);
   border: 1px solid var(--vgw-glass-border);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), inset 0 1px 0 0 var(--vgw-glass-highlight);
   color: var(--text-normal);
@@ -901,8 +901,9 @@ body {
 /* ---- Usage sheet ---------------------------------------------
    Bottom sheet listing the account's usage meters (the `limits`
    array the Mac menu-bar app renders), opened from the header's
-   gauge button. Glass treatment matches the composer; meter
-   colors go green/yellow/red at the 50/80% thresholds the watch
+   gauge button. Flat fill rather than the header/composer's glass
+   blur (see .vaultgw-usage-sheet below); meter colors go
+   green/yellow/red at the 50/80% thresholds the watch
    complications use. */
 .vaultgw-usage-overlay {
   position: fixed;
@@ -919,9 +920,11 @@ body {
   overflow-y: auto;
   border-radius: 20px 20px 0 0;
   padding: 14px 18px calc(var(--vgw-safe-bottom, 0px) + 18px);
-  background: var(--vgw-glass-bg);
-  -webkit-backdrop-filter: var(--vgw-blur);
-  backdrop-filter: var(--vgw-blur);
+  /* Flat fill, not the glass var: this sheet animates translateY on open,
+     and a backdrop-filtered box can't be cached as a compositor layer
+     while it moves (the blur has to be re-rasterized on the main thread
+     every frame). rgba keeps a hint of the scrim behind it. */
+  background: rgba(22, 27, 34, 0.96);
   border-top: 1px solid var(--vgw-glass-border);
 }
 
