@@ -287,14 +287,7 @@ mark.claudian-search-mark.is-active {
   background: var(--background-secondary);
 }
 
-/* ---- Subagent (Task tool) summary ------------------------ */
-.claudian-subagent-summary {
-  margin: 4px 0 6px 22px;
-  padding: 6px 10px;
-  background: rgba(var(--claudian-brand-rgb), 0.06);
-  border-left: 2px solid var(--claudian-brand);
-  border-radius: 4px;
-}
+/* ---- Subagent description (manager modal rows) ----------- */
 .claudian-subagent-description {
   font-family: var(--font-text);
   font-size: 13px;
@@ -2754,115 +2747,96 @@ mark.claudian-search-mark.is-active {
   font-size: 12px;
 }
 
-/* ---- Subagent nested event timeline (Task tool) ------------ */
-/* Rendered inside .claudian-subagent-summary when Claude calls the Task
-   tool. The timeline shows the subagent's internal events (text deltas,
-   tool calls, thinking traces) tailed live from its session JSONL. */
-.claudian-subagent-events {
-  margin-top: 8px;
-  padding-left: 6px;
-  border-left: 1px dashed var(--background-modifier-border);
+/* ---- Agent group card (Task/Agent runs) -------------------- */
+/* Replaces the old inline subagent timeline. Every agent spawned by one
+   assistant message collapses into a single card rendered in place of the
+   individual tool rows; clicking a row opens .claudian-agent-detail. Token
+   choices mirror .claudian-tool-call so the card reads as part of the same
+   tool language, just boxed. */
+.claudian-agent-group {
+  margin: 6px 0 6px 22px;
+  padding: 5px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 1px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
 }
-.claudian-subagent-event {
-  font-size: 12px;
-  color: var(--text-normal);
-  line-height: 1.4;
-}
-.claudian-subagent-event-text {
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.claudian-subagent-event-thinking {
-  font-style: italic;
-  color: var(--text-faint);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.claudian-subagent-event-tool {
-  padding-left: 1.25em;
-  font-family: var(--font-monospace);
+.claudian-agent-group-header {
+  padding: 2px 6px 4px 6px;
   font-size: 11px;
   color: var(--text-muted);
-}
-.claudian-subagent-event-tool-name {
-  font-weight: 600;
-  color: var(--text-normal);
-}
-.claudian-subagent-event-tool-status {
-  margin-left: 6px;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.claudian-subagent-events-truncated {
-  font-size: 11px;
-  color: var(--text-faint);
-  font-style: italic;
-}
-/* Toggle row that gates the nested timeline. Reads as one compact status
-   line (chevron · state · N steps · pulse) and the whole row is clickable. */
-.claudian-subagent-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 4px;
-  font-size: 11px;
-  color: var(--text-muted);
-  cursor: default;
+  font-variant-numeric: tabular-nums;
   user-select: none;
 }
-.claudian-subagent-toggle:has(.claudian-subagent-chevron) {
+
+/* One agent. The six children are flat (no wrappers), so the two-line
+   layout is expressed as an explicit grid: identity + status on the top
+   row, live activity + meta on the second. Named areas mean the visual
+   layout does not depend on DOM order, and a missing child just leaves
+   its cell empty. */
+.claudian-agent-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "icon     name     desc     status"
+    "activity activity activity meta";
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 1px;
+  padding: 4px 6px;
+  border-radius: 6px;
   cursor: pointer;
+  user-select: none;
+  line-height: 1.4;
+  transition: background 120ms ease;
 }
-.claudian-subagent-toggle:has(.claudian-subagent-chevron):hover {
-  color: var(--text-normal);
+.claudian-agent-row:hover {
+  background: var(--background-modifier-hover);
 }
-.claudian-subagent-toggle.is-spawning {
-  color: var(--text-faint);
-  font-style: italic;
-}
-.claudian-subagent-toggle.is-running {
+.claudian-agent-row:hover .claudian-agent-row-name {
   color: var(--claudian-brand);
 }
-.claudian-subagent-toggle.is-failed {
-  color: var(--text-error);
-}
-.claudian-subagent-chevron {
+.claudian-agent-row-icon {
+  grid-area: icon;
   display: inline-flex;
-  width: 13px;
-  height: 13px;
-  transition: transform 150ms ease;
-  transform: rotate(-90deg);
+  color: var(--interactive-accent);
 }
-.claudian-subagent-summary.is-events-open .claudian-subagent-chevron {
-  transform: rotate(0deg);
+.claudian-agent-row-icon svg {
+  width: 14px;
+  height: 14px;
 }
-.claudian-subagent-toggle-label {
-  font-weight: 500;
+.claudian-agent-row-name {
+  grid-area: name;
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-normal);
+  transition: color 100ms ease;
 }
-.claudian-subagent-step-count {
+.claudian-agent-row-desc {
+  grid-area: desc;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.claudian-agent-row-meta {
+  grid-area: meta;
+  justify-self: end;
+  font-size: 11px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.claudian-subagent-step-count::before {
-  content: "· ";
-}
-.claudian-subagent-pulse {
-  display: inline-block;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: currentColor;
-  animation: claudian-status-pulse 1.2s ease-in-out infinite;
-}
-
-/* Collapsed live preview: the subagent's latest step on a single line. */
-.claudian-subagent-current {
-  margin-top: 3px;
-  padding-left: 19px;
+/* Latest step of a live agent, one line, indented under the name. */
+.claudian-agent-row-activity {
+  grid-area: activity;
+  min-width: 0;
+  padding-left: 22px;
   font-family: var(--font-monospace);
   font-size: 11px;
   color: var(--text-muted);
@@ -2870,13 +2844,345 @@ mark.claudian-search-mark.is-active {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
-/* The full timeline is hidden until the summary is toggled open. */
-.claudian-subagent-events-wrap {
+.claudian-agent-row-activity:empty {
   display: none;
 }
-.claudian-subagent-summary.is-events-open .claudian-subagent-events-wrap {
+
+/* ---- Agent status pill ------------------------------------- */
+/* Shared by the group row and the detail header; same four modifiers in
+   both places. */
+.claudian-agent-row-status,
+.claudian-agent-detail-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  color: var(--text-muted);
+  background: var(--background-modifier-border);
+}
+.claudian-agent-row-status {
+  grid-area: status;
+  justify-self: end;
+}
+.claudian-agent-detail-status {
+  flex-shrink: 0;
+}
+.claudian-agent-row-status.is-spawning,
+.claudian-agent-detail-status.is-spawning {
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--text-faint) 14%, transparent);
+  animation: claudian-agent-status-pulse 1.6s ease-in-out infinite;
+}
+.claudian-agent-row-status.is-running,
+.claudian-agent-detail-status.is-running {
+  color: var(--claudian-brand);
+  background: rgba(var(--claudian-brand-rgb), 0.14);
+  animation: claudian-agent-status-pulse 1.6s ease-in-out infinite;
+}
+.claudian-agent-row-status.is-completed,
+.claudian-agent-detail-status.is-completed {
+  color: var(--color-green, var(--text-success, #6bcb77));
+  background: color-mix(in srgb, var(--color-green, var(--text-success, #6bcb77)) 15%, transparent);
+}
+.claudian-agent-row-status.is-failed,
+.claudian-agent-detail-status.is-failed {
+  color: var(--text-error, #dc3545);
+  background: color-mix(in srgb, var(--text-error, #dc3545) 15%, transparent);
+}
+/* Opacity-only pulse. claudian-status-pulse also scales, which is right
+   for a 5px dot and wrong for a pill. */
+@keyframes claudian-agent-status-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* ---- Full-pane agent detail overlay ------------------------ */
+/* Mounted on .claudian-tab-content (position: relative), the same anchor
+   the welcome screen uses. The z-index clears the sticky search bar (4)
+   and the message stream; the composer popups (50) live in a sibling
+   subtree and Obsidian modals are their own layer, so both still win.
+   The hidden state is a display toggle in JS. */
+.claudian-agent-detail {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--background-primary);
+}
+.claudian-agent-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.claudian-agent-detail-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+  transition: color 120ms ease, background 120ms ease;
+}
+.claudian-agent-detail-back:hover {
+  color: var(--claudian-brand);
+  background: rgba(var(--claudian-brand-rgb), 0.1);
+}
+.claudian-agent-detail-back svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-agent-detail-title {
+  flex-shrink: 0;
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.claudian-agent-detail-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.claudian-agent-detail-meta {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.claudian-agent-detail-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 12px 16px 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-normal);
+}
+
+/* The spawn prompt: a "Prompt" header row that toggles, over a body clamped
+   until expanded. The header is the only click target (see
+   AgentDetailView.renderPrompt), so the pointer cursor lives there. */
+.claudian-agent-detail-prompt {
+  padding: 6px 10px 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+.claudian-agent-detail-prompt-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+}
+.claudian-agent-detail-prompt-header:hover {
+  color: var(--claudian-brand);
+}
+.claudian-agent-detail-prompt-chevron {
+  display: inline-flex;
+  transition: transform 120ms ease;
+}
+.claudian-agent-detail-prompt-chevron svg {
+  width: 12px;
+  height: 12px;
+}
+.claudian-agent-detail-prompt.is-expanded .claudian-agent-detail-prompt-chevron {
+  transform: rotate(180deg);
+}
+.claudian-agent-detail-prompt-body {
+  margin-top: 4px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 6.6em;
+  overflow: hidden;
+}
+.claudian-agent-detail-prompt.is-expanded .claudian-agent-detail-prompt-body {
+  max-height: 420px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+.claudian-agent-detail-truncated {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-faint);
+}
+.claudian-agent-detail-result {
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-normal);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+.claudian-agent-detail-result.is-error {
+  color: var(--text-error, #dc3545);
+  border-color: var(--text-error, #dc3545);
+  background: color-mix(in srgb, var(--text-error, #dc3545) 8%, transparent);
+}
+.claudian-agent-detail-placeholder {
+  margin: auto;
+  padding: 24px 16px;
+  text-align: center;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-faint);
+}
+
+/* ---- Agent detail transcript events ------------------------ */
+.claudian-agent-detail-event {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-normal);
+}
+.claudian-agent-detail-event-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.claudian-agent-detail-event-thinking {
+  font-style: italic;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.claudian-agent-detail-event-tool {
+  padding-left: 8px;
+  border-inline-start: 2px solid var(--background-modifier-border);
+}
+.claudian-agent-detail-event-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.claudian-agent-detail-event-tool-header:hover .claudian-agent-detail-event-tool-name {
+  color: var(--claudian-brand);
+}
+.claudian-agent-detail-event-tool-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--interactive-accent);
+}
+.claudian-agent-detail-event-tool-icon svg {
+  width: 13px;
+  height: 13px;
+}
+.claudian-agent-detail-event-tool-name {
+  flex-shrink: 0;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-normal);
+  transition: color 100ms ease;
+}
+.claudian-agent-detail-event-tool-subject {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Status is an icon (check / x / loader / shield), same vocabulary as
+   .claudian-tool-status — size the svg or it renders at lucide's 24px. */
+.claudian-agent-detail-event-tool-status {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--text-faint);
+}
+.claudian-agent-detail-event-tool-status svg {
+  width: 12px;
+  height: 12px;
+}
+.claudian-agent-detail-event-tool-status.status-approved,
+.claudian-agent-detail-event-tool-status.status-completed {
+  color: var(--text-success, #6bcb77);
+}
+.claudian-agent-detail-event-tool-status.status-running {
+  color: var(--claudian-brand);
+  animation: claudian-tool-spin 1.2s linear infinite;
+}
+.claudian-agent-detail-event-tool-status.status-errored,
+.claudian-agent-detail-event-tool-status.status-denied,
+.claudian-agent-detail-event-tool-status.is-error {
+  color: var(--text-error, #dc3545);
+  animation: none;
+}
+.claudian-agent-detail-event-tool-body {
+  display: none;
+  margin-top: 2px;
+  padding: 4px 0 4px 10px;
+  border-inline-start: 2px solid var(--background-modifier-border);
+}
+.claudian-agent-detail-event-tool.is-expanded .claudian-agent-detail-event-tool-body {
   display: block;
+}
+/* Height caps match .claudian-tool-content: one agent step must not take
+   over the pane. */
+.claudian-agent-detail-event-tool-input,
+.claudian-agent-detail-event-tool-result {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+.claudian-agent-detail-event-tool-input {
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.claudian-agent-detail-event-tool-result {
+  color: var(--text-normal);
+}
+.claudian-agent-detail-event-tool-result.is-error {
+  color: var(--text-error, #dc3545);
 }
 
 /* ---- Agents pill in the input toolbar ---------------------- */

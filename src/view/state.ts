@@ -22,6 +22,11 @@ export type ToolCall = {
   /* Set when the nestedEvents buffer hit its cap (200 entries) and earlier
      events were dropped. UI surfaces this as a "[+N earlier events]" hint. */
   nestedTruncatedCount?: number;
+  /* Async (background) agent: the tool_result was only a launch
+     acknowledgement, so `status` is already "completed" while the agent is
+     still working. Liveness lives in `nestedStatus` until the CLI delivers
+     the agent's <task-notification>, whose <result> replaces `result`. */
+  backgroundAgent?: boolean;
 };
 
 /* One synthesized event from the subagent's session JSONL. The discriminator

@@ -31,8 +31,9 @@ import { join } from "node:path";
 import { JsonlTailer } from "./JsonlTailer";
 import { projectDirFor } from "./RemoteControlSession";
 import type { SubprocessManager } from "./SubprocessManager";
-import type { StreamEvent, AssistantEvent, ToolUseEvent, ToolResultEvent } from "./Events";
-import type { NestedSubagentEvent, ToolCall } from "../view/state";
+import type { StreamEvent } from "./Events";
+import { translateNestedEvent, type NestedToolUseUpdate } from "./nestedEventTranslation";
+import type { NestedSubagentEvent } from "../view/state";
 
 const POLL_INTERVAL_MS = 250;
 const POLL_MAX_ATTEMPTS = 240;  /* 60s total — well past the spawn race window */
@@ -47,12 +48,7 @@ export type SubagentTrackerUpdate = {
   /* Appended nested events. */
   events: NestedSubagentEvent[];
   /* Updates to existing nested tool_use entries, keyed by tool_use id. */
-  toolUseUpdates?: Array<{
-    id: string;
-    status: ToolCall["status"];
-    result?: string;
-    isError?: boolean;
-  }>;
+  toolUseUpdates?: NestedToolUseUpdate[];
   /* Set once on first match — the subagent's own session ID (from filename). */
   sessionId?: string;
   /* Set when the tracker gives up looking for a matching JSONL. UI can
@@ -277,55 +273,9 @@ export class SubagentSessionTracker {
 
   private handleStreamEvent(e: StreamEvent): void {
     if (this.stopped) return;
-    const events: NestedSubagentEvent[] = [];
-    const toolUseUpdates: SubagentTrackerUpdate["toolUseUpdates"] = [];
-
-    if (e.type === "assistant") {
-      const ae = e as AssistantEvent;
-      for (const block of ae.message.content) {
-        if (block.type === "text" && block.text) {
-          events.push({ kind: "text", text: block.text });
-        } else if (block.type === "thinking" && block.thinking) {
-          events.push({ kind: "thinking", text: block.thinking });
-        }
-        /* tool_use blocks arrive as separate ToolUseEvent emissions from
-           JsonlTailer's translator. Handled below; skip here. */
-      }
-    } else if (e.type === "tool_use") {
-      const tu = e as ToolUseEvent;
-      if (!this.seenNestedToolIds.has(tu.id)) {
-        this.seenNestedToolIds.add(tu.id);
-        events.push({
-          kind: "tool_use",
-          id: tu.id,
-          name: tu.name,
-          input: tu.input,
-          status: "running",
-        });
-      }
-    } else if (e.type === "tool_result") {
-      const tr = e as ToolResultEvent;
-      const flat = typeof tr.content === "string"
-        ? tr.content
-        : Array.isArray(tr.content)
-          ? tr.content.map(b => (b.type === "text" ? b.text : `[${b.type} block]`)).join("")
-          : "";
-      toolUseUpdates.push({
-        id: tr.tool_use_id,
-        status: tr.is_error ? "errored" : "completed",
-        result: flat,
-        isError: !!tr.is_error,
-      });
-    }
-    /* type === "user" is skipped (echo of parent prompt). System events,
-       result events, etc. are also skipped since they describe the parent
-       session, not the subagent. */
-
-    if (events.length === 0 && toolUseUpdates.length === 0) return;
-    this.opts.onUpdate({
-      events,
-      toolUseUpdates: toolUseUpdates.length > 0 ? toolUseUpdates : undefined,
-    });
+    const update = translateNestedEvent(e, this.seenNestedToolIds);
+    if (update.events.length === 0 && !update.toolUseUpdates) return;
+    this.opts.onUpdate(update);
   }
 }
 

@@ -3,6 +3,7 @@ import { MessageListRenderer } from "./MessageRenderer";
 import { ApprovalArea, type ApprovalDecision } from "./ApprovalModal";
 import { InputBox, extractObsidianUrlPaths, type SubmitPayload, type Suggestion } from "./InputBox";
 import { renderWelcome, setWelcomeVisible } from "./Welcome";
+import { AgentDetailView } from "./AgentDetailView";
 import { RemotePairingCard } from "./RemotePairingCard";
 import { StatusIndicator } from "./StatusIndicator";
 import { SearchBar } from "./SearchBar";
@@ -20,6 +21,8 @@ import { spawnOptionsFromSettings } from "../claude/spawn-options";
 import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings-data";
 import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
 import type { SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
+import { translateNestedEvent } from "../claude/nestedEventTranslation";
+import { deriveAgentStatus } from "./AgentGroupRenderer";
 import { MCPConfigStore, sanitizeMcpServerName } from "../mcp/MCPConfig";
 import { SubagentPicker } from "./SubagentPicker";
 import { CreateSubagentModal } from "./CreateSubagentModal";
@@ -48,6 +51,10 @@ import type {
 } from "../claude/Events";
 
 export type TabMode = "local" | "remote";
+
+/* Prefix of the synthetic tool_result the CLI returns for a background agent
+   launch, before the agent has done any work. */
+const ASYNC_LAUNCH_ACK = "Async agent launched successfully";
 
 /* TabController owns the DOM and state for a single chat tab. It binds together
    the message renderer, approval area, input box, and the subprocess session,
@@ -80,6 +87,7 @@ export class TabController {
   private titleBarEl: HTMLElement;
   private titleTextEl: HTMLElement;
   private renderer: MessageListRenderer;
+  private agentDetail: AgentDetailView;
   private approvalArea: ApprovalArea;
   private inputBox: InputBox;
   /** Host access to the composer (iOS share intake); plugin/desktop do not use it. */
@@ -102,6 +110,14 @@ export class TabController {
   /* Spawn timestamps per Task tool call, used to compute nestedDurationMs
      when the tool_result arrives. */
   private subagentSpawnTimes = new Map<string, number>();
+  /* Task tool ids whose nested feed is being driven by the live stream
+     (events tagged with parent_tool_use_id). The JSONL tracker must not run
+     for these — both sources carry the same text with no shared dedupe key,
+     so a tailer left running duplicates every line. */
+  private streamNestedTools = new Set<string>();
+  /* Per-subagent dedupe sets for nested tool_use ids, owned here so
+     translateNestedEvent stays pure. Keyed by parent tool_use id. */
+  private nestedSeenToolIds = new Map<string, Set<string>>();
 
   /* Cached @-mention index: a flat snapshot of every vault file and folder.
      Built lazily on first use and invalidated on vault create/delete/rename so
@@ -209,6 +225,16 @@ export class TabController {
     this.renderer.setActionCallbacks({
       onFork: messageId => this.onForkRequest?.(this, messageId),
     });
+    /* Full-pane drill-in for one agent run. Mounted on the stable tab content
+       (like Welcome) so it overlays the whole tab rather than just the
+       messages wrapper. Runtime-only — nothing about it is persisted, so it
+       needs no incognito guard. */
+    this.agentDetail = new AgentDetailView(this.root, {
+      /* Back / Esc just hides the overlay; the chat DOM underneath was never
+         touched, so its scroll position is exactly where the user left it. */
+      onClose: () => { /* nothing else to reconcile */ },
+    });
+    this.renderer.setAgentClickCallback(toolId => this.openAgentDetail(toolId));
     this.approvalArea = new ApprovalArea(this.root, {
       onDecide: (requestId, decision) => this.handleApproval(requestId, decision),
     });
@@ -476,6 +502,8 @@ export class TabController {
     this.activeFileIndicator.destroy();
     this.selectionTracker.destroy();
     this.searchBar.destroy();
+    /* Drops the document-level Esc listener; the DOM goes with root.remove(). */
+    this.agentDetail.close();
     this.renderer.destroy();
     this.inputBox.destroy();
     this.root.remove();
@@ -614,6 +642,8 @@ export class TabController {
       }
       this.subagentTrackers.clear();
       this.subagentSpawnTimes.clear();
+      this.streamNestedTools.clear();
+      this.nestedSeenToolIds.clear();
       this.clearStreamingPointer();
       this.streamingBlocks.clear();
       this.passStartedAt = null;
@@ -973,6 +1003,12 @@ export class TabController {
     this.titleGenerationStarted = false;
     this.refreshTitleBar();
     this.toolToMessage.clear();
+    /* The tool objects the drill-in is holding are about to be discarded. */
+    this.agentDetail.close();
+    /* Messages are gone, so every agent that was keeping the pill lit is too.
+       Background agents survive a turn end, so without this the pill would
+       carry a count from the discarded conversation into the new one. */
+    this.refreshRunningAgentCount();
     this.renderer.reset();
     this.statusIndicator.hide();
     this.inputBox.setUsage(undefined);
@@ -1608,6 +1644,29 @@ export class TabController {
        CLI is still working. heartbeat() is a no-op unless a thinking spinner
        is currently showing. */
     this.statusIndicator.heartbeat();
+    /* Subagent diversion. The CLI multiplexes every subagent's own events
+       onto the parent's stdout, tagged with parent_tool_use_id. They are not
+       parent turn content: routed through the main switch they would land in
+       the parent's streaming bubble, register nested tool ids in
+       toolToMessage, and get spoken aloud. Feed the owning agent's card
+       instead and stop here.
+
+       control_request is deliberately NOT diverted — a subagent's tool
+       approval still has to be answered — and neither are system / result /
+       usage, which describe the session as a whole. */
+    const nestedParent = nestedParentToolUseId(event);
+    if (nestedParent) {
+      /* stream_event deltas are dropped outright rather than translated:
+         their `index` addresses the parent's streamingBlocks map (subagent
+         indices collide with the parent's), and the assistant/tool_result
+         envelopes that follow already carry the same content at the same
+         granularity the JSONL tracker produced. */
+      if (event.type !== "stream_event") {
+        this.handleNestedEvent(nestedParent, event);
+      }
+      this.onStateChangeCb();
+      return;
+    }
     switch (event.type) {
       case "system": {
         const sys = event as SystemInitEvent | SystemApiRetryEvent | { type: "system"; subtype: string };
@@ -1742,6 +1801,14 @@ export class TabController {
       }
     }
 
+    /* A finished background agent reports back inside a <task-notification>
+       block on a synthetic user turn rather than through its tool_result. */
+    for (const block of blocks) {
+      if (block.type === "text" && typeof block.text === "string" && block.text.includes("<task-notification>")) {
+        await this.handleTaskNotifications(block.text);
+      }
+    }
+
     /* Render text bubbles only in remote mode. In local mode the user's real
        input already got a synchronous bubble from submit(), so anything else
        arriving as a "user" text block is the CLI feeding context to itself
@@ -1749,7 +1816,11 @@ export class TabController {
        bubbles is just noise. */
     if (this.mode !== "remote") return;
 
-    const textBlocks = blocks.filter(b => b.type === "text") as Array<{ text: string }>;
+    /* task-notification blocks are machine plumbing handled above — bubbling
+       their raw XML at a remote host would be pure noise. */
+    const textBlocks = blocks.filter(
+      b => b.type === "text" && !(b.text ?? "").includes("<task-notification>"),
+    ) as Array<{ text: string }>;
     const text = textBlocks.map(b => b.text).join("");
     if (!text) return;
     const last = [...this.state.messages].reverse().find(m => m.role === "user");
@@ -1766,6 +1837,54 @@ export class TabController {
     if (this.state.title === "New chat") this.state.title = text.slice(0, 48);
     this.updateWelcomeVisibility();
     await this.renderer.upsertMessage(msg);
+  }
+
+  /* Settles background agents from the CLI's <task-notification> blocks. One
+     text block can carry several (parallel agents finishing close together),
+     each with <tool-use-id>, <status> and usually <result>. A notification
+     whose id we can't resolve is skipped silently — it belongs to a cleared
+     or forked-away conversation, not to anything on screen. */
+  private async handleTaskNotifications(text: string): Promise<void> {
+    const blockRe = /<task-notification>([\s\S]*?)<\/task-notification>/gi;
+    for (let match = blockRe.exec(text); match !== null; match = blockRe.exec(text)) {
+      const body = match[1];
+      const toolId = extractNotificationTag(body, "tool-use-id");
+      if (!toolId) continue;
+      const found = this.findToolCallById(toolId);
+      if (!found) continue;
+      const { msg, tool } = found;
+
+      /* The CLI's status vocabulary is completed | failed | killed | blocked
+         | stopped | cancelled. Only the first is a success, so anything else
+         — including a value we don't recognise — fails rather than flipping
+         a killed agent's card to Completed. A missing tag stays neutral. */
+      const status = (extractNotificationTag(body, "status") ?? "").trim();
+      const failed = status !== "" && !/^(completed|success)/i.test(status);
+      /* <result> is optional (the CLI omits it for a killed / blocked agent,
+         or one that produced no final message) but <summary> is always
+         written. Without the fallback `result` keeps the launch
+         acknowledgement, which the drill-in would then present as the
+         agent's report. */
+      const result = extractNotificationTag(body, "result") ?? extractNotificationTag(body, "summary");
+      if (result) tool.result = result;
+      tool.status = failed ? "errored" : "completed";
+      if (failed) tool.isError = true;
+      tool.nestedStatus = failed ? "failed" : "completed";
+
+      const spawnedAt = this.subagentSpawnTimes.get(toolId);
+      if (spawnedAt !== undefined) {
+        tool.nestedDurationMs = Date.now() - spawnedAt;
+        this.subagentSpawnTimes.delete(toolId);
+      }
+      const tracker = this.subagentTrackers.get(toolId);
+      if (tracker) {
+        void tracker.stop();
+        this.subagentTrackers.delete(toolId);
+      }
+      this.refreshRunningAgentCount();
+      if (this.agentDetail.isOpenFor(toolId)) this.agentDetail.refresh();
+      await this.renderer.upsertMessage(msg);
+    }
   }
 
   private async handleStreamEvent(event: StreamEventEvent) {
@@ -2030,6 +2149,21 @@ export class TabController {
        did. Tool name is "Task" on Claude Code 2.1.141 and "Agent" on
        2.1.143+. */
     if (tool.name === "Task" || tool.name === "Agent") {
+      /* Background ("async") agents answer their tool_use immediately with a
+         launch acknowledgement and keep working; the real report arrives
+         later in a <task-notification>. Finalizing here would flip the card
+         to Completed · 2s while the agent is still running, so record the
+         mode and leave every liveness field alone. */
+      if (!event.is_error && (tool.result ?? "").trimStart().startsWith(ASYNC_LAUNCH_ACK)) {
+        tool.backgroundAgent = true;
+        if (tool.nestedStatus !== "completed" && tool.nestedStatus !== "failed") {
+          tool.nestedStatus = "running";
+        }
+        this.refreshRunningAgentCount();
+        if (this.agentDetail.isOpenFor(tool.id)) this.agentDetail.refresh();
+        await this.renderer.upsertMessage(msg);
+        return;
+      }
       const tracker = this.subagentTrackers.get(event.tool_use_id);
       if (tracker) {
         void tracker.stop();
@@ -2042,6 +2176,7 @@ export class TabController {
       }
       tool.nestedStatus = event.is_error ? "failed" : "completed";
       this.refreshRunningAgentCount();
+      if (this.agentDetail.isOpenFor(tool.id)) this.agentDetail.refresh();
     }
     await this.renderer.upsertMessage(msg);
   }
@@ -2055,6 +2190,9 @@ export class TabController {
   private maybeStartSubagentTracker(tool: ToolCall, _msg: ChatMessage): void {
     if (tool.name !== "Task" && tool.name !== "Agent") return;
     if (this.subagentTrackers.has(tool.id)) return;
+    /* The live stream already owns this agent's nested feed; a tailer on top
+       of it would duplicate every event. */
+    if (this.streamNestedTools.has(tool.id)) return;
     if (!this.state.sessionId) return;
     const cwd = this.plugin.getVaultPath();
     if (!cwd) return;
@@ -2087,12 +2225,9 @@ export class TabController {
      arriving after the tool_result already finalized — the nestedStatus
      check prevents the "running" status from clobbering "completed". */
   private applySubagentUpdate(toolId: string, update: SubagentTrackerUpdate): void {
-    const msgId = this.toolToMessage.get(toolId);
-    if (!msgId) return;
-    const msg = this.state.messages.find(m => m.id === msgId);
-    if (!msg || !msg.toolCalls) return;
-    const tool = msg.toolCalls.find(t => t.id === toolId);
-    if (!tool) return;
+    const found = this.findToolCallById(toolId);
+    if (!found) return;
+    const { msg, tool } = found;
 
     if (update.sessionId && !tool.nestedSessionId) {
       tool.nestedSessionId = update.sessionId;
@@ -2100,8 +2235,17 @@ export class TabController {
     }
 
     if (update.events.length > 0) {
-      tool.nestedEvents = tool.nestedEvents ?? [];
-      for (const e of update.events) tool.nestedEvents.push(e);
+      const events = tool.nestedEvents ?? [];
+      tool.nestedEvents = events;
+      for (const e of update.events) {
+        /* Until the live stream proves it carries narration, the JSONL
+           tracker and the stream can BOTH be feeding this agent, and each
+           owns its own seen-set. A nested tool_use is the only event with a
+           stable identity, so it is also the only one that can duplicate
+           across producers — drop the second sighting. */
+        if (e.kind === "tool_use" && events.some(x => x.kind === "tool_use" && x.id === e.id)) continue;
+        events.push(e);
+      }
       if (tool.nestedEvents.length > NESTED_EVENTS_CAP) {
         const overflow = tool.nestedEvents.length - NESTED_EVENTS_CAP;
         tool.nestedTruncatedCount = (tool.nestedTruncatedCount ?? 0) + overflow;
@@ -2124,7 +2268,95 @@ export class TabController {
     }
 
     void this.renderer.upsertMessage(msg);
+    if (this.agentDetail.isOpenFor(toolId)) this.agentDetail.refresh();
     this.onStateChangeCb();
+  }
+
+  /* Resolves a tool_use id to its ToolCall and owning message. toolToMessage
+     is only populated while a turn streams, so a restored / replayed
+     conversation has none of its spawn tools in it — fall back to a scan
+     rather than making the group card's rows dead on reload. */
+  private findToolCallById(toolId: string): { msg: ChatMessage; tool: ToolCall } | null {
+    const msgId = this.toolToMessage.get(toolId);
+    if (msgId) {
+      const msg = this.state.messages.find(m => m.id === msgId);
+      const tool = msg?.toolCalls?.find(t => t.id === toolId);
+      if (msg && tool) return { msg, tool };
+    }
+    for (const msg of this.state.messages) {
+      const tool = msg.toolCalls?.find(t => t.id === toolId);
+      if (tool) return { msg, tool };
+    }
+    return null;
+  }
+
+  /* Routes one subagent-tagged stream event into the owning agent's nested
+     feed. The stream takes the feed over from the JSONL tracker the first
+     time it carries narration (see the takeover block below); everything
+     else is a plain translate-and-apply. */
+  private handleNestedEvent(parentToolUseId: string, event: StreamEvent): void {
+    const found = this.findToolCallById(parentToolUseId);
+    /* Unknown parent (event for a tool from a previous, cleared session)
+       — nothing to attach it to. */
+    if (!found) return;
+    const tool = found.tool;
+
+    /* On a host with no tracker capability (remote / iOS) nothing seeded the
+       spawn time, and a diverted event is the earliest evidence of liveness.
+       Idempotent, so it costs nothing when the tracker already set it. */
+    if (!this.subagentSpawnTimes.has(parentToolUseId)) {
+      this.subagentSpawnTimes.set(parentToolUseId, Date.now());
+    }
+
+    if (tool.nestedStatus === undefined || tool.nestedStatus === "spawning") {
+      tool.nestedStatus = "running";
+      this.refreshRunningAgentCount();
+    }
+    tool.nestedEvents = tool.nestedEvents ?? [];
+
+    let seen = this.nestedSeenToolIds.get(parentToolUseId);
+    if (!seen) {
+      seen = new Set<string>();
+      this.nestedSeenToolIds.set(parentToolUseId, seen);
+    }
+    const update = translateNestedEvent(event, seen);
+    if (update.events.length === 0 && !update.toolUseUpdates) return;
+
+    /* Takeover, deliberately NOT triggered by the first diverted event.
+       The CLI only forwards a subagent's text/thinking frames when the run
+       is background-launched (or `--forward-subagent-text` is passed, which
+       we never do): a SYNCHRONOUS agent forwards nothing but frames whose
+       first block is tool_use / tool_result. Stopping the JSONL tracker on
+       sight of one of those would leave the drill-in with tool rows and no
+       narration at all. So the stream only claims ownership once it proves
+       it carries narration, and at that moment the tracker's contribution is
+       dropped — text/thinking has no id to dedupe on, and everything the
+       tailer wrote is about to be re-delivered by the stream. Nested tool
+       rows survive the cut (they dedupe by id in applySubagentUpdate) so
+       diverted tool activity from before the takeover isn't lost. */
+    if (
+      !this.streamNestedTools.has(parentToolUseId) &&
+      update.events.some(e => e.kind === "text" || e.kind === "thinking")
+    ) {
+      this.streamNestedTools.add(parentToolUseId);
+      const tracker = this.subagentTrackers.get(parentToolUseId);
+      if (tracker) {
+        void tracker.stop();
+        this.subagentTrackers.delete(parentToolUseId);
+      }
+      /* The detail view full-rebuilds when the event list shrinks. */
+      tool.nestedEvents = tool.nestedEvents.filter(e => e.kind === "tool_use");
+    }
+
+    this.applySubagentUpdate(parentToolUseId, update);
+  }
+
+  /* Opens the full-pane view for one Task/Agent tool call. The detail view
+     then holds that live ToolCall and re-reads it on every refresh(). */
+  private openAgentDetail(toolId: string): void {
+    const found = this.findToolCallById(toolId);
+    if (!found) return;
+    this.agentDetail.open(found.tool);
   }
 
   /* `plugin.subprocessManager.fetchPendingApprovals` is not part of
@@ -2282,6 +2514,7 @@ export class TabController {
             this.subagentTrackers.delete(t.id);
           }
           this.subagentSpawnTimes.delete(t.id);
+          if (this.agentDetail.isOpenFor(t.id)) this.agentDetail.refresh();
           swept++;
         } else {
           /* A regular tool (Bash, Read, Edit, MCP, …) still running at the
@@ -2391,14 +2624,34 @@ export class TabController {
     }
     this.subagentTrackers.clear();
     this.subagentSpawnTimes.clear();
+    this.streamNestedTools.clear();
+    this.nestedSeenToolIds.clear();
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
       let touched = false;
       for (const t of m.toolCalls) {
+        /* A background agent outlives normal turn ends, but not this one:
+           the subprocess is gone, so its <task-notification> can never
+           arrive. Its tool `status` is already "completed" (launch ack), so
+           the running-tool sweep below would skip it. */
+        if (t.backgroundAgent && (t.nestedStatus === "spawning" || t.nestedStatus === "running")) {
+          t.nestedStatus = "failed";
+          t.isError = true;
+          /* `result` still holds the launch acknowledgement. Once the card
+             reads terminal the drill-in starts showing `result` as the
+             agent's report, and "launched successfully" would claim an
+             outcome that never arrived. */
+          if ((t.result ?? "").trimStart().startsWith(ASYNC_LAUNCH_ACK)) {
+            t.result = "The session ended before this background agent reported back.";
+          }
+          if (this.agentDetail.isOpenFor(t.id)) this.agentDetail.refresh();
+          touched = true;
+        }
         if (t.status !== "running") continue;
         t.status = "errored";
         t.isError = true;
         if (t.name === "Task" || t.name === "Agent") t.nestedStatus = "failed";
+        if (this.agentDetail.isOpenFor(t.id)) this.agentDetail.refresh();
         touched = true;
       }
       if (touched) void this.renderer.upsertMessage(m);
@@ -2612,19 +2865,22 @@ export class TabController {
     this.streamingAssistantMessageId = null;
   }
 
-  /* Walk all messages and count Task/Agent tool calls still in flight
-     (status === "running"). Cheap O(messages × toolCalls), called on every
-     tool start/finish — counts grow slowly in practice so the walk is fine.
-     "Task" matches Claude Code 2.1.141 and earlier; "Agent" matches 2.1.143+
-     where the tool was renamed. */
+  /* Walk all messages and count Task/Agent tool calls still in flight. Cheap
+     O(messages × toolCalls), called on every tool start/finish — counts grow
+     slowly in practice so the walk is fine. "Task" matches Claude Code
+     2.1.141 and earlier; "Agent" matches 2.1.143+ where the tool was renamed.
+
+     Liveness comes from deriveAgentStatus (the same predicate the group card
+     renders), not from `status`: a background agent's tool_use completed the
+     moment it launched, so `status` alone would under-count it. */
   private refreshRunningAgentCount(): void {
     let running = 0;
     for (const m of this.state.messages) {
       if (!m.toolCalls) continue;
       for (const t of m.toolCalls) {
-        if ((t.name === "Task" || t.name === "Agent") && t.status === "running") {
-          running++;
-        }
+        if (t.name !== "Task" && t.name !== "Agent") continue;
+        const status = deriveAgentStatus(t);
+        if (status === "spawning" || status === "running") running++;
       }
     }
     this.inputBox.setRunningAgentCount(running);
@@ -2975,4 +3231,30 @@ function formatSelectionForPrompt(sel: ActiveSelection, userText: string): strin
   const fence = lang ? `\`\`\`${lang}` : "```";
   const block = `**Selected from \`${sel.filePath}\` (${lineRangeLabel(sel)}):**\n${fence}\n${sel.text}\n\`\`\``;
   return userText ? `${block}\n\n${userText}` : block;
+}
+
+/* Reads the subagent tag off an inbound event. Only the event types that
+   carry actual conversation content are considered — see the diversion gate
+   in onEvent for why control_request / system / result / usage are not. */
+function nestedParentToolUseId(event: StreamEvent): string | null {
+  switch (event.type) {
+    case "assistant":
+    case "user":
+    case "tool_use":
+    case "tool_result":
+    case "stream_event":
+      break;
+    default:
+      return null;
+  }
+  const ptid = (event as { parent_tool_use_id?: unknown }).parent_tool_use_id;
+  return typeof ptid === "string" && ptid.length > 0 ? ptid : null;
+}
+
+/* Pulls one <tag>…</tag> body out of a task-notification block. Deliberately
+   a tolerant regex rather than an XML parse: the block is model-adjacent
+   prose the CLI assembles, not guaranteed well-formed markup. */
+function extractNotificationTag(body: string, tag: string): string | null {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i").exec(body);
+  return match ? match[1].trim() : null;
 }

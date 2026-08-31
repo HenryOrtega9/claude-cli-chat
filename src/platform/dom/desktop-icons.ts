@@ -13,7 +13,7 @@
    fill instead of stroke. */
 
 import {
-  Check, CheckCircle2, ChevronDown, ChevronUp, Circle, CircleHelp, CircleX, Copy,
+  ArrowLeft, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, Circle, CircleHelp, CircleX, Copy,
   ExternalLink, File, FileEdit, FilePlus, FileSpreadsheet, FileText, Folder,
   FolderOpen, Gauge, GitBranch, Globe, History, Image, Layers, LayoutGrid,
   ListChecks, LoaderCircle, LocateFixed, Paperclip, Pause, Pin, Play, PlugZap,
@@ -36,6 +36,8 @@ type IconNode = [tag: string, attrs: Record<string, string | number | undefined>
    the app. A missing id still fails safely: renderIcon warns once and
    renders nothing, exactly as an unresolved icon did before. */
 const iconMap: Record<string, IconNode | undefined> = {
+  "arrow-left": ArrowLeft,
+  "bot": Bot,
   "check": Check,
   "check-circle-2": CheckCircle2,
   "chevron-down": ChevronDown,

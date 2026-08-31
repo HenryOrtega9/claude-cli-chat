@@ -107,6 +107,9 @@ export type UserEchoEvent = {
   type: "user";
   uuid?: string;
   session_id?: string;
+  /* Non-empty when this envelope belongs to a subagent's own stream rather
+     than the parent turn — the id is the parent's Task/Agent tool_use id. */
+  parent_tool_use_id?: string | null;
   message: { role: "user"; content: ContentBlock[] };
 };
 
@@ -114,6 +117,8 @@ export type AssistantEvent = {
   type: "assistant";
   uuid?: string;
   session_id?: string;
+  /* See UserEchoEvent.parent_tool_use_id. */
+  parent_tool_use_id?: string | null;
   message: {
     role: "assistant";
     model?: string;
@@ -159,6 +164,8 @@ export type ToolUseEvent = {
   name: string;
   input: Record<string, unknown>;
   uuid?: string;
+  /* See UserEchoEvent.parent_tool_use_id. */
+  parent_tool_use_id?: string | null;
 };
 
 export type ToolResultEvent = {
@@ -166,6 +173,8 @@ export type ToolResultEvent = {
   tool_use_id: string;
   content: string | ContentBlock[];
   is_error?: boolean;
+  /* See UserEchoEvent.parent_tool_use_id. */
+  parent_tool_use_id?: string | null;
 };
 
 export type ResultEvent = {
