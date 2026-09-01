@@ -99,13 +99,21 @@ export class InputWriter {
     this.send(response);
   }
 
-  closeStdin() {
+  closeStdin(): Promise<void> {
     /* Wait for any queued writes to flush before signaling EOF; otherwise
-       the child can miss the final NDJSON line. */
-    this.writeChain = this.writeChain.then(() => {
-      if (this.stdin.writable) this.stdin.end();
-    }).catch(() => {
-      try { if (this.stdin.writable) this.stdin.end(); } catch { /* ignore */ }
-    });
+       the child can miss the final NDJSON line. Returns a promise that
+       settles once the EOF itself has been handed to the stream (end()'s
+       callback), so a caller about to SIGTERM the child can wait for the
+       pipe to actually drain first. Never rejects — a dead pipe settles too. */
+    const done = this.writeChain
+      .then(() => new Promise<void>(resolve => {
+        if (this.stdin.writable) this.stdin.end(() => resolve());
+        else resolve();
+      }))
+      .catch(() => {
+        try { if (this.stdin.writable) this.stdin.end(); } catch { /* ignore */ }
+      });
+    this.writeChain = done;
+    return done;
   }
 }

@@ -415,7 +415,15 @@ export class TabSession {
        spawn() racing this disposal (see the `disposed` field comment) must
        replace the session rather than reuse it. */
     this.disposed = true;
-    this.writer.closeStdin();
+    /* Let the queued stdin writes + EOF actually reach the child before
+       SIGTERM: closeStdin() flushes on the write chain, and signaling
+       immediately raced that flush, so the child could miss the final
+       NDJSON line (or the EOF-driven graceful exit entirely). Bounded so
+       a wedged pipe (child not reading) can't stall teardown. */
+    await Promise.race([
+      this.writer.closeStdin(),
+      new Promise<void>(resolve => setTimeout(resolve, 500)),
+    ]);
     return new Promise(resolve => {
       /* `status` flips to "exited" asynchronously inside the 'exit' handler, so
          the process can already be gone here even though the check above passed.
