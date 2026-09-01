@@ -9,14 +9,16 @@
      replay/seq/session-id machinery is keyed on the daemon's.
    - closeTab() DELETEs the tab. The daemon owns the conversation file and the
      event spill, so a local-only delete would leak both.
-   - "New chat" (the header's clear button) POSTs /tabs/:id/clear and only then
-     calls TabController.clear() locally. A purely local clear would wipe the UI
-     while the daemon kept the messages, the replay ring and the session id, so
-     the chat came back on the next restore and the next turn `--resume`d a
-     conversation the user believed they had discarded. Closing and recreating
-     the tab was the earlier workaround: it churned the tab id, dropped the chat
-     out of History, and did not even yield a fresh chat when other tabs were
-     open, because closeTab falls back to selecting a neighbour.
+   - "New chat" (the header's clear button, and the composer's `/clear`, which
+     TabController routes here through onClearRequest) POSTs /tabs/:id/clear
+     and only then calls TabController.clear() locally. A purely local clear
+     would wipe the UI while the daemon kept the messages, the replay ring and
+     the session id, so the chat came back on the next restore and the next
+     turn `--resume`d a conversation the user believed they had discarded.
+     Closing and recreating the tab was the earlier workaround: it churned the
+     tab id, dropped the chat out of History, and did not even yield a fresh
+     chat when other tabs were open, because closeTab falls back to selecting
+     a neighbour.
    - There is no window lock. The daemon is the single writer of its own store,
      and two phones talking to it is a supported case (each gets the same
      frames), not a corruption risk — which is exactly what the lock existed to
@@ -46,6 +48,7 @@ import type { Persistence } from "../../../src/storage/Persistence";
 import type { GatewayConnection, LinkState } from "../../../src/platform/remote/GatewayConnection";
 import { isNativeHost, onSwitchTab, type PendingTabSwitch } from "./native";
 import { showUsageSheet } from "./usage";
+import { showSettingsSheet } from "./settings";
 import type { RemoteHost } from "../../../src/platform/remote/RemoteHost";
 import type { RemoteFileStorage } from "../../../src/platform/remote/RemoteFileStorage";
 import type { GatewayTransport } from "../../../src/platform/remote/transport";
@@ -267,9 +270,14 @@ export class IosChatShell {
       attr: { "aria-label": "Settings", title: "Settings" },
     });
     platform.setIcon(settings, "settings");
+    /* The gear opens the WEB settings sheet, not the native screen directly:
+       the phone-owned defaults (model, effort) live in the WebView's own
+       localStorage, where SwiftUI cannot reach them. The native gateway/token
+       screen is one tap further in, behind that sheet's Connection row, so it
+       stays reachable from the only entry point it ever had. */
     settings.addEventListener("click", () => {
       this.transport.haptic("selection");
-      this.transport.openSettings();
+      showSettingsSheet(this.host, this.transport);
     });
   }
 
@@ -465,6 +473,10 @@ export class IosChatShell {
     );
     controller.onForkRequest = (src, messageId) => void this.forkFromMessage(src, messageId);
     controller.onIncognitoToggle = (tabId, incognito) => void this.onIncognitoToggle(tabId, incognito);
+    /* `/clear` typed into the composer takes the same route as the header's
+       clear button — the daemon owns the conversation, so it has to be reset
+       there first or the messages come back on the next relaunch. */
+    controller.onClearRequest = tab => this.newChat(tab);
     /* Seed from what the daemon just told us so mounting a tab does not
        immediately PATCH back the value it was read from. */
     this.pushedConfig.set(
@@ -559,20 +571,24 @@ export class IosChatShell {
     void this.saveIndex();
   }
 
-  /* The header's "new chat" button: reset the ACTIVE tab in place, keeping its
-     id, its slot in the tab bar and its model / effort / mode. See the class
-     header for why the daemon has to be told first. */
-  private async newChat(): Promise<void> {
-    const active = this.tabs.find(t => t.state.id === this.activeTabId);
+  /* The header's "new chat" button, and the composer's `/clear` (routed here
+     through TabController.onClearRequest — the two must not diverge, since a
+     local-only clear leaves the daemon holding the conversation): reset the
+     tab in place, keeping its id, its slot in the tab bar and its model /
+     effort / mode. See the class header for why the daemon has to be told
+     first. `target` defaults to the active tab. Resolves true when the tab
+     was actually reset; a failure is reported here, not by the caller. */
+  private async newChat(target?: TabController): Promise<boolean> {
+    const active = target ?? this.tabs.find(t => t.state.id === this.activeTabId);
     if (!active) {
       await this.createTab();
-      return;
+      return true;
     }
     if (active.state.messages.length === 0 && !active.isBusy()) {
       /* Already empty — nothing to discard, and a round trip would only churn
          the session id of a chat that has not started. */
       active.focusInput();
-      return;
+      return true;
     }
     const tabId = active.state.id;
     /* Suppress the `resync` the daemon broadcasts for this clear: it is meant
@@ -589,7 +605,7 @@ export class IosChatShell {
           : `Gateway refused to clear the chat (HTTP ${res.status}).`,
         6000,
       );
-      return;
+      return false;
     }
     /* Jump the cursor past the wiped history. Without this the next reconnect
        subscribes with a `since` below the ring's new floor, the daemon answers
@@ -604,6 +620,7 @@ export class IosChatShell {
     this.renderTabBar();
     void this.saveIndex();
     active.focusInput();
+    return true;
   }
 
   private async forkFromMessage(source: TabController, messageId: string): Promise<void> {

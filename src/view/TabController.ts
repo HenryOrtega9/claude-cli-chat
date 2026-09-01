@@ -140,6 +140,18 @@ export class TabController {
      tab so the view can reconcile disk state (delete any persisted file when
      turning on, resume persistence when turning off). */
   onIncognitoToggle?: (tabId: string, incognito: boolean) => void;
+  /* Set by the mounting shell when this controller is NOT the owner of the
+     conversation it renders — the iOS client, whose tab store and messages
+     live in the gateway daemon. `/clear` must then reset the owning side
+     first: a purely local clear() wipes the UI while the daemon keeps the
+     messages, the replay ring and the session id, so the conversation comes
+     back on the next relaunch and the next turn `--resume`s a chat the user
+     believed they had discarded. The handler performs the remote reset AND
+     the local clear() (exactly what IosChatShell.newChat already does for the
+     header's clear button), reports its own failures, and resolves true only
+     when the tab was actually reset. Left unset on the plugin/desktop, where
+     this controller owns the state and Persistence writes it. */
+  onClearRequest?: (tab: TabController) => Promise<boolean>;
 
   /* Set to true while teardownSession() is executing so re-entrant callers
      (e.g. an onExit firing mid-dispose) don't double-dispose. */
@@ -877,8 +889,7 @@ export class TabController {
     const head = parts[0].toLowerCase();
     switch (head) {
       case "/clear":
-        void this.clear();
-        platform.notify("Cleared chat — next message starts a new Claude session.");
+        void this.runClearCommand();
         return true;
       case "/help": {
         const skills = this.state.availableSkills ?? [];
@@ -980,6 +991,21 @@ export class TabController {
       text = `Use the Task tool to launch the "${entry.name}" subagent.${descBit}`;
     }
     void this.submit({ text, attachments: [] });
+  }
+
+  /* `/clear` typed into the composer. Routes through onClearRequest when a
+     shell owns the reset (see that field's comment) so the discarded
+     conversation is wiped where it actually lives; otherwise resets locally
+     and lets the normal onStateChangeCb -> scheduleSaveTab path write the
+     emptied tab. The toast is deferred until the reset really happened — a
+     gateway that refused the clear reports that itself. */
+  private async runClearCommand(): Promise<void> {
+    if (this.onClearRequest) {
+      if (!(await this.onClearRequest(this))) return;
+    } else {
+      await this.clear();
+    }
+    platform.notify("Cleared chat — next message starts a new Claude session.");
   }
 
   /* Resets the active tab in place: kills the subprocess, wipes messages and

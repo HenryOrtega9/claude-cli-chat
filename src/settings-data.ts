@@ -20,6 +20,7 @@
    itself does the model selection; the underlying Opus path still gets
    1M context. Same model alias `/model opusplan` exposes in Claude Code. */
 export const MODEL_IDS = {
+  "fable-5-1": "claude-fable-5-1[1m]",
   "fable-5": "claude-fable-5[1m]",
   "opus-5": "claude-opus-5[1m]",
   "opus-1m": "claude-opus-4-8[1m]",
@@ -34,6 +35,7 @@ export const MODEL_IDS = {
 export type ModelKey = keyof typeof MODEL_IDS;
 
 export const MODEL_LABELS: Record<ModelKey, string> = {
+  "fable-5-1": "Fable 5.1 1M",
   "fable-5": "Fable 5 1M",
   "opus-5": "Opus 5 1M",
   "opus-1m": "Opus 4.8 1M",
@@ -71,7 +73,7 @@ export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
    Keep in sync with MODEL_IDS: every ModelKey must appear in exactly one
    group. */
 export const MODEL_GROUPS: { header: string; keys: ModelKey[] }[] = [
-  { header: "FABLE", keys: ["fable-5"] },
+  { header: "FABLE", keys: ["fable-5-1", "fable-5"] },
   { header: "OPUS", keys: ["opus-5", "opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
   { header: "SONNET", keys: ["sonnet-5", "sonnet-1m"] },
   { header: "HAIKU", keys: ["haiku"] },
@@ -97,7 +99,7 @@ export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "l
    ladder (incl. xhigh/max) is confirmed by the effort docs as of its
    2026-07-24 release. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
@@ -107,7 +109,7 @@ export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
    resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 

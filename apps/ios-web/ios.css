@@ -1009,6 +1009,94 @@ body {
   color: var(--text-muted);
 }
 
+/* ---- Settings sheet -----------------------------------------
+   Opened from the header's gear. Reuses the usage sheet's
+   overlay/sheet/head classes verbatim (same bottom-sheet shape,
+   same entrance animation) and adds only the row chrome the
+   Defaults section needs. Rows are 44pt minimum so the native
+   <select> wheel is a comfortable tap target. */
+.vaultgw-settings-section {
+  padding: 14px 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.vaultgw-settings-section:first-child {
+  padding-top: 4px;
+}
+
+.vaultgw-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--vgw-glass-border);
+}
+
+.vaultgw-settings-label {
+  font-size: 14px;
+  color: var(--text-normal);
+}
+
+/* -webkit-appearance is cleared because iOS paints its own inset
+   bevel on a <select>, which reads as a light-mode control on
+   this dark sheet. The wheel picker it opens on tap is untouched. */
+.vaultgw-settings-select {
+  flex: 0 1 auto;
+  max-width: 62%;
+  min-height: 34px;
+  padding: 6px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--vgw-glass-border);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text-normal);
+  font-size: 14px;
+  text-align: right;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.vaultgw-settings-note {
+  padding: 8px 0 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.vaultgw-settings-note.is-hidden {
+  display: none;
+}
+
+.vaultgw-settings-hint {
+  padding: 10px 0 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
+.vaultgw-settings-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  font-size: 14px;
+  color: var(--text-normal);
+}
+
+.vaultgw-settings-link-icon {
+  display: flex;
+  color: var(--text-faint);
+}
+
+.vaultgw-settings-link-icon .svg-icon {
+  width: 16px;
+  height: 16px;
+}
+
 /* ---- Entrance motion ----------------------------------------
    Surfaces that hard-cut into view read as stutter next to the
    native transitions around them. Transform + opacity only, so
