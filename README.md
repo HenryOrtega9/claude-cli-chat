@@ -16,7 +16,7 @@ Each chat tab spawns its own `claude --print --output-format stream-json` subpro
 
 ### watch-bridge
 
-`scripts/watch-bridge/bridge.py` is a zero-dependency Python daemon that holds one interactive `claude` session on a PTY and exposes it over a bearer-authed HTTP API on the Tailscale interface. It backs [ask-claude-watch](https://github.com/HenryOrtega9/ask-claude-watch), a standalone watchOS app. Endpoints cover chat turns with a partial-reply budget, a long-poll `/wait` for background notifications, a directory of every live Claude session on the Mac (with tmux input injection), and an OAuth usage proxy for plan-limit gauges.
+`daemons/watch-bridge/bridge.py` is a zero-dependency Python daemon that holds one interactive `claude` session on a PTY and exposes it over a bearer-authed HTTP API on the Tailscale interface. It backs [ask-claude-watch](https://github.com/HenryOrtega9/ask-claude-watch), a standalone watchOS app. Endpoints cover chat turns with a partial-reply budget, a long-poll `/wait` for background notifications, a directory of every live Claude session on the Mac (with tmux input injection), and an OAuth usage proxy for plan-limit gauges.
 
 ### TC001 hardware status display
 

@@ -16,7 +16,7 @@ Against the launchd daemon at `henrys-macbook-pro.tail92466c.ts.net:8788`, vault
 | | Result |
 |---|---|
 | Gateway rebuild + `launchctl kickstart` | `/health` → `ready`, WebSocket handshake accepted by WKWebView (the wave-1 GUID typo is really gone) |
-| `scripts/gateway/test/smoke.mjs` | 34/34 assertions, including the new cold-tab regression |
+| `daemons/gateway/test/smoke.mjs` | 34/34 assertions, including the new cold-tab regression |
 | Cold launch, token seeded, no banner | [`sim-01`](screens/sim-01-welcome.png) |
 | Streamed turn | [`sim-02`](screens/sim-02-streamed-reply.png) |
 | Approval card in `default` mode | [`sim-03`](screens/sim-03-approval-card.png) |

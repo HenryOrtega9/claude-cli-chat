@@ -1,0 +1,498 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		09AF7041BCC912DCA93AAF2F /* VaultGatewayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 289B9DC854FA17A849B935DA /* VaultGatewayApp.swift */; };
+		0DCCA53855A4FBF3C7983D51 /* WebHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 487B5693410A068B4A5E21CE /* WebHost.swift */; };
+		0FCC02DE616E44A6D73DD524 /* WebSchemeHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF5EA183CCB56D6CD43BE323 /* WebSchemeHandler.swift */; };
+		37F572A6E4F2694ECB238A6E /* ConnectivityBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */; };
+		47DD83B146FE7DF3ED8C6806 /* Web in Resources */ = {isa = PBXBuildFile; fileRef = 0FDF4E4B00D8A1CBB0695CF4 /* Web */; };
+		4B1D68BDCCA3D71066BE2929 /* GatewayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B870DB873970D7A12AB3179A /* GatewayClient.swift */; };
+		55447A040EB86A1F8234EE15 /* NativeBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */; };
+		5A0BA34A95404F6D3333DFFB /* GatewayConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */; };
+		64463D6ED640DC5ECE5665E2 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */; };
+		679BCC6B623837AB82963D0B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2648DC2BCD105AD42D1B031B /* Assets.xcassets */; };
+		6AECBC61B45F0AC194E5B99F /* Secrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7113B675BCE7B8D5B0CA854 /* Secrets.swift */; };
+		719887B024880E7B5AAD2BE8 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */; };
+		80DE10F676FB711FAE44D05B /* ConnectivityMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */; };
+		85BDCCFB74BED86AF91B094E /* ShareInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BA707DB287AFEF61FBC40AD /* ShareInbox.swift */; };
+		87010C30E14352A55F01DFD2 /* TurnNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4041BF1C59EF00F173A0256D /* TurnNotifier.swift */; };
+		8D481D2184EF47F6F062F63D /* DebugLaunchEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */; };
+		AA23C8716CAC5116BAC2D7A3 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F62FE8262D4AE91B7C11641A /* ShareViewController.swift */; };
+		AE960D92DE40972C25EB280B /* ShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 300F67370639EDDF766F84A0 /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		25587DE4AEF397F5B14FAA92 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 048471F9E07913739220C166 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0FC0F2076D140D57FD2EA2C7;
+			remoteInfo = ShareExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		992DD67382C953551F00A7D8 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				AE960D92DE40972C25EB280B /* ShareExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0FDF4E4B00D8A1CBB0695CF4 /* Web */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Web; sourceTree = SOURCE_ROOT; };
+		16D1D8704BB039E4573C7BDD /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		2648DC2BCD105AD42D1B031B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		289B9DC854FA17A849B935DA /* VaultGatewayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultGatewayApp.swift; sourceTree = "<group>"; };
+		300F67370639EDDF766F84A0 /* ShareExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = ShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		4041BF1C59EF00F173A0256D /* TurnNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnNotifier.swift; sourceTree = "<group>"; };
+		487B5693410A068B4A5E21CE /* WebHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebHost.swift; sourceTree = "<group>"; };
+		4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLaunchEnvironment.swift; sourceTree = "<group>"; };
+		626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeBridge.swift; sourceTree = "<group>"; };
+		7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayConfig.swift; sourceTree = "<group>"; };
+		974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectivityBanner.swift; sourceTree = "<group>"; };
+		986F81B16897C2358026503A /* VaultGateway.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VaultGateway.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9BA707DB287AFEF61FBC40AD /* ShareInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareInbox.swift; sourceTree = "<group>"; };
+		B7113B675BCE7B8D5B0CA854 /* Secrets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Secrets.swift; sourceTree = "<group>"; };
+		B870DB873970D7A12AB3179A /* GatewayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayClient.swift; sourceTree = "<group>"; };
+		CF805F7F96FD1EE807EAA231 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		DF5EA183CCB56D6CD43BE323 /* WebSchemeHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSchemeHandler.swift; sourceTree = "<group>"; };
+		E5C0CFB45E0E6A7F4DE47CC4 /* ShareExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ShareExtension.entitlements; sourceTree = "<group>"; };
+		F5E597D913997A8DFD01C3E2 /* VaultGateway.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VaultGateway.entitlements; sourceTree = "<group>"; };
+		F62FE8262D4AE91B7C11641A /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
+		FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectivityMonitor.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		02EED9E6EA5576C69BF2020C /* ShareExtension */ = {
+			isa = PBXGroup;
+			children = (
+				16D1D8704BB039E4573C7BDD /* Info.plist */,
+				E5C0CFB45E0E6A7F4DE47CC4 /* ShareExtension.entitlements */,
+				F62FE8262D4AE91B7C11641A /* ShareViewController.swift */,
+			);
+			path = ShareExtension;
+			sourceTree = "<group>";
+		};
+		A86AF16CF0334C792AA2D515 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				300F67370639EDDF766F84A0 /* ShareExtension.appex */,
+				986F81B16897C2358026503A /* VaultGateway.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		BF5C1C0ADFE01C599FA48F69 = {
+			isa = PBXGroup;
+			children = (
+				0FDF4E4B00D8A1CBB0695CF4 /* Web */,
+				02EED9E6EA5576C69BF2020C /* ShareExtension */,
+				CDF5C9ECE8D5E4B7660399BA /* Sources */,
+				A86AF16CF0334C792AA2D515 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		CDF5C9ECE8D5E4B7660399BA /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				2648DC2BCD105AD42D1B031B /* Assets.xcassets */,
+				974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */,
+				FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */,
+				5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */,
+				B870DB873970D7A12AB3179A /* GatewayClient.swift */,
+				7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */,
+				CF805F7F96FD1EE807EAA231 /* Info.plist */,
+				222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */,
+				626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */,
+				B7113B675BCE7B8D5B0CA854 /* Secrets.swift */,
+				4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */,
+				9BA707DB287AFEF61FBC40AD /* ShareInbox.swift */,
+				4041BF1C59EF00F173A0256D /* TurnNotifier.swift */,
+				F5E597D913997A8DFD01C3E2 /* VaultGateway.entitlements */,
+				289B9DC854FA17A849B935DA /* VaultGatewayApp.swift */,
+				487B5693410A068B4A5E21CE /* WebHost.swift */,
+				DF5EA183CCB56D6CD43BE323 /* WebSchemeHandler.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0FC0F2076D140D57FD2EA2C7 /* ShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C6281114E779FD413DF2343F /* Build configuration list for PBXNativeTarget "ShareExtension" */;
+			buildPhases = (
+				423FECB95063D907AF28ED03 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ShareExtension;
+			packageProductDependencies = (
+			);
+			productName = ShareExtension;
+			productReference = 300F67370639EDDF766F84A0 /* ShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		9B4E228FFB1DD4A003B4FD1D /* VaultGateway */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AD7B8D8DE50EF1FDCD82CB15 /* Build configuration list for PBXNativeTarget "VaultGateway" */;
+			buildPhases = (
+				C4E21E545296731AF3E74353 /* Sources */,
+				DDB5133A32438B26EE98081B /* Resources */,
+				992DD67382C953551F00A7D8 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				F4B3FB55C1D629C449B3737B /* PBXTargetDependency */,
+			);
+			name = VaultGateway;
+			packageProductDependencies = (
+			);
+			productName = VaultGateway;
+			productReference = 986F81B16897C2358026503A /* VaultGateway.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		048471F9E07913739220C166 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					0FC0F2076D140D57FD2EA2C7 = {
+						DevelopmentTeam = SHMR9277Y3;
+						ProvisioningStyle = Automatic;
+					};
+					9B4E228FFB1DD4A003B4FD1D = {
+						DevelopmentTeam = SHMR9277Y3;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 9D87B1D1EA8EC4A818BDDB8E /* Build configuration list for PBXProject "VaultGateway" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = BF5C1C0ADFE01C599FA48F69;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = A86AF16CF0334C792AA2D515 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0FC0F2076D140D57FD2EA2C7 /* ShareExtension */,
+				9B4E228FFB1DD4A003B4FD1D /* VaultGateway */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		DDB5133A32438B26EE98081B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				679BCC6B623837AB82963D0B /* Assets.xcassets in Resources */,
+				47DD83B146FE7DF3ED8C6806 /* Web in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		423FECB95063D907AF28ED03 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA23C8716CAC5116BAC2D7A3 /* ShareViewController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C4E21E545296731AF3E74353 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				37F572A6E4F2694ECB238A6E /* ConnectivityBanner.swift in Sources */,
+				80DE10F676FB711FAE44D05B /* ConnectivityMonitor.swift in Sources */,
+				8D481D2184EF47F6F062F63D /* DebugLaunchEnvironment.swift in Sources */,
+				4B1D68BDCCA3D71066BE2929 /* GatewayClient.swift in Sources */,
+				5A0BA34A95404F6D3333DFFB /* GatewayConfig.swift in Sources */,
+				719887B024880E7B5AAD2BE8 /* KeychainStore.swift in Sources */,
+				55447A040EB86A1F8234EE15 /* NativeBridge.swift in Sources */,
+				6AECBC61B45F0AC194E5B99F /* Secrets.swift in Sources */,
+				64463D6ED640DC5ECE5665E2 /* SettingsView.swift in Sources */,
+				85BDCCFB74BED86AF91B094E /* ShareInbox.swift in Sources */,
+				87010C30E14352A55F01DFD2 /* TurnNotifier.swift in Sources */,
+				09AF7041BCC912DCA93AAF2F /* VaultGatewayApp.swift in Sources */,
+				0DCCA53855A4FBF3C7983D51 /* WebHost.swift in Sources */,
+				0FCC02DE616E44A6D73DD524 /* WebSchemeHandler.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		F4B3FB55C1D629C449B3737B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0FC0F2076D140D57FD2EA2C7 /* ShareExtension */;
+			targetProxy = 25587DE4AEF397F5B14FAA92 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		2B01CCC10C076F40FE674D94 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Sources/VaultGateway.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				INFOPLIST_FILE = Sources/Info.plist;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = NO;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.henryortega.vaultgateway;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		382022DC2BF11E0FF40CE66A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = SHMR9277Y3;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+		5AB46B21B2072E6730AF0B2F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.henryortega.vaultgateway.share;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		BA9C29E3D18E27C8C0F1C1CB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Sources/VaultGateway.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				INFOPLIST_FILE = Sources/Info.plist;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = NO;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.henryortega.vaultgateway;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		CF8E8AE143F4BF19D2D88055 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.henryortega.vaultgateway.share;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		E77C577146A567687AB5DD73 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = SHMR9277Y3;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9D87B1D1EA8EC4A818BDDB8E /* Build configuration list for PBXProject "VaultGateway" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				382022DC2BF11E0FF40CE66A /* Debug */,
+				E77C577146A567687AB5DD73 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AD7B8D8DE50EF1FDCD82CB15 /* Build configuration list for PBXNativeTarget "VaultGateway" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BA9C29E3D18E27C8C0F1C1CB /* Debug */,
+				2B01CCC10C076F40FE674D94 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C6281114E779FD413DF2343F /* Build configuration list for PBXNativeTarget "ShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CF8E8AE143F4BF19D2D88055 /* Debug */,
+				5AB46B21B2072E6730AF0B2F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 048471F9E07913739220C166 /* Project object */;
+}

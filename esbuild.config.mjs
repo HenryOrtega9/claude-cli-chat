@@ -24,9 +24,9 @@ if (!appMode && !iosMode) {
 }
 
 const copyStaticAssets = () => {
-  copyFileSync("manifest.json", join(VAULT_PLUGIN_DIR, "manifest.json"));
-  if (existsSync("styles.css")) {
-    copyFileSync("styles.css", join(VAULT_PLUGIN_DIR, "styles.css"));
+  copyFileSync("apps/obsidian/manifest.json", join(VAULT_PLUGIN_DIR, "manifest.json"));
+  if (existsSync("apps/obsidian/styles.css")) {
+    copyFileSync("apps/obsidian/styles.css", join(VAULT_PLUGIN_DIR, "styles.css"));
   }
 };
 
@@ -49,7 +49,7 @@ const buildOptions = {
  * The two builds share nothing but this file: the plugin's entry, output path,
  * and options above must stay byte-for-byte what they were.
  */
-const APP_DIST = "app/dist";
+const APP_DIST = "apps/electron/dist";
 
 /*
  * The shell hosts the SAME shared code as the plugin, which is only decoupled
@@ -74,7 +74,7 @@ const forbidObsidianImports = {
 };
 
 const appMainOptions = {
-  entryPoints: ["app/src/main.ts"],
+  entryPoints: ["apps/electron/src/main.ts"],
   bundle: true,
   outfile: join(APP_DIST, "main.js"),
   format: "cjs",
@@ -88,7 +88,7 @@ const appMainOptions = {
 };
 
 const appRendererOptions = {
-  entryPoints: ["app/src/renderer.ts"],
+  entryPoints: ["apps/electron/src/renderer.ts"],
   bundle: true,
   outfile: join(APP_DIST, "renderer.js"),
   format: "cjs",
@@ -116,8 +116,8 @@ const appRendererOptions = {
  * below turns any regression into a build error naming the importer, which is
  * the whole point of having this target land before the client is written.
  */
-const IOS_WEB_DIR = "ios/Web";
-const IOS_ENTRY = "ios-web/src/renderer.ts";
+const IOS_WEB_DIR = "apps/ios/Web";
+const IOS_ENTRY = "apps/ios-web/src/renderer.ts";
 
 const FORBIDDEN_NODE_BUILTINS =
   /^(node:)?(fs|fs\/promises|child_process|path|os|http|https|net|readline|stream|zlib|url|crypto|util|events)$/;
@@ -166,10 +166,10 @@ const iosRendererOptions = {
    Load order matters and matches index.html: styles.css (shared plugin CSS),
    desktop.css (the theme tokens it consumes), ios.css (touch + glass). */
 const copyIosAssets = () => {
-  copyFileSync("ios-web/index.html", join(IOS_WEB_DIR, "index.html"));
-  copyFileSync("styles.css", join(IOS_WEB_DIR, "styles.css"));
-  copyFileSync("app/desktop.css", join(IOS_WEB_DIR, "desktop.css"));
-  copyFileSync("ios-web/ios.css", join(IOS_WEB_DIR, "ios.css"));
+  copyFileSync("apps/ios-web/index.html", join(IOS_WEB_DIR, "index.html"));
+  copyFileSync("apps/obsidian/styles.css", join(IOS_WEB_DIR, "styles.css"));
+  copyFileSync("apps/electron/desktop.css", join(IOS_WEB_DIR, "desktop.css"));
+  copyFileSync("apps/ios-web/ios.css", join(IOS_WEB_DIR, "ios.css"));
 };
 
 if (iosMode) {

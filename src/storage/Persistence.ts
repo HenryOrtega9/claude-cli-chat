@@ -74,7 +74,7 @@ type StoredTab = {
   voiceEnabled?: boolean;
   /* Unsent composer text — see TabState.draft's own comment for the full
      contract. Round-tripped like any other per-tab field on this path; the
-     gateway's own StoredTab-shaped projection (scripts/gateway/src/engine.ts
+     gateway's own StoredTab-shaped projection (daemons/gateway/src/engine.ts
      storedTab()) carries it separately for the remote client. */
   draft?: string;
   /* Remote-only (see the type comment above) — absent from every local

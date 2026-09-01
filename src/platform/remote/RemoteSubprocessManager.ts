@@ -496,7 +496,7 @@ export class RemoteSubprocessManager implements SubprocessManagerLike {
      `GET /tabs/:id` instead and reads a `pendingApprovals` field.
 
      That field does NOT exist on the wire yet — verified against the
-     current `storedTab()` in `scripts/gateway/src/engine.ts` (lines ~235-253
+     current `storedTab()` in `daemons/gateway/src/engine.ts` (lines ~235-253
      as of this change), which returns id/sessionId/title/.../busy/status/
      lastSeq and nothing about `this.pending`. The daemon already computes
      the exact right shape for this in the same file:

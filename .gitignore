@@ -1,9 +1,9 @@
 node_modules/
 main.js
 main.js.map
-app/dist/
-app/release/
-ios/Web/
+apps/electron/dist/
+apps/electron/release/
+apps/ios/Web/
 *.log
 .DS_Store
 .vscode/

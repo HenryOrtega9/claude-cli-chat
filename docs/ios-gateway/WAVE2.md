@@ -1,4 +1,4 @@
-# Wave 2 — the browser client (`ios-web/` + `src/platform/remote/`)
+# Wave 2 — the browser client (`apps/ios-web/` + `src/platform/remote/`)
 
 The full claude-cli-chat UI — tabs, composer, message rendering, tool rows,
 approvals, model/effort/mode pills, history, MCP manager — running in a browser
@@ -18,13 +18,13 @@ Contract: [`CONTRACTS.md`](CONTRACTS.md).
 | `src/platform/remote/RemoteFileStorage.ts` | `FileStorage` mapped onto the daemon's routes (table below). |
 | `src/platform/remote/RemoteHost.ts` | `PluginHost`: catalogs, MCP list, title generation, device settings. |
 | `src/platform/remote/RemoteSpeech.ts` | Voice mode over the native `speak` bridge (AVSpeechSynthesizer). |
-| `ios-web/src/native.ts` | The WKWebView bridge, plus a desktop-browser fallback for development. |
-| `ios-web/src/platform.ts` | `Platform` over `src/platform/dom/*`. |
-| `ios-web/src/vault.ts` | `VaultFeatures` (the @-mention index) from a `GET /files` snapshot. |
-| `ios-web/src/shell.ts` | `IosChatShell` — the port of `DesktopChatShell`. |
-| `ios-web/src/renderer.ts` | Boot: `__vaultgw.dispatch` first, then config, platform, host, shell, socket. |
-| `ios-web/ios.css` | Glass + touch layer, loaded after `styles.css` and `desktop.css`. |
-| `ios-web/dev-server.mjs` | Static host for `ios/Web/` plus a `/gw/*` reverse proxy (WebSocket upgrade included). |
+| `apps/ios-web/src/native.ts` | The WKWebView bridge, plus a desktop-browser fallback for development. |
+| `apps/ios-web/src/platform.ts` | `Platform` over `src/platform/dom/*`. |
+| `apps/ios-web/src/vault.ts` | `VaultFeatures` (the @-mention index) from a `GET /files` snapshot. |
+| `apps/ios-web/src/shell.ts` | `IosChatShell` — the port of `DesktopChatShell`. |
+| `apps/ios-web/src/renderer.ts` | Boot: `__vaultgw.dispatch` first, then config, platform, host, shell, socket. |
+| `apps/ios-web/ios.css` | Glass + touch layer, loaded after `styles.css` and `desktop.css`. |
+| `apps/ios-web/dev-server.mjs` | Static host for `apps/ios/Web/` plus a `/gw/*` reverse proxy (WebSocket upgrade included). |
 
 ### Engine mapping
 
@@ -90,7 +90,7 @@ already degrades to a no-op on.
 ## Screenshots
 
 Captured against the live daemon at `100.96.112.74:8788` through
-`ios-web/dev-server.mjs`.
+`apps/ios-web/dev-server.mjs`.
 
 | | |
 |---|---|
@@ -125,9 +125,9 @@ pipe: nothing in it parses a frame, so it cannot get framing wrong.
 ## Two wave-1 bugs found and fixed here
 
 **1. The daemon's WebSocket handshake was rejected by every real browser.**
-`scripts/gateway/src/ws.ts` computed `Sec-WebSocket-Accept` with a mistyped RFC
+`daemons/gateway/src/ws.ts` computed `Sec-WebSocket-Accept` with a mistyped RFC
 6455 GUID (`…95CA-5AB0DC85B11F` instead of `…95CA-C5AB0DC85B11`), and
-`scripts/gateway/test/ws-client.mjs` carried the same typo — so the smoke test
+`daemons/gateway/test/ws-client.mjs` carried the same typo — so the smoke test
 passed while no browser could connect. Chrome's error was
 `Incorrect 'Sec-WebSocket-Accept' header value`, and the client's reconnect
 backoff simply retried forever.
@@ -139,7 +139,7 @@ wrong. Both constants are fixed, with the RFC's own example vector
 (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`) written into the
 comment so a future typo is checkable. `smoke.mjs` still passes.
 
-Two one-line constants in `scripts/gateway/` is outside this change's declared
+Two one-line constants in `daemons/gateway/` is outside this change's declared
 ownership; it was unavoidable, since without it the wave-2 deliverable cannot
 connect from any browser, WKWebView included.
 
@@ -151,7 +151,7 @@ so a tab created (`POST /tabs`, which mints a session id) but never given a turn
 before the daemon restarts spawns with `--resume <uuid>` for a conversation that
 does not exist. The CLI exits 1 with `No conversation found with session ID`,
 and the turn surfaces as `error_during_execution`. The fix belongs in
-`scripts/gateway/src/engine.ts`: persist `sessionEstablished` alongside the
+`daemons/gateway/src/engine.ts`: persist `sessionEstablished` alongside the
 session id, or fall back to `--session-id` when a resume fails.
 
 ## Client-side fixes this wave needed

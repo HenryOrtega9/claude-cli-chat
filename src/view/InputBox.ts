@@ -61,6 +61,30 @@ const TOUCH_PRIMARY: boolean = (() => {
   }
 })();
 
+/* Whether a physical keyboard is known to be present. On a pointer host this
+   is trivially true. On a touch host it starts false (software return key =
+   newline, send button submits) and flips when either source proves a real
+   keyboard: the native shell's GCKeyboard observation arriving through
+   setHardwareKeyboardPresent, or the keydown heuristic in handleKeydown for
+   hosts with no bridge (iPad Safari). Once true, Enter submits and
+   Shift+Enter newlines — the desktop convention. Native can flip it back
+   false when the keyboard detaches, restoring the software-keyboard default. */
+let HARDWARE_KEYBOARD = !TOUCH_PRIMARY;
+
+/* Keys the iOS software keyboard never emits; seeing one on a touch host is
+   proof of a physical keyboard. */
+const HARDWARE_ONLY_KEYS = new Set([
+  "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+  "Tab", "Home", "End", "PageUp", "PageDown", "Escape",
+]);
+
+/* Bridge entry point for the iOS app: NativeBridge observes GCKeyboard
+   connect/disconnect and pushes the state here via renderer.ts. On a pointer
+   host the flag is pinned true regardless of what a caller says. */
+export function setHardwareKeyboardPresent(present: boolean): void {
+  HARDWARE_KEYBOARD = present || !TOUCH_PRIMARY;
+}
+
 /* btoa() needs a binary string. Building one with String.fromCharCode(...arr)
    blows the call stack on large images, so feed it in chunks. */
 function bytesToBase64(bytes: Uint8Array): string {
@@ -1680,6 +1704,19 @@ export class InputBox {
   }
 
   private handleKeydown(e: KeyboardEvent) {
+    /* Heuristic half of hardware-keyboard detection (the iOS app also gets
+       the authoritative GCKeyboard signal from native): a modifier riding
+       any key, Shift on Enter itself, or a key the software keyboard can't
+       produce. Checked before everything else so evidence isn't lost to an
+       early return; the Shift+Enter that proves the keyboard still falls
+       through to the shiftKey branch below and newlines as the user meant. */
+    if (TOUCH_PRIMARY && !HARDWARE_KEYBOARD && (
+      e.metaKey || e.ctrlKey || e.altKey ||
+      (e.shiftKey && e.key === "Enter") ||
+      HARDWARE_ONLY_KEYS.has(e.key)
+    )) {
+      HARDWARE_KEYBOARD = true;
+    }
     /* When the suggestion popup is open, arrow keys + Enter/Tab navigate it.
        Esc closes it. Everything else falls through to normal typing. */
     if (this.suggestion) {
@@ -1737,15 +1774,18 @@ export class InputBox {
     if (e.key !== "Enter") return;
     if (e.isComposing) return;
     if (e.shiftKey) return;
-    /* On a touch host there is no Shift key riding along with the software
-       keyboard's return key, so "Enter submits, Shift+Enter newlines" — the
-       desktop convention this handler otherwise implements — would make
-       every return keystroke send the message, with no way to type a second
-       line short of pasting one in. Phones instead get the opposite default,
-       matching every other iOS chat app: return inserts a newline (the
-       textarea's native behavior, so nothing here needs to run) and the send
-       button in the toolbar is the only way to submit. */
-    if (TOUCH_PRIMARY) return;
+    /* With only a software keyboard there is no Shift key riding along with
+       the return key, so "Enter submits, Shift+Enter newlines" — the desktop
+       convention this handler otherwise implements — would make every return
+       keystroke send the message, with no way to type a second line short of
+       pasting one in. Software-keyboard hosts instead get the opposite
+       default, matching every other iOS chat app: return inserts a newline
+       (the textarea's native behavior, so nothing here needs to run) and the
+       send button in the toolbar is the only way to submit. Once a physical
+       keyboard is detected (native GCKeyboard signal or the heuristic above)
+       the desktop convention applies — an iPad with a Magic Keyboard types
+       like a laptop, not like a phone. */
+    if (!HARDWARE_KEYBOARD) return;
     e.preventDefault();
     e.stopPropagation();
     this.submit();

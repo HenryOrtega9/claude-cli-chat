@@ -1,6 +1,19 @@
 # claude-cli-chat
 
-Obsidian plugin that wraps the Claude Code CLI (`claude --print --output-format stream-json --input-format stream-json`) as a chat UI. Each chat tab spawns its own CLI subprocess and renders the event stream as bubbles, tool rows, and diffs. macOS only (Remote Control mode depends on Python `pty.fork`).
+Monorepo for a family of Claude chat clients over one shared TypeScript UI core. The original product is an Obsidian plugin that wraps the Claude Code CLI (`claude --print --output-format stream-json --input-format stream-json`) as a chat UI — each chat tab spawns its own CLI subprocess and renders the event stream as bubbles, tool rows, and diffs. macOS only (Remote Control mode depends on Python `pty.fork`).
+
+Top-level structure (since the 2026-08-31 restructure):
+
+- `src/`: the shared core — view layer, CLI/event plumbing, storage, platform abstraction. Every app bundles from here; `src/main.ts` is specifically the Obsidian plugin entry.
+- `apps/obsidian/`: the plugin's `manifest.json` + `styles.css` (entry lives in `src/main.ts`; build ships all three to the vault).
+- `apps/electron/`: "Claude Quick Chat" — standalone Electron menu-bar shell.
+- `apps/ios/`: "Claude & Second Brain" — Swift/WKWebView shell for iPhone + iPad (XcodeGen project).
+- `apps/ios-web/`: the browser client the iOS shell hosts (also runnable in a desktop browser via its dev server).
+- `daemons/gateway/`: Vault Gateway — the Mac-side node daemon the iOS app talks to (launchd: `dev.claude-cli-chat.vault-gateway`).
+- `daemons/watch-bridge/`: Apple Watch chat bridge daemon (launchd: `dev.claude-cli-chat.watch-bridge`). The watchOS client itself is the separate `ask-claude-watch` repo.
+- `scripts/`: out-of-tree helpers (TC001 animator + its plist, smoke tests, credit-pool forecaster). Not bundled.
+
+The user-level launchd plists in `~/Library/LaunchAgents/dev.claude-cli-chat.*.plist` point at absolute paths inside this repo — moving a daemon's folder means updating its plist and kickstarting the job.
 
 ## Commands
 
@@ -35,8 +48,8 @@ Build output path: `/Users/henryortega/Library/Mobile Documents/iCloud~md~obsidi
 - `src/mcp/McpServerList.ts`: `listMcpServersViaCli` + `parseMcpListOutput` — shells out to `claude mcp list` for the authoritative set of servers the spawned chat actually loads (incl. claude.ai account connectors).
 - Per-vault MCP disable: the MCP manager lists the real CLI servers; unchecking one records its name in `disabledServers`. At spawn, those become `mcp__<server>` deny rules passed via `--settings` (SubprocessManager.buildArgs), which removes the server's tools from the model's tool list. Scoped to the plugin's subprocesses only — other Claude Code instances and the server definitions are untouched. Patterns are cached on the plugin (`mcpDenyPatterns`, refreshed via `refreshMcpDenyPatterns`) so the synchronous spawn path can read them.
 - `src/permissions/PermissionsConfig.ts`: `can_use_tool` policy.
-- `scripts/`: out-of-tree shell + Python helpers (smoke tests, credit-pool forecaster). Not bundled.
-  - `scripts/watch-bridge/`: Apple Watch chat bridge — launchd daemon (`bridge.py`) holding one interactive `claude` session (no `--print`, subscription-cap billing) in a PTY over the vault, HTTP API for a watch Shortcut via Tailscale; `stop_hook.py` signals end-of-turn. Authoritative doc note lives in the vault.
+- `scripts/`: out-of-tree shell + Python helpers (TC001 animator, smoke tests, credit-pool forecaster). Not bundled.
+- `daemons/watch-bridge/`: Apple Watch chat bridge — launchd daemon (`bridge.py`) holding one interactive `claude` session (no `--print`, subscription-cap billing) in a PTY over the vault, HTTP API for a watch Shortcut via Tailscale; `stop_hook.py` signals end-of-turn. Authoritative doc note lives in the vault.
 
 ## Wire-format gotchas (do not regress)
 

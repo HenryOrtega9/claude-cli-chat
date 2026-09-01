@@ -81,7 +81,7 @@ export type SpawnOptions = {
       server's tools from the model's advertised tool list. */
   mcpDenyPatterns?: string[];
   /** Extra argv appended verbatim, just before the `--resume` pair. Added for
-      the iOS gateway daemon (`scripts/gateway/`), which needs flags the chat
+      the iOS gateway daemon (`daemons/gateway/`), which needs flags the chat
       UI has no use for: `--session-id <uuid>` (server-generated session id so
       a tab has an identity before its first spawn) and
       `--replay-user-messages` (the CLI echoes stdin user messages back on

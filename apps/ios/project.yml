@@ -1,0 +1,161 @@
+# XcodeGen manifest — the authoritative source for the VaultGateway target.
+# Regenerate with `xcodegen generate` from inside `ios/`; VaultGateway.xcodeproj,
+# Sources/Info.plist and Sources/VaultGateway.entitlements are all derived from
+# this file, so edit here and never in Xcode's inspector.
+name: VaultGateway
+
+options:
+  bundleIdPrefix: dev.henryortega
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: SHMR9277Y3
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: 1
+
+targets:
+  VaultGateway:
+    type: application
+    platform: iOS
+    sources:
+      # Secrets.swift is gitignored and holds local first-launch defaults;
+      # Secrets.example.swift is the committed template and must stay out of
+      # the compile sources or the `Secrets` enum is declared twice.
+      - path: Sources
+        excludes:
+          - "Secrets.example.swift"
+      # Blue folder reference: the whole tree is copied into the bundle as
+      # `Web/` with its directory layout intact, which is what the
+      # vaultgw:// scheme handler serves. Written by the shared-ui agent's
+      # `--ios` esbuild target; a placeholder index.html lives here until then.
+      - path: Web
+        type: folder
+        buildPhase: resources
+    entitlements:
+      path: Sources/VaultGateway.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.dev.henryortega.vaultgateway
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: "Claude & Second Brain"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # iPad runs native (device family 1,2). All four orientations are
+        # declared for iPad — required for Split View / Stage Manager
+        # multitasking eligibility (an iPad app that restricts orientations
+        # must otherwise declare UIRequiresFullScreen). iPhone stays
+        # portrait-only via the unsuffixed key above.
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIViewControllerBasedStatusBarAppearance: false
+        ITSAppUsesNonExemptEncryption: false
+        # So the banner's "Open Tailscale" button can canOpenURL-check first.
+        LSApplicationQueriesSchemes:
+          - tailscale
+        # Honest string: the app only probes/talks to the Mac running the
+        # gateway. On a tailnet that is not technically "local network", but
+        # iOS prompts for the raw-IP override path, so the copy has to be true
+        # for both.
+        NSLocalNetworkUsageDescription: >-
+          Claude & Second Brain connects to the Claude gateway running on your Mac.
+          If your Mac is on the same Wi-Fi instead of Tailscale, iOS needs
+          local network access to reach it.
+        # Scoped ATS exception, NOT NSAllowsArbitraryLoads. The gateway speaks
+        # plain HTTP inside the Tailscale WireGuard tunnel, so only the tailnet
+        # domain is excepted. ATS exception domains cannot name an IP literal,
+        # so the raw-IP override in Settings works only over https (or with the
+        # FQDN); see ios/README.md.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            tail92466c.ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true
+        # The Share Extension's hand-off channel: it cannot call
+        # UIApplication directly (app-extension-unavailable), so it uses
+        # `NSExtensionContext.open(_:completionHandler:)` on this scheme,
+        # which SwiftUI's `.onOpenURL` (VaultGatewayApp.swift) picks up to
+        # drain ios/Sources/ShareInbox.swift. No host/path is parsed — the
+        # URL is purely a wake-up signal, so one static entry covers it.
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.henryortega.vaultgateway.share
+            CFBundleURLSchemes:
+              - vaultgw-share
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.henryortega.vaultgateway
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+    dependencies:
+      - target: ShareExtension
+        embed: true
+
+  # The Share Sheet target: "Claude & Second Brain" in the row that appears
+  # when text, a URL, or an image is shared from another app. No storyboard,
+  # no compose UI — ShareViewController.swift writes the shared items into
+  # the App Group's ShareInbox/ folder and hands off to the main app via the
+  # vaultgw-share:// scheme above. See ios/README.md, "Share Extension".
+  ShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+    entitlements:
+      path: ShareExtension/ShareExtension.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.dev.henryortega.vaultgateway
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: "Claude & Second Brain"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          # Swift's default ObjC runtime name for an NSObject-rooted class is
+          # exactly "<ModuleName>.<ClassName>" — no @objc(...) override
+          # needed on ShareViewController for this string to resolve.
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsWebPageWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 4
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.henryortega.vaultgateway.share
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
+
+# Declared explicitly rather than leaning on Xcode's autocreated scheme, so
+# `xcodebuild -scheme VaultGateway` behaves the same on a fresh clone.
+schemes:
+  VaultGateway:
+    build:
+      targets:
+        VaultGateway: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    archive:
+      config: Release
