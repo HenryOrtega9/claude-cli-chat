@@ -1737,7 +1737,7 @@ export class TabController {
         break;
       }
       case "user": {
-        await this.handleUserEcho(event as { type: "user"; message: { role: "user"; content: Array<{ type: string; text?: string }> } });
+        await this.handleUserEcho(event as { type: "user"; message: { role: "user"; content: string | Array<{ type: string; text?: string }> } });
         break;
       }
       case "stream_event": {
@@ -1783,12 +1783,18 @@ export class TabController {
     this.onStateChangeCb();
   }
 
-  private async handleUserEcho(event: { message: { content: Array<{ type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } }) {
+  private async handleUserEcho(event: { message: { content: string | Array<{ type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } }) {
     /* Synthetic user turns from the CLI carry two kinds of blocks:
        - text blocks (real user input echoed back, OR skill bodies / file
          contents the CLI injects into the model's context behind the scenes)
-       - tool_result blocks (delivered back to the model after a tool ran) */
-    const blocks = event.message.content;
+       - tool_result blocks (delivered back to the model after a tool ran)
+       `content` is usually a block array, but some synthetic turns — notably
+       the <task-notification> wake-ups for finished background agents — carry
+       it as a PLAIN STRING. Iterating that string as blocks silently walks
+       its characters, so the notification never parses and the agent card
+       stays on Running forever. Normalize to one text block. */
+    const raw = event.message.content;
+    const blocks = typeof raw === "string" ? [{ type: "text", text: raw }] : raw;
 
     for (const block of blocks) {
       if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
@@ -2528,7 +2534,11 @@ export class TabController {
       /* Re-render so the swept tool row stops showing a running spinner. */
       if (touched) void this.renderer.upsertMessage(m);
     }
-    if (swept > 0) this.refreshRunningAgentCount();
+    /* Unconditional (not just when swept > 0): with background agents still
+       in flight this is also what flips the status pill from the thinking
+       spinner (hidden above) to "N agents running…", so the tail of the chat
+       doesn't read as fully settled while agents keep working. */
+    this.refreshRunningAgentCount();
     /* Turn settled. StateEmitter auto-transitions complete -> ready after
        10s (matches the daemon's COMPLETE_TIMEOUT_S), and the animator daemon
        times ready -> idle after 60s. A failed turn goes straight to ready —
@@ -2884,6 +2894,12 @@ export class TabController {
       }
     }
     this.inputBox.setRunningAgentCount(running);
+    /* Between turns, background agents are the only thing still working, so
+       surface them in the status pill ("N agents running…"). Mid-turn the
+       thinking spinner owns that surface — don't fight it. setAgentsRunning(0)
+       only hides a pill this mode itself put up, so the not-busy call is safe
+       even when no agents ever ran. */
+    if (!this.state.busy) this.statusIndicator.setAgentsRunning(running);
   }
 
   /* Best-effort vault-path resolution for items dropped from the Obsidian

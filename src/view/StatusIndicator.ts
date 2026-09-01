@@ -62,7 +62,7 @@ export class StatusIndicator {
   private wordTimer: number | null = null;
   private countdownTimer: number | null = null;
   private watchdogTimer: number | null = null;
-  private mode: "idle" | "thinking" | "retrying" = "idle";
+  private mode: "idle" | "thinking" | "retrying" | "agents" = "idle";
 
   /* Inactivity ceiling for the thinking spinner. Each inbound CLI event kicks
      this via heartbeat(), so it measures silence-since-last-event, not total
@@ -144,6 +144,31 @@ export class StatusIndicator {
       window.clearTimeout(this.watchdogTimer);
       this.watchdogTimer = null;
     }
+  }
+
+  /* Persistent "N agents running…" pill for the window between a turn's
+     result event and the background agents' <task-notification> wake-ups.
+     The turn itself is over (input unlocked, no thinking spinner), but work
+     the user is waiting on is still in flight — without this the tail of the
+     chat reads as if everything finished. No word cycle (the label is
+     literal) and no watchdog: a background agent can legitimately emit
+     nothing to this session for minutes, and its own liveness is tracked by
+     the JSONL tailer, not by CLI stream silence. count <= 0 hides the pill,
+     but only when this mode owns it — never clobbers a thinking/retrying
+     display some other path just armed. */
+  setAgentsRunning(count: number) {
+    if (count <= 0) {
+      if (this.mode === "agents") this.hide();
+      return;
+    }
+    this.mode = "agents";
+    this.clearTimers();
+    this.root.removeAttribute("title");
+    this.root.removeClass("is-retrying");
+    this.root.addClass("is-thinking");
+    this.root.style.display = "";
+    this.labelEl.setText(`${count} agent${count === 1 ? "" : "s"} running…`);
+    this.detailEl.setText("");
   }
 
   setRetrying(attempt: number, maxRetries: number, retryDelayMs: number) {
