@@ -69,6 +69,15 @@ export class MessageListRenderer {
      cleared bubble. Each upsert captures the generation it was queued under;
      doUpsert bails if it no longer matches, so post-reset stragglers are inert. */
   private generation = 0;
+  /* Per-id counterpart to `generation`. reset() invalidates every scheduled
+     continuation renderer-wide, but removeMessage() (the preamble-fold path)
+     only needs to invalidate continuations for the one id it just tore down —
+     bumping the global generation would also cancel every OTHER message's
+     in-flight render. Bumped in removeMessage(); dispatchUpsert snapshots the
+     current value per id and doUpsert bails if it no longer matches, so a
+     doUpsert already queued for an id before its removeMessage() runs can't
+     resurrect the bubble that removal just deleted. */
+  private removeEpoch = new Map<string, number>();
   /* Sticky per-message override for the thinking-block toggle. Set when the
      user clicks the header. Survives the empty()+rebuild cycle that happens
      on every streaming delta, so a user-collapsed block doesn't auto-reopen
@@ -243,6 +252,7 @@ export class MessageListRenderer {
     if (this.scrollBottomBtn) this.scrollBottomBtn.style.display = "none";
     this.liveEls.clear();
     this.toolEls.clear();
+    this.removeEpoch.clear();
     this.thinkingOpenOverride.clear();
     this.agentGroups.reset();
     /* Clear render chains too: a doUpsert queued behind an in-flight
@@ -375,9 +385,11 @@ export class MessageListRenderer {
        the chain settles so long-lived sessions don't leak. */
     const prev = this.renderChains.get(msg.id) ?? Promise.resolve();
     /* Snapshot the generation now, before the chain resolves: if reset() runs
-       while this upsert is queued, doUpsert sees the mismatch and bails. */
+       while this upsert is queued, doUpsert sees the mismatch and bails. Same
+       idea for removeEpoch, scoped to this one message id. */
     const gen = this.generation;
-    const next = prev.then(() => this.doUpsert(msg, gen));
+    const idEpoch = this.removeEpoch.get(msg.id) ?? 0;
+    const next = prev.then(() => this.doUpsert(msg, gen, idEpoch));
     this.renderChains.set(msg.id, next);
     next.finally(() => {
       if (this.renderChains.get(msg.id) === next) this.renderChains.delete(msg.id);
@@ -391,6 +403,13 @@ export class MessageListRenderer {
      a strict-prefix duplicate of the second). Also sweeps any tool elements
      nested inside the bubble so their entries in toolEls don't dangle. */
   removeMessage(id: string) {
+    /* Bump before the early return: a doUpsert for this id can already be
+       queued (its dispatchUpsert ran and captured the pre-bump epoch) even
+       when this id has no liveEls entry yet — e.g. the finalizing upsert for
+       a still-streaming message is suspended on the chain while THIS call
+       runs first. That queued doUpsert must still see the epoch mismatch and
+       bail instead of recreating the bubble this fold just removed. */
+    this.removeEpoch.set(id, (this.removeEpoch.get(id) ?? 0) + 1);
     const entry = this.liveEls.get(id);
     if (!entry) return;
     for (const [toolId, toolEl] of Array.from(this.toolEls)) {
@@ -416,11 +435,16 @@ export class MessageListRenderer {
     this.lastStreamRenderAt.delete(id);
   }
 
-  private async doUpsert(msg: ChatMessage, gen: number) {
+  private async doUpsert(msg: ChatMessage, gen: number, idEpoch: number) {
     /* Bail before createBubble if a reset() ran while this upsert was queued.
        Without this the missing liveEls entry would route us through createBubble
        and re-append a bubble to the cleared container — a zombie message. */
     if (gen !== this.generation) return;
+    /* Same bail, scoped to this id: removeMessage() ran for this exact message
+       (a preamble fold) while this upsert was queued behind it. Without this
+       the missing liveEls entry below routes us through createBubble and
+       re-appends the bubble removeMessage() just tore down. */
+    if (idEpoch !== (this.removeEpoch.get(msg.id) ?? 0)) return;
     let entry = this.liveEls.get(msg.id);
     if (!entry) {
       entry = this.createBubble(msg);

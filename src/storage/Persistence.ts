@@ -266,7 +266,17 @@ export class Persistence {
     if (existing) clearTimeout(existing.handle);
     const handle = setTimeout(() => {
       this.pendingWrites.delete(state.id);
-      void this.saveTab(this.snapshotState(state));
+      /* doSaveTab can throw (disk full, EACCES, a transient iCloud rename
+         lock — see writeJsonAtomic's own retry comment), and this dispatch
+         is otherwise fire-and-forget: an uncaught rejection here would be
+         an unhandled promise rejection with zero user-visible signal, and
+         the write is already off pendingWrites so flush()/flushSync() at
+         unload wouldn't know to retry it. Warn and re-arm so it isn't lost
+         from tracking — unless a newer edit already rescheduled this tab. */
+      void this.saveTab(this.snapshotState(state)).catch(err => {
+        console.warn(`[claude-cli-chat] debounced save failed for tab ${state.id}`, err);
+        if (!this.pendingWrites.has(state.id)) this.scheduleSaveTab(state);
+      });
     }, 500);
     this.pendingWrites.set(state.id, { handle, state });
   }
@@ -433,7 +443,9 @@ export class Persistence {
          last write wins. On hard quit the chained save never runs and the
          sync write stands. */
       if (this.inflightSaves.has(state.id)) {
-        void this.saveTab(snapshot);
+        void this.saveTab(snapshot).catch(err => {
+          console.warn(`[claude-cli-chat] post-flush save failed for tab ${state.id}`, err);
+        });
       }
     }
     /* Re-assert the newest index payload — if its async write was still in

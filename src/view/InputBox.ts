@@ -717,11 +717,18 @@ export class InputBox {
        cursor travel from pill to popup without the popup vanishing
        mid-flight. closeNow / scheduleClose live as instance methods so
        the popup-side handlers can call into them too. */
-    this.costPill.addEventListener("mouseenter", () => this.openCostPopup());
-    this.costPill.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
-    /* Click also toggles the popup (in addition to hover) so keyboard /
-       touch users have a stable affordance. Tapping the pill while the
-       popup is open closes it. */
+    /* Hover open/close is desktop-only. A touch tap synthesizes mouseenter
+       right before click (standard mobile ghost-mouse-event order), so on a
+       touch host wiring both would have mouseenter open the popup and the
+       click handler below immediately see it open and close it again —
+       same tap, popup never stays open. Touch gets click-to-toggle alone. */
+    if (!TOUCH_PRIMARY) {
+      this.costPill.addEventListener("mouseenter", () => this.openCostPopup());
+      this.costPill.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
+    }
+    /* Click also toggles the popup (in addition to hover, on desktop) so
+       keyboard / touch users have a stable affordance. Tapping the pill
+       while the popup is open closes it. */
     this.costPill.addEventListener("click", e => {
       e.stopPropagation();
       if (this.costPopup && this.costPopup.style.display !== "none") {

@@ -1,4 +1,6 @@
-import { ItemView, WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, ItemView, WorkspaceLeaf } from "obsidian";
+import { promises as fs } from "node:fs";
+import { join } from "node:path";
 import type ClaudeChatPlugin from "../main";
 import { renderHeader } from "./Header";
 import { TabBar, type TabBadgeState } from "./TabBar";
@@ -72,24 +74,27 @@ export class ClaudeChatView extends ItemView {
     root.addClass("claudian-container");
     root.setAttribute("data-provider", "claude");
 
-    /* Check the multi-window lock BEFORE setting up any UI. If another live
-       window holds it, we short-circuit with a placeholder. */
-    const lockHolder = await this.checkWindowLock();
-    if (lockHolder !== null) {
-      this.renderAlreadyOpenPlaceholder(root as HTMLElement, lockHolder);
-      return;
-    }
-    /* Foreign-process check passed; now guard against a SECOND leaf of this
-       view in OUR process (split pane, or a restored layout with two Claude
-       leaves). The on-disk lock can't catch that case — both leaves share the
-       PID — so a process-local singleton ensures only the first instance
-       restores tabs and acquires the lock. The rest render the placeholder. */
+    /* Guard against a SECOND leaf of this view in OUR process (split pane,
+       or a restored layout with two Claude leaves) BEFORE touching disk.
+       This check-then-set has no await between them, so it can't race
+       against another same-process leaf's onOpen. */
     if (activeChatViewInstance && activeChatViewInstance !== this) {
       this.renderAlreadyOpenPlaceholder(root as HTMLElement, process.pid);
       return;
     }
     activeChatViewInstance = this;
-    await this.acquireWindowLock();
+
+    /* Atomically claim the on-disk multi-window lock BEFORE setting up any
+       UI. If another live window (a different OS process) holds it, we
+       short-circuit with a placeholder. */
+    const lockHolder = await this.acquireWindowLock();
+    if (lockHolder !== null) {
+      /* Lost the race to a foreign process. Undo the singleton claim above
+         so it doesn't wrongly block a later leaf in this same process. */
+      if (activeChatViewInstance === this) activeChatViewInstance = null;
+      this.renderAlreadyOpenPlaceholder(root as HTMLElement, lockHolder);
+      return;
+    }
 
     renderHeader(root as HTMLElement, {
       onNewTab: () => this.createTab(),
@@ -112,51 +117,136 @@ export class ClaudeChatView extends ItemView {
     await this.restoreTabs();
   }
 
-  /* Returns the PID of the live window currently holding the lock, or null
-     if no live holder exists (lock missing, stale, or unreadable). */
-  private async checkWindowLock(): Promise<number | null> {
+  /* Absolute filesystem path of the vault root, or null when the adapter
+     isn't filesystem-backed (mirrors main.ts's own getVaultPath guard). */
+  private getVaultBasePath(): string | null {
     const adapter = this.app.vault.adapter;
-    try {
-      if (!(await adapter.exists(WINDOW_LOCK_PATH))) return null;
-      const raw = (await adapter.read(WINDOW_LOCK_PATH)).trim();
-      /* Lock payload is `<pid>:<uuid>`. Parse the PID off the front; older
-         locks may be a bare PID, which parseInt still reads correctly. */
-      const pid = parseInt(raw, 10);
-      if (!Number.isFinite(pid) || pid <= 0) return null;
-      /* A lock we wrote ourselves (exact token match) means this same view is
-         reopening (tab close/reopen) — treat as no foreign holder. */
-      if (raw === this.instanceToken) return null;
-      if (pid === process.pid) {
-        /* Same PID but a DIFFERENT token: a second leaf in our own process
-           wrote it. The singleton gate already blocks that path, but treat it
-           as held here too so the on-disk lock can't be silently overwritten
-           if the gate is ever bypassed. */
-        return pid;
-      }
-      try {
-        /* signal 0 doesn't deliver a signal; it tests whether the target is
-           still alive and accessible. Throws ESRCH if the process is gone. */
-        process.kill(pid, 0);
-        return pid;
-      } catch {
-        /* Stale lock from a crashed prior instance. Safe to overwrite. */
-        return null;
-      }
-    } catch {
-      return null;
-    }
+    return adapter instanceof FileSystemAdapter ? adapter.getBasePath() : null;
   }
 
-  private async acquireWindowLock(): Promise<void> {
+  /* Atomically claims the on-disk multi-window lock. Returns the PID of a
+     live foreign holder (blocked) or null (claimed — this.holdingLock is
+     now true).
+
+     Uses an exclusive create (node fs 'wx' flag) directly on the vault's
+     real filesystem path instead of the adapter's separate exists/read/write
+     used previously — 'wx' either creates the file or fails atomically, so
+     two windows opening together can no longer both observe the lock as
+     absent and both proceed (the exact TOCTOU this lock exists to prevent).
+     Falls back to the old adapter-based check+write when the vault isn't
+     filesystem-backed; that path has no atomicity guarantee but is not
+     expected to be reachable on this macOS-only plugin's supported host. */
+  private async acquireWindowLock(): Promise<number | null> {
+    const basePath = this.getVaultBasePath();
+    if (basePath === null) return this.acquireWindowLockViaAdapter();
+
+    const lockDir = join(basePath, WINDOW_LOCK_DIR);
+    const lockPath = join(basePath, WINDOW_LOCK_PATH);
+    try {
+      await fs.mkdir(lockDir, { recursive: true });
+    } catch (err) {
+      console.warn(`[claude-cli-chat] failed to create window lock dir:`, err);
+      return null;
+    }
+
+    /* One exclusive-create attempt, plus one retry each time we find and
+       clear a stale lock left by a crashed instance. A live foreign holder
+       returns immediately without looping. */
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const handle = await fs.open(lockPath, "wx");
+        try {
+          await handle.writeFile(this.instanceToken);
+        } finally {
+          await handle.close();
+        }
+        this.holdingLock = true;
+        return null;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+          console.warn(`[claude-cli-chat] failed to acquire window lock:`, err);
+          return null;
+        }
+      }
+      /* Lost the exclusive create — someone else's lock is already on disk.
+         Inspect it exactly like the old checkWindowLock did: our own token
+         means this same view is reopening, a live PID is a real foreign
+         holder, anything else is stale and safe to clear and retry. */
+      let raw = "";
+      try {
+        raw = (await fs.readFile(lockPath, "utf8")).trim();
+      } catch {
+        continue; // holder unlinked it between our failed open and this read
+      }
+      if (raw === this.instanceToken) return null;
+      const pid = parseInt(raw, 10);
+      if (Number.isFinite(pid) && pid > 0) {
+        if (pid === process.pid) {
+          /* Same PID but a different token: a second leaf in our own
+             process holds it. The singleton gate already blocks that path,
+             but treat it as held here too in case the gate is bypassed. */
+          return pid;
+        }
+        try {
+          /* signal 0 doesn't deliver a signal; it tests whether the target
+             is still alive and accessible. Throws ESRCH if it's gone. */
+          process.kill(pid, 0);
+          return pid; // live foreign holder
+        } catch {
+          /* Stale lock from a crashed prior instance — fall through to
+             clear it and retry the exclusive create below. */
+        }
+      }
+      try {
+        await fs.unlink(lockPath);
+      } catch {
+        /* Someone else cleared it first — fine, retry the create. */
+      }
+    }
+    /* Exhausted retries without ever finding a live foreign holder (each
+       attempt hit a stale/vanishing lock, not a real contender). Don't spin
+       forever — fall back to a best-effort non-exclusive write, matching
+       the old code's failure mode for the pathological case. */
+    try {
+      await fs.writeFile(lockPath, this.instanceToken);
+      this.holdingLock = true;
+    } catch (err) {
+      console.warn(`[claude-cli-chat] failed to acquire window lock after retries:`, err);
+    }
+    return null;
+  }
+
+  /* Fallback used only when the vault isn't filesystem-backed (see
+     acquireWindowLock). Same check-then-write shape as the pre-fix code:
+     not atomic, but there's no exclusive-create primitive on the adapter to
+     do better with. */
+  private async acquireWindowLockViaAdapter(): Promise<number | null> {
     const adapter = this.app.vault.adapter;
     try {
+      if (await adapter.exists(WINDOW_LOCK_PATH)) {
+        const raw = (await adapter.read(WINDOW_LOCK_PATH)).trim();
+        if (raw !== this.instanceToken) {
+          const pid = parseInt(raw, 10);
+          if (Number.isFinite(pid) && pid > 0) {
+            if (pid === process.pid) return pid;
+            try {
+              process.kill(pid, 0);
+              return pid;
+            } catch {
+              /* Stale lock from a crashed prior instance. Safe to overwrite. */
+            }
+          }
+        }
+      }
       if (!(await adapter.exists(WINDOW_LOCK_DIR))) {
         await adapter.mkdir(WINDOW_LOCK_DIR);
       }
       await adapter.write(WINDOW_LOCK_PATH, this.instanceToken);
       this.holdingLock = true;
+      return null;
     } catch (err) {
       console.warn(`[claude-cli-chat] failed to acquire window lock:`, err);
+      return null;
     }
   }
 

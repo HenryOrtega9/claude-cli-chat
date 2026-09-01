@@ -464,6 +464,17 @@ export class SubprocessManager {
      Used by the mtime-based session-file poll to avoid picking the same
      JSONL twice under parallel-spawn races. */
   private claimedSessionFiles = new Set<string>();
+  /* Which RemoteControlSession currently owns each path recorded above.
+     RemoteControlSession.sessionFile is never cleared once set, and three
+     independent sites here can end up releasing the same path for the same
+     session (a replace-on-reregister, the eventual onExit, and an explicit
+     unregisterRemote) — without this, a release from a session that no
+     longer owns the path (because it was disposed and the path already
+     passed to a new owner) would revoke that new owner's live claim. Only
+     entries claimed through registerRemote()'s onSessionFile hook are
+     tracked; releaseSessionFile() itself stays untouched so callers with no
+     notion of "owner" (SubagentSessionTracker) keep working unchanged. */
+  private sessionFileOwner = new Map<string, RemoteControlSession>();
 
   /* Returns true on first claim, false if the path was already claimed. The
      poll logic in RemoteControlSession uses this to skip files another
@@ -537,25 +548,44 @@ export class SubprocessManager {
   registerRemote(tabId: string, session: RemoteControlSession): void {
     const prior = this.remoteSessions.get(tabId);
     if (prior && prior !== session) {
-      if (prior.sessionFile) this.releaseSessionFile(prior.sessionFile);
+      this.releaseSessionFileIfOwner(prior);
       void prior.dispose();
     }
     this.remoteSessions.set(tabId, session);
     session.onSessionFile((path: string) => {
       /* Best-effort claim: the session may have already claimed the path
-         itself via the poll loop. Calling claim() again is a no-op. */
-      this.claimSessionFile(path);
+         itself via the poll loop. Calling claim() again is a no-op. Only
+         record ownership when the claim actually landed for `session` --
+         if it was already held by someone else (another session, or a
+         SubagentSessionTracker), `session` must never be allowed to
+         release it later. */
+      if (this.claimSessionFile(path)) this.sessionFileOwner.set(path, session);
     });
     session.onExit(() => {
       if (this.remoteSessions.get(tabId) === session) this.remoteSessions.delete(tabId);
-      if (session.sessionFile) this.releaseSessionFile(session.sessionFile);
+      this.releaseSessionFileIfOwner(session);
     });
   }
 
   unregisterRemote(tabId: string): void {
     const session = this.remoteSessions.get(tabId);
-    if (session?.sessionFile) this.releaseSessionFile(session.sessionFile);
+    if (session) this.releaseSessionFileIfOwner(session);
     this.remoteSessions.delete(tabId);
+  }
+
+  /* Releases `session.sessionFile` only if `session` is still its recorded
+     owner. Guards against the double-release/steal race: sessionFile is
+     never cleared on RemoteControlSession once set, so a replace-on-
+     reregister release, the session's own (possibly much later) onExit, and
+     an explicit unregisterRemote can all fire a release for the same path.
+     Once the path has passed to a new owner, a stale release must be a
+     no-op instead of revoking a claim `session` no longer holds. */
+  private releaseSessionFileIfOwner(session: RemoteControlSession): void {
+    const path = session.sessionFile;
+    if (!path) return;
+    if (this.sessionFileOwner.get(path) !== session) return;
+    this.sessionFileOwner.delete(path);
+    this.releaseSessionFile(path);
   }
 
   listRemote(): RemoteControlSession[] {
@@ -568,6 +598,7 @@ export class SubprocessManager {
     this.sessions.clear();
     this.remoteSessions.clear();
     this.claimedSessionFiles.clear();
+    this.sessionFileOwner.clear();
     await Promise.all([...local, ...remote]);
   }
 

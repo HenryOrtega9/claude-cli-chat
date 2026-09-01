@@ -1546,6 +1546,17 @@ export class TabController {
        silently overridden and the message sent anyway. Honor the cancel:
        leave the bubble in place but never send. */
     if (this.userCancelInitiated) {
+      /* This session was just spawned by the ensureSession() await above but
+         never got a message written to its stdin, so nothing else will ever
+         tear it down (wire-format gotcha #1: no user message means the CLI
+         never even emits system/init, let alone exits on its own). Dispose it
+         here like the destroyed branch above — guarded on identity in case a
+         concurrent submit() already claimed this.session, so we never dispose
+         a session out from under a legitimate in-flight turn. */
+      if (this.session === session) {
+        this.session = null;
+        void session.dispose();
+      }
       this.state.busy = false;
       this.inputBox.setBusy(false);
       this.statusIndicator.hide();
@@ -2627,8 +2638,13 @@ export class TabController {
      subagent trackers, flip running tool rows to errored, re-render them, and
      refresh the Agents pill count. Idempotent: empty maps / no running tools
      => no-op, so paths that already tore the session down (and any double
-     handleError → onExit sequence) cost nothing. */
+     handleError → onExit sequence) cost nothing.
+
+     Also forgets this tab's speech channel, same as handleResult — an
+     errored/killed pass never reaches handleResult, so without this the
+     SpeechController's stream-offset entry for it would never be dropped. */
   private reconcileAbortedTurn(): void {
+    this.plugin.speech.forgetChannel(this.state.id);
     for (const tracker of this.subagentTrackers.values()) {
       void tracker.stop();
     }
