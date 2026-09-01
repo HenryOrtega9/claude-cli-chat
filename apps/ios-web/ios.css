@@ -470,6 +470,14 @@ body {
 
 #app .claudian-send-button {
   margin-left: auto;
+  /* The row scrolls horizontally when the pills outgrow a phone width (a
+     long model name, the usage donut appearing mid-session). Sticky pins
+     send/stop to the scrollport's right edge so the one control that must
+     always be tappable never scrolls off-screen; the pills slide under it.
+     Solid brand background means nothing shows through. */
+  position: sticky;
+  right: 0;
+  z-index: 1;
 }
 
 /* ---- Top toolbar row (mode, incognito, voice, model) --------
