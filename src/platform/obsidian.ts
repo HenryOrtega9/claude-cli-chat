@@ -24,6 +24,7 @@ import {
   TFile,
   TFolder,
 } from "obsidian";
+import { transcodeImageToJpeg } from "./node-transcode";
 import type {
   FileStorage,
   HttpRequestOptions,
@@ -224,6 +225,10 @@ export class ObsidianPlatform implements Platform {
 
   notify(message: string, timeoutMs?: number): void {
     new Notice(message, timeoutMs);
+  }
+
+  transcodeImage(bytes: Uint8Array, mediaType: string): Promise<{ bytes: Uint8Array; mediaType: string } | null> {
+    return transcodeImageToJpeg(bytes, mediaType);
   }
 
   setIcon(el: HTMLElement, iconId: string): void {

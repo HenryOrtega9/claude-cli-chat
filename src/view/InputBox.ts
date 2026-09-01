@@ -117,6 +117,57 @@ function guessMimeFromName(name: string): string {
   return EXT_MIME[ext] ?? "";
 }
 
+/* The only image media types Claude's API accepts in an image block. Anything
+   else (iPhone HEIC screenshots being the case that actually bites) has to be
+   transcoded at attach time or the turn fails downstream with an opaque
+   "could not process image" error. */
+const API_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/* Decode + re-encode through a canvas. Works wherever the renderer can decode
+   the source format: WKWebView (iOS) decodes HEIC natively, so this is the
+   whole fix on the phone; Chromium (Obsidian, Electron) cannot, and throws
+   here into the host's sips fallback. JPEG has no alpha channel, so paint
+   white first — screenshots are opaque anyway. */
+async function canvasTranscodeToJpeg(bytes: Uint8Array, mime: string): Promise<Uint8Array> {
+  const bitmap = await createImageBitmap(new Blob([bytes as Uint8Array<ArrayBuffer>], { type: mime }));
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("no 2d context");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0);
+    const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", 0.9));
+    if (!blob) throw new Error("JPEG encode failed");
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    bitmap.close();
+  }
+}
+
+/* Normalize raw image bytes into something the API will take: supported types
+   pass through untouched, everything else tries the canvas, then the host's
+   native transcoder (macOS sips on the desktop shells; absent on iOS). HEIC
+   that survives both is a hard error — attaching it as-is is a guaranteed
+   turn failure, and the thrown message surfaces through the caller's notify.
+   Other exotic types (bmp, svg) keep their old pass-through behavior. */
+async function toApiImage(bytes: Uint8Array, mime: string): Promise<{ data: string; mediaType: string }> {
+  if (API_IMAGE_MIMES.has(mime)) return { data: bytesToBase64(bytes), mediaType: mime };
+  try {
+    return { data: bytesToBase64(await canvasTranscodeToJpeg(bytes, mime)), mediaType: "image/jpeg" };
+  } catch {
+    /* fall through to the host transcoder */
+  }
+  const native = await platform.transcodeImage?.(bytes, mime).catch(() => null);
+  if (native) return { data: bytesToBase64(native.bytes), mediaType: native.mediaType };
+  if (mime === "image/heic" || mime === "image/heif") {
+    throw new Error("couldn't convert HEIC to JPEG");
+  }
+  return { data: bytesToBase64(bytes), mediaType: mime };
+}
+
 /* Cap on bytes a single attachment may carry. Base64 inflates by ~4/3, and
    text attachments get re-embedded into wireText, so very large files would
    blow past Claude's per-turn input limit and waste tokens regardless. 10MB
@@ -2003,12 +2054,14 @@ export class InputBox {
          broke image paste. Blob.arrayBuffer() works universally. */
       try {
         const buf = await file.arrayBuffer();
+        const img = await toApiImage(new Uint8Array(buf), file.type);
         if (this.destroyed || this.attachments !== target) return;
-        const data = bytesToBase64(new Uint8Array(buf));
-        this.attachments.push({ kind: "image", mediaType: file.type, data });
+        this.attachments.push({ kind: "image", mediaType: img.mediaType, data: img.data });
         this.renderAttachmentChips();
       } catch (err) {
         console.error("claude-cli-chat: failed to read pasted image", err);
+        const msg = err instanceof Error ? err.message : String(err);
+        platform.notify(`Couldn't attach pasted image: ${msg}`);
       }
     }
   }
@@ -2141,10 +2194,11 @@ export class InputBox {
     const mime = file.type || guessMimeFromName(file.name);
     if (mime.startsWith("image/")) {
       const buf = await file.arrayBuffer();
+      const img = await toApiImage(new Uint8Array(buf), mime);
       return {
         kind: "image",
-        mediaType: mime,
-        data: bytesToBase64(new Uint8Array(buf)),
+        mediaType: img.mediaType,
+        data: img.data,
         filename: file.name,
       };
     }

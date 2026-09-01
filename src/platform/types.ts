@@ -218,4 +218,9 @@ export interface Platform {
   storage: FileStorage;
   /* Absent outside Obsidian — consumers must feature-check. */
   vaultFeatures?: VaultFeatures;
+  /* Convert an image Claude's API can't ingest (HEIC/HEIF chiefly) into one
+     it can. The node hosts back this with macOS `sips`; absent on iOS, where
+     WKWebView decodes HEIC natively so the canvas path in InputBox already
+     covers it. null = the host tried and couldn't. */
+  transcodeImage?(bytes: Uint8Array, mediaType: string): Promise<{ bytes: Uint8Array; mediaType: string } | null>;
 }

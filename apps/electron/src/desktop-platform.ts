@@ -28,6 +28,7 @@ import { renderIcon } from "../../../src/platform/dom/desktop-icons";
 import { DomModalHost, DomSuggestModalHost, showContextMenuAt, showToast } from "../../../src/platform/dom/desktop-overlays";
 import { installDomHelpers } from "../../../src/platform/dom/dom-polyfill";
 import { NodeFileStorage } from "./desktop-storage";
+import { transcodeImageToJpeg } from "../../../src/platform/node-transcode";
 import { renderMarkdownInto } from "../../../src/platform/dom/markdown";
 
 export class DesktopPlatform implements Platform {
@@ -43,6 +44,10 @@ export class DesktopPlatform implements Platform {
 
   notify(message: string, timeoutMs?: number): void {
     showToast(message, timeoutMs);
+  }
+
+  transcodeImage(bytes: Uint8Array, mediaType: string): Promise<{ bytes: Uint8Array; mediaType: string } | null> {
+    return transcodeImageToJpeg(bytes, mediaType);
   }
 
   setIcon(el: HTMLElement, iconId: string): void {
