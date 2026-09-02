@@ -31,9 +31,13 @@ import {
   MODEL_IDS,
   MODEL_LABELS,
   MODEL_NOTES,
+  PERMISSION_MODE_DESCRIPTIONS,
+  PERMISSION_MODE_LABELS,
+  PERMISSION_MODE_ORDER,
   effortLevelsForModel,
   type EffortLevel,
   type ModelKey,
+  type PermissionMode,
 } from "../../../src/settings-data";
 import type { RemoteHost } from "../../../src/platform/remote/RemoteHost";
 import type { GatewayTransport } from "../../../src/platform/remote/transport";
@@ -106,9 +110,26 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
   effortRow.createSpan({ cls: "vaultgw-settings-label", text: "Reasoning effort" });
   const effortSelect = effortRow.createEl("select", { cls: "vaultgw-settings-select" });
 
+  /* bypassPermissions is not a legal value anywhere in this client (see
+     RemoteHost.loadDeviceSettings and the composer popup filter in shell.ts),
+     so the picker never offers it. */
+  const modeRow = body.createDiv({ cls: "vaultgw-settings-row" });
+  modeRow.createSpan({ cls: "vaultgw-settings-label", text: "Permission mode" });
+  const modeSelect = modeRow.createEl("select", { cls: "vaultgw-settings-select" });
+  const modes = PERMISSION_MODE_ORDER.filter((m) => m !== "bypassPermissions");
+  for (const mode of modes) {
+    modeSelect.createEl("option", { value: mode, text: PERMISSION_MODE_LABELS[mode] });
+  }
+  const modeNote = body.createDiv({ cls: "vaultgw-settings-note" });
+  function renderModeNote(): void {
+    modeNote.setText(PERMISSION_MODE_DESCRIPTIONS[modeSelect.value as PermissionMode] ?? "");
+  }
+  modeSelect.value = modes.includes(host.settings.permissionMode) ? host.settings.permissionMode : "acceptEdits";
+  renderModeNote();
+
   body.createDiv({
     cls: "vaultgw-settings-hint",
-    text: "Seeds every new chat. Chats already open keep the model and effort they were started with — change those from the composer's pills.",
+    text: "Seeds every new chat. Chats already open keep the model, effort and permission mode they were started with — change those from the composer's pills.",
   });
 
   /* Rebuilds the effort options for the current model and clamps the stored
@@ -152,6 +173,13 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
   effortSelect.addEventListener("change", () => {
     transport.haptic("selection");
     host.settings.defaultEffort = effortSelect.value as EffortLevel;
+    void host.saveSettings();
+  });
+
+  modeSelect.addEventListener("change", () => {
+    transport.haptic("selection");
+    host.settings.permissionMode = modeSelect.value as PermissionMode;
+    renderModeNote();
     void host.saveSettings();
   });
 
