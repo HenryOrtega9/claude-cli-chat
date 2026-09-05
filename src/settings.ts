@@ -17,6 +17,9 @@ import {
   PERMISSION_MODE_LABELS,
   PERMISSION_MODE_DESCRIPTIONS,
   makeSnippetId,
+  clampTypewriterSpeed,
+  TYPEWRITER_SPEED_MIN,
+  TYPEWRITER_SPEED_MAX,
   type ModelKey,
   type EffortLevel,
   type PermissionMode,
@@ -178,6 +181,29 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("Animate replies")
+      .setDesc("Type out Claude's text as it streams in, instead of painting each chunk the moment it arrives. Restored history is never animated. Applies to the next reply.")
+      .addToggle(t =>
+        t.setValue(this.plugin.settings.typewriterEnabled).onChange(async value => {
+          this.plugin.settings.typewriterEnabled = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Animation speed")
+      .setDesc(`Characters per second for the reply animation (${TYPEWRITER_SPEED_MIN}–${TYPEWRITER_SPEED_MAX}). The reveal speeds up on its own whenever it falls more than a couple of seconds behind the live stream, so a fast reply still finishes promptly.`)
+      .addSlider(sl =>
+        sl.setLimits(TYPEWRITER_SPEED_MIN, TYPEWRITER_SPEED_MAX, 10)
+          .setValue(clampTypewriterSpeed(this.plugin.settings.typewriterSpeed))
+          .setDynamicTooltip()
+          .onChange(async value => {
+            this.plugin.settings.typewriterSpeed = clampTypewriterSpeed(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
     containerEl.createEl("h3", { text: "Vault system prompt" });
     containerEl.createEl("p", {
       text: "Additional instructions appended to Claude's system prompt on every spawn. Scoped to this vault only — equivalent to a vault-level CLAUDE.md addition. Composes with any env-snippet addendum (both apply if both are set). Takes effect on the next subprocess restart (new tab, /clear, or sending the next message in a fresh tab).",
@@ -208,6 +234,16 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       .addToggle(t =>
         t.setValue(this.plugin.settings.autoGenerateTitles).onChange(async value => {
           this.plugin.settings.autoGenerateTitles = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Suggest a reply")
+      .setDesc("After each reply, run Haiku over the last exchange to propose your next message. It appears as ghost text in the composer: press Tab to use it, or just type and it goes away. Skipped in incognito tabs.")
+      .addToggle(t =>
+        t.setValue(this.plugin.settings.replySuggestions).onChange(async value => {
+          this.plugin.settings.replySuggestions = value;
           await this.plugin.saveSettings();
         })
       );

@@ -222,11 +222,13 @@ export class IosChatShell {
 
     this.tabsContainer = this.root.createDiv({ cls: "claudian-tab-content-container" });
 
-    /* See RemoteHost.generateTitle: it needs to map a TitleGenOptions with no
-       tab id back to a tab, and the first user message is the one identifying
-       value available at the moment the controller fires it. */
+    /* See RemoteHost.generateTitle / suggestReply: neither options type
+       carries a tab id, so the message text is the one identifying value
+       available at the moment the controller fires. Title passes the first
+       user message, reply suggestion passes the last, so match against every
+       user message in the tab rather than only the opening one. */
     this.host.setTabResolver(userMessage => {
-      const match = this.tabs.find(t => t.state.messages.find(m => m.role === "user")?.content === userMessage);
+      const match = this.tabs.find(t => t.state.messages.some(m => m.role === "user" && m.content === userMessage));
       return match?.state.id ?? null;
     });
     this.conn.onLinkState(state => this.renderLinkState(state));

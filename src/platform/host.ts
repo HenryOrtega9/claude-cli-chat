@@ -32,6 +32,7 @@ import type { StreamEvent } from "../claude/Events";
 import type { DisplayState } from "../claude/StateEmitter";
 import type { SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
 import type { TitleGenOptions } from "../claude/TitleGenerator";
+import type { ReplySuggestOptions } from "../claude/ReplySuggester";
 
 /* Mirror of SelectionTracker's ActiveSelection. Canonical shared shape —
    after migration, SelectionTracker and InputBox both reference this type
@@ -168,6 +169,10 @@ export interface PluginHost {
   /* One-shot `claude --print` auto-title pass. Absent => the tab keeps its
      placeholder title. */
   generateTitle?(opts: TitleGenOptions): Promise<string | null>;
+
+  /* One-shot `claude --print` pass proposing the user's next message after a
+     turn. Absent => the composer shows no reply suggestion. */
+  suggestReply?(opts: ReplySuggestOptions): Promise<string | null>;
 
   /* `claude remote-control` in a PTY. Absent => the mode toggle has nothing
      to start. */

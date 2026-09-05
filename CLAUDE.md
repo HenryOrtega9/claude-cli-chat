@@ -35,7 +35,9 @@ Build output path: `/Users/henryortega/Library/Mobile Documents/iCloud~md~obsidi
   - `RemoteControlSession.ts`: pty-proxied `claude --remote` flow (inline Python `pty.fork()`).
   - `JsonlTailer.ts`: follows `~/.claude/projects/.../session.jsonl` for resume support.
   - `SkillDiscovery.ts`: scans disk for skills + slash commands at plugin load.
-  - `TitleGenerator.ts`: auto-titles new tabs.
+  - `QuickPrompt.ts`: shared one-shot `claude --print` side-pass spawner (Haiku, tools off, no session persistence).
+  - `TitleGenerator.ts`: auto-titles new tabs (via QuickPrompt).
+  - `ReplySuggester.ts`: proposes the user's next message after each turn; surfaces as Tab-to-accept ghost text in `InputBox` (via QuickPrompt).
 - `src/view/`: Obsidian view and DOM.
   - `ClaudeChatView.ts`: the `ItemView` shell.
   - `TabController.ts`: the heart of the plugin. Owns tab state, routes CLI events into `ChatMessage` entries, handles all submit / cancel / approval / tool-result orchestration. ~1.4k lines; grep before adding a new method.
@@ -59,7 +61,7 @@ Each of these was a load-bearing bug we hit and fixed. Authoritative reference i
 2. `tool_use` blocks live INSIDE the assistant message's `content[]` array, not as top-level `tool_use` events. Filtering `content` to text-only drops tools silently.
 3. `tool_result` blocks live INSIDE synthetic `user`-type events (`event.type === "user"`, content blocks with `type: "tool_result"`). Missing this leaves tools stuck on "RUNNING" forever.
 4. The `can_use_tool` control_response schema is `{ behavior: "allow", updatedInput }` or `{ behavior: "deny", message }`. Any other shape produces a Zod parse error that the CLI returns as a synthetic tool_result, which the model then narrates as "harness ZodError".
-5. Model `[1m]` suffix gating: Opus 5 1M, Opus (4.x) 1M, Fable 5 1M, and Sonnet 5 1M support `xhigh` effort (CLI-verified for Sonnet 5 on 2026-07-08 and Opus 5 on 2026-07-24); other models top out at `max`.
+5. Model `[1m]` suffix gating: Opus 1M, Fable 5 1M, and Sonnet 5 1M support `xhigh` effort (CLI-verified for Sonnet 5 on 2026-07-08); other models top out at `max`.
 6. Synthetic `user` events usually carry `message.content` as a block array, but some — notably the `<task-notification>` wake-ups for finished background agents — carry it as a PLAIN STRING. Iterating a string as blocks walks its characters silently, so the notification never parses and agent cards stay on Running forever. Normalize string content to one text block first (`handleUserEcho`).
 7. `--no-session-persistence` (incognito) suppresses the conversation transcript but the CLI STILL writes a one-line `ai-title` record to `~/.claude/projects/<slug>/<session-id>.jsonl`, and that title summarizes the chat. Neither `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` nor any flag stops it. Incognito tabs therefore delete their own session files on teardown (`TabController.cleanupIncognitoSessionFiles`) rather than trusting the flag alone.
 

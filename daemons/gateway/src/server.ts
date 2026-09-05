@@ -298,6 +298,7 @@ export class GatewayServer {
         }
         case "POST approve": return this.postApprove(req, res, engine);
         case "POST title": return this.postTitle(res, engine);
+        case "POST suggest": return this.postSuggest(res, engine);
         case "GET events": return this.getEvents(res, engine, url);
         default: return sendJson(res, 404, { error: "not_found" });
       }
@@ -407,6 +408,27 @@ export class GatewayServer {
     engine.setTitle(title);
     await this.deps.registry.saveIndex();
     sendJson(res, 200, { title });
+  }
+
+  /* The phone's half of the reply-suggestion pass: the desktop hosts run
+     suggestReply in-process, the phone has no `claude` to spawn, so the
+     daemon runs it against its own projection of the conversation. Fired
+     after the turn has landed, so unlike title there is nothing to poll for. */
+  private async postSuggest(res: ServerResponse, engine: TabEngine): Promise<void> {
+    const exchange = engine.lastExchange();
+    if (!exchange) return sendJson(res, 400, { error: "no_messages" });
+    /* Lazy for the same reason as postTitle: a throwaway `claude --print`
+       spawner most tabs never reach has no business in the boot path. */
+    const { suggestReply } = await import("../../../src/claude/ReplySuggester");
+    const suggestion = await suggestReply({
+      userMessage: exchange.userMessage,
+      assistantResponse: exchange.assistantResponse,
+      claudePath: this.deps.claudePath,
+      model: "haiku",
+      cwd: this.deps.config.vault,
+      incognito: engine.incognito,
+    });
+    sendJson(res, 200, { suggestion });
   }
 
   private async getEvents(res: ServerResponse, engine: TabEngine, url: URL): Promise<void> {

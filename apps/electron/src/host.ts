@@ -36,6 +36,7 @@ import {
   writeSubagentFile as writeSubagentFileImpl,
 } from "../../../src/platform/node-capabilities";
 import { generateTitle as generateTitleImpl } from "../../../src/claude/TitleGenerator";
+import { suggestReply as suggestReplyImpl } from "../../../src/claude/ReplySuggester";
 import type {
   SubagentFileResult,
   SubagentTrackerHandle,
@@ -225,6 +226,7 @@ export class DesktopHost implements PluginHost {
   createJsonlTailer = createJsonlTailerImpl;
   createRemoteControlSession = createRemoteControlSessionImpl;
   generateTitle = generateTitleImpl;
+  suggestReply = suggestReplyImpl;
   openPathExternally = openPathExternallyImpl;
 
   createSubagentTracker(opts: SubagentTrackerRequest): SubagentTrackerHandle {

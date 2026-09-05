@@ -212,6 +212,20 @@ export type ClaudeChatSettings = {
   voiceDefaultOn: boolean;
   voiceName: string;
   voiceRate: number;
+  /* Typewriter reveal for assistant text. When enabled, new assistant
+     bubbles paint their text progressively at ~typewriterSpeed characters
+     per second instead of jumping to whatever the stream has delivered so
+     far (MessageRenderer owns the reveal cursor). The reveal never lags the
+     real stream by more than a couple of seconds: it speeds up when the
+     backlog grows, so a long reply finishes shortly after the CLI does.
+     Restored history never animates. */
+  typewriterEnabled: boolean;
+  typewriterSpeed: number;
+  /* After each successful turn, run a small model over the last exchange to
+     propose the user's next message. Shows as ghost text in the composer;
+     Tab accepts it, typing dismisses it. Skipped for incognito tabs (the
+     one-shot subprocess leaves an ai-title record on disk, gotcha #7). */
+  replySuggestions: boolean;
   /* Last-known MCP tool list per server, keyed by the sanitized server name
      the CLI uses in `mcp__<server>__<tool>` ids. Written on every init event;
      read as a fallback by the cost-surface pill so tool counts show before
@@ -239,6 +253,9 @@ export const DEFAULT_SETTINGS: ClaudeChatSettings = {
   voiceDefaultOn: false,
   voiceName: "",
   voiceRate: 1,
+  typewriterEnabled: true,
+  typewriterSpeed: 120,
+  replySuggestions: true,
   mcpToolCache: {},
 };
 
@@ -253,6 +270,15 @@ export function trustedFolderAllowPatterns(absolutePath: string): string[] {
     `Glob(${normalized}/**)`,
     `Grep(${normalized}/**)`,
   ];
+}
+
+/* Bounds for the typewriter speed slider (characters per second). Kept
+   here so the settings UI and the renderer's clamp agree. */
+export const TYPEWRITER_SPEED_MIN = 30;
+export const TYPEWRITER_SPEED_MAX = 400;
+export function clampTypewriterSpeed(cps: number): number {
+  if (!Number.isFinite(cps)) return DEFAULT_SETTINGS.typewriterSpeed;
+  return Math.min(TYPEWRITER_SPEED_MAX, Math.max(TYPEWRITER_SPEED_MIN, cps));
 }
 
 export function makeSnippetId(): string {

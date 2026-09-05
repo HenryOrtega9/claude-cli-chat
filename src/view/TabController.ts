@@ -18,7 +18,7 @@ import type {
 import type { TabSessionLike, RemoteControlSessionLike, SubprocessManagerLike } from "../platform/engine";
 import { makeMessageId, makeTabState, NESTED_EVENTS_CAP, type ChatMessage, type TabState, type PendingApproval, type ToolCall, type NestedSubagentEvent } from "./state";
 import { spawnOptionsFromSettings } from "../claude/spawn-options";
-import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings-data";
+import { resolveModelId, trustedFolderAllowPatterns, effortLevelsForModel, clampTypewriterSpeed, MODEL_IDS, EFFORT_ORDER, PERMISSION_MODE_ORDER, type ModelKey, type EffortLevel, type PermissionMode, type EnvSnippet, type TrustedFolder } from "../settings-data";
 import { PermissionsConfigStore } from "../permissions/PermissionsConfig";
 import type { SubagentTrackerUpdate } from "../claude/SubagentSessionTracker";
 import { translateNestedEvent } from "../claude/nestedEventTranslation";
@@ -234,6 +234,14 @@ export class TabController {
     });
 
     this.renderer = new MessageListRenderer(null, this.component, this.messagesEl);
+    /* Getter, not a snapshot: the settings tab mutates plugin.settings in
+       place, so the next tick/bubble sees a speed or toggle change without a
+       rebuild. `!== false` keeps hosts whose persisted settings predate the
+       field (iOS localStorage, older data.json) on the default-on path. */
+    this.renderer.setTypewriter(() => ({
+      enabled: this.plugin.settings.typewriterEnabled !== false,
+      cps: clampTypewriterSpeed(this.plugin.settings.typewriterSpeed),
+    }));
     this.renderer.setActionCallbacks({
       onFork: messageId => this.onForkRequest?.(this, messageId),
     });
@@ -420,6 +428,9 @@ export class TabController {
     this.inputBox.setBusy(true);
     this.replayDone = this.replayMessages().finally(() => {
       if (!this.state.busy) this.inputBox.setBusy(false);
+      /* Restored history painted in full above; from here on new assistant
+         bubbles type out (when the setting is on). */
+      this.renderer.setTypewriterArmed(true);
       /* After replay, surface any in-flight Task/Agent tools the persisted
          state still has marked running. Resumed tabs from a hard reload may
          carry stale "running" statuses; surfacing them is honest to what's
@@ -1043,6 +1054,7 @@ export class TabController {
        to the discarded conversation. */
     this.state.draft = undefined;
     this.inputBox.clearDraftUi();
+    this.dropReplySuggestion();
     this.updateWelcomeVisibility();
     this.onStateChangeCb();
     /* Reset the TC001 to "ready" so it doesn't sit on whatever state the
@@ -1402,6 +1414,10 @@ export class TabController {
      doesn't suppress the new turn's events. */
     this.errorBubbleEmitted = false;
     this.userCancelInitiated = false;
+
+    /* A new turn makes the previous turn's reply suggestion stale — including
+       one still being generated, which the sequence bump discards on arrival. */
+    this.dropReplySuggestion();
 
     /* A new message interrupts this tab's speech still reading the previous
        response — matches the mobile voice-mode feel where talking over
@@ -2593,6 +2609,63 @@ export class TabController {
 
     /* Title generation was already kicked off in submit() — it runs in
        parallel with the assistant response. Nothing to do here. */
+
+    /* Reply suggestion: needs the finished reply, so this is the earliest it
+       can start. A failed turn has nothing sensible to follow up on. */
+    if (!turnFailed) void this.maybeSuggestReply();
+  }
+
+  /* Monotonic guard for the reply-suggestion pass. Bumped by every submit
+     and clear so a suggestion generated for an earlier exchange can't land
+     in the composer after the conversation has moved on. */
+  private replySuggestionSeq = 0;
+
+  private dropReplySuggestion(): void {
+    this.replySuggestionSeq++;
+    this.inputBox.setReplySuggestion(null);
+  }
+
+  private async maybeSuggestReply(): Promise<void> {
+    if (this.plugin.settings.replySuggestions === false) return;
+    if (!this.plugin.suggestReply) return;
+    /* Incognito tabs must touch no disk — the side pass leaves an ai-title
+       jsonl behind (gotcha #7) that no cleanup path reclaims. */
+    if (this.state.incognito) return;
+    /* Last exchange: the most recent user bubble and the most recent
+       assistant text after it. Multi-pass tool turns produce several
+       assistant messages; the final one with text is the answer the user
+       actually read. */
+    let lastUserIdx = -1;
+    for (let i = this.state.messages.length - 1; i >= 0; i--) {
+      if (this.state.messages[i].role === "user") { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx < 0) return;
+    const lastUser = this.state.messages[lastUserIdx];
+    let lastAssistant: ChatMessage | undefined;
+    for (let i = this.state.messages.length - 1; i > lastUserIdx; i--) {
+      const m = this.state.messages[i];
+      if (m.role === "assistant" && m.content.trim().length > 0) { lastAssistant = m; break; }
+    }
+    if (!lastAssistant) return;
+    const seq = this.replySuggestionSeq;
+    /* Hard-pinned to Haiku 4.5 for the same reason as title generation: a
+       one-shot, ~15-word side pass after every turn must not drift onto a
+       frontier model through a settings typo. */
+    const suggestion = (await this.plugin.suggestReply({
+      userMessage: lastUser.content,
+      assistantResponse: lastAssistant.content,
+      claudePath: this.plugin.settings.claudePath || undefined,
+      model: "claude-haiku-4-5-20251001",
+      cwd: this.plugin.getVaultPath(),
+      incognito: this.state.incognito,
+    })) ?? null;
+    /* The pass outlives teardown and takes a few seconds; only surface the
+       result if this exact exchange is still the latest thing on screen. */
+    if (this.destroyed) return;
+    if (seq !== this.replySuggestionSeq) return;
+    if (this.state.busy) return;
+    if (!suggestion) return;
+    this.inputBox.setReplySuggestion(suggestion);
   }
 
   private titleGenerationStarted = false;

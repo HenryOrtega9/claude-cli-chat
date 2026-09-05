@@ -25,6 +25,7 @@ import {
   writeSubagentFile as writeSubagentFileImpl,
 } from "./platform/node-capabilities";
 import { generateTitle as generateTitleImpl } from "./claude/TitleGenerator";
+import { suggestReply as suggestReplyImpl } from "./claude/ReplySuggester";
 import type {
   SubagentFileResult,
   SubagentTrackerHandle,
@@ -270,6 +271,7 @@ export default class ClaudeChatPlugin extends Plugin {
   createJsonlTailer = createJsonlTailerImpl;
   createRemoteControlSession = createRemoteControlSessionImpl;
   generateTitle = generateTitleImpl;
+  suggestReply = suggestReplyImpl;
   openPathExternally = openPathExternallyImpl;
 
   createSubagentTracker(opts: SubagentTrackerRequest): SubagentTrackerHandle {

@@ -17,6 +17,7 @@
                         since the daemon builds the real `--settings` deny
                         rules itself at spawn time
      generateTitle      POST /tabs/:id/title (the daemon runs the Haiku pass)
+     suggestReply       POST /tabs/:id/suggest (same, for composer ghost text)
      speech             AVSpeechSynthesizer through the native `speak` bridge
      stateEmitter       ABSENT — the daemon already mirrors TC001 state to
                         /tmp/claude_state.ios; a second writer from the phone
@@ -35,13 +36,14 @@
    phone's default model, effort and voice preference have no business
    rewriting the Mac's `data.json`. */
 
-import { DEFAULT_SETTINGS, type ClaudeChatSettings, type EffortLevel, type ModelKey, type PermissionMode } from "../../settings-data";
+import { DEFAULT_SETTINGS, clampTypewriterSpeed, type ClaudeChatSettings, type EffortLevel, type ModelKey, type PermissionMode } from "../../settings-data";
 import { PermissionsConfigStore } from "../../permissions/PermissionsConfig";
 import type { DiscoveredEntry, DiscoveryResult } from "../../claude/SkillDiscovery";
 import type { SubagentCatalog, SubagentEntry } from "../../claude/SubagentDiscovery";
 import type { ParsedMcpServer } from "../../mcp/McpServerList";
 import type { SpeechController } from "../../voice/SpeechController";
 import type { TitleGenOptions } from "../../claude/TitleGenerator";
+import type { ReplySuggestOptions } from "../../claude/ReplySuggester";
 import type {
   ActiveFileIndicatorHandle,
   ActiveSelection,
@@ -75,7 +77,16 @@ const SETTINGS_KEY = "vaultgw.settings";
    defaults so a stale localStorage blob can never inject a path or a prompt. */
 type DeviceSettings = Pick<
   ClaudeChatSettings,
-  "defaultModel" | "defaultEffort" | "permissionMode" | "autoGenerateTitles" | "voiceDefaultOn" | "voiceName" | "voiceRate"
+  | "defaultModel"
+  | "defaultEffort"
+  | "permissionMode"
+  | "autoGenerateTitles"
+  | "voiceDefaultOn"
+  | "voiceName"
+  | "voiceRate"
+  | "typewriterEnabled"
+  | "typewriterSpeed"
+  | "replySuggestions"
 >;
 
 class InertActiveFileIndicator implements ActiveFileIndicatorHandle {
@@ -113,7 +124,11 @@ export class RemoteHost implements PluginHost {
      was written for a local one-shot subprocess — and TabController fires
      title generation BEFORE it has even spawned a session, so nothing on the
      engine side can identify the caller yet. The shell can: it holds every
-     live TabController and can match the first user message. */
+     live TabController and can match the message text back to a tab.
+
+     Matches ANY user message in a tab, not just the first: suggestReply
+     passes the LAST user message, and a first-only match would resolve
+     nothing from the second turn on. */
   private tabResolver: ((userMessage: string) => string | null) | null = null;
 
   private catalog: Catalog | null = null;
@@ -189,6 +204,9 @@ export class RemoteHost implements PluginHost {
       voiceDefaultOn: this.settings.voiceDefaultOn,
       voiceName: this.settings.voiceName,
       voiceRate: this.settings.voiceRate,
+      typewriterEnabled: this.settings.typewriterEnabled,
+      typewriterSpeed: this.settings.typewriterSpeed,
+      replySuggestions: this.settings.replySuggestions,
     };
     try {
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(device));
@@ -219,6 +237,15 @@ export class RemoteHost implements PluginHost {
       if (typeof parsed.voiceDefaultOn === "boolean") out.voiceDefaultOn = parsed.voiceDefaultOn;
       if (typeof parsed.voiceName === "string") out.voiceName = parsed.voiceName;
       if (typeof parsed.voiceRate === "number") out.voiceRate = parsed.voiceRate;
+      if (typeof parsed.typewriterEnabled === "boolean") out.typewriterEnabled = parsed.typewriterEnabled;
+      /* Clamped on read as well as on write: the bounds can tighten between
+         releases, and an out-of-range blob would otherwise drive the reveal
+         at a speed the slider cannot represent. Keys the blob predates are
+         simply absent — the constructor's DEFAULT_SETTINGS spread fills them. */
+      if (typeof parsed.typewriterSpeed === "number") {
+        out.typewriterSpeed = clampTypewriterSpeed(parsed.typewriterSpeed);
+      }
+      if (typeof parsed.replySuggestions === "boolean") out.replySuggestions = parsed.replySuggestions;
       return out;
     } catch {
       return base;
@@ -328,6 +355,25 @@ export class RemoteHost implements PluginHost {
       await new Promise(r => setTimeout(r, 1500));
     }
     return null;
+  }
+
+  /* Same shape as generateTitle: the daemon runs the Haiku pass against its
+     own projection (POST /tabs/:id/suggest), and the tab is identified from
+     the message text via tabResolver — here the LAST user message, which is
+     why the resolver matches any user message rather than just the first.
+
+     No polling loop, unlike title: TabController fires this only after the
+     turn has landed, so the daemon has already projected both halves of the
+     exchange. Any non-200 (400 no_messages on a race, 404 on a tab the
+     daemon dropped) degrades to no ghost text, exactly as an absent
+     capability does on the desktop. */
+  async suggestReply(opts: ReplySuggestOptions): Promise<string | null> {
+    const tabId = this.tabResolver?.(opts.userMessage) ?? null;
+    if (!tabId) return null;
+    const res = await this.conn.rpc("POST", `/tabs/${encodeURIComponent(tabId)}/suggest`);
+    if (res.status !== 200) return null;
+    const suggestion = (res.json as { suggestion?: unknown } | undefined)?.suggestion;
+    return typeof suggestion === "string" && suggestion.trim() ? suggestion.trim() : null;
   }
 
   async dispose(): Promise<void> {

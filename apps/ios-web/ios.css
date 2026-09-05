@@ -293,6 +293,43 @@ body {
   font-size: 16px;
 }
 
+/* ---- Reply-suggestion chip ----------------------------------
+   The ghost text and its chip come from styles.css; the desktop
+   chip is a 20px-tall pointer target and reads "Tab to use".
+   InputBox renders "Tap to use" on a touch host (one span, no
+   key cap) and this grows the chip to a 28px finger target. Its
+   `top` stays untouched: refreshReplyGhost writes it inline from
+   the textarea's live offsetTop, which no stylesheet should
+   second-guess. */
+#app .claudian-reply-hint {
+  right: 10px;
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 12px;
+  /* The composer's own card is already translucent glass; a flat
+     hover token on top of it disappears. Match the toolbar pills. */
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--vgw-glass-border);
+}
+
+/* :hover sticks after a tap on iOS, leaving the chip lit once it
+   has been used. Feedback rides :active instead. */
+#app .claudian-reply-hint:hover {
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+#app .claudian-reply-hint:active {
+  color: var(--text-normal);
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* The chip is wider and the type is bigger here, so the gutter
+   the placeholder must keep clear of it grows with them. */
+#app .claudian-input.has-reply-suggestion {
+  padding-right: 104px;
+}
+
 /* ---- Text selection ----------------------------------------
    desktop.css turns selection off globally (a frameless window
    must not be select-draggable). On a phone there is no window
@@ -1066,6 +1103,105 @@ body {
   text-align: right;
   -webkit-appearance: none;
   appearance: none;
+}
+
+/* iOS-style switch built on a bare checkbox: no shared toggle
+   component exists in src/ (Obsidian supplies its own, which this
+   client does not load), and one input beats a div that has to
+   reimplement focus and the change event. 51x31 is the native
+   UISwitch metric, so it sits right next to the system controls
+   the sheet links out to. */
+.vaultgw-settings-toggle {
+  flex: 0 0 auto;
+  position: relative;
+  width: 51px;
+  height: 31px;
+  margin: 0;
+  border-radius: 16px;
+  border: 1px solid var(--vgw-glass-border);
+  background: rgba(255, 255, 255, 0.09);
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background 160ms ease;
+}
+
+.vaultgw-settings-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 25px;
+  height: 25px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform 160ms ease;
+}
+
+.vaultgw-settings-toggle:checked {
+  background: rgba(var(--claudian-brand-rgb), 0.85);
+  border-color: rgba(var(--claudian-brand-rgb), 0.85);
+}
+
+.vaultgw-settings-toggle:checked::after {
+  transform: translateX(20px);
+}
+
+.vaultgw-settings-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+/* Tabular figures so the readout does not shuffle the slider
+   sideways as the value crosses a digit width while dragging. */
+.vaultgw-settings-value {
+  min-width: 46px;
+  text-align: right;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.vaultgw-settings-slider {
+  flex: 0 1 150px;
+  height: 28px;
+  margin: 0;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.vaultgw-settings-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* The thumb is the whole tap target on a phone, hence 24px even
+   though the track is 4px; the negative margin re-centers it. */
+.vaultgw-settings-slider::-webkit-slider-thumb {
+  width: 24px;
+  height: 24px;
+  margin-top: -10px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Dimmed rather than hidden: hiding the row would make the rows
+   below it jump every time the toggle above is tapped. */
+.vaultgw-settings-row.is-disabled .vaultgw-settings-label,
+.vaultgw-settings-row.is-disabled .vaultgw-settings-value {
+  opacity: 0.4;
+}
+
+.vaultgw-settings-slider:disabled {
+  opacity: 0.4;
 }
 
 .vaultgw-settings-note {

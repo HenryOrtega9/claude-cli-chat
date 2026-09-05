@@ -1,23 +1,10 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname } from "node:path";
-import { StringDecoder } from "node:string_decoder";
-import { autodetectClaudePath } from "../settings-autodetect";
+import { runQuickPrompt } from "./QuickPrompt";
 
 /* Spawns a one-off `claude --print` call with a small fast model (Haiku by
-   default) and a focused prompt asking for a short conversation title.
-   Several speed optimizations are layered in:
-     - --system-prompt overrides the default system prompt entirely, so the
-       CLI skips CLAUDE.md auto-discovery, auto-memory loading, dynamic
-       per-machine context, and skill catalog injection — none of which a
-       title-generation pass needs.
-     - --tools "" empties the tool catalog so no tool definitions are sent
-       to the API.
-     - --disable-slash-commands skips slash-command discovery on startup.
-     - --setting-sources user limits config loading to ~/.claude only,
-       skipping per-project + local settings walks.
-     - --no-session-persistence keeps these throwaways out of the user's
-       saved session list. */
+   default) and a focused prompt asking for a short conversation title. The
+   spawn itself — stripped-down CLI flags, PATH enrichment, UTF-8 chunk
+   decoding, timeout escalation — lives in QuickPrompt and is shared with
+   the reply suggester. */
 
 export type TitleGenOptions = {
   userMessage: string;
@@ -59,8 +46,6 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
      never spawn it for an incognito tab. */
   if (opts.incognito) return null;
 
-  const cmd = opts.claudePath || autodetectClaudePath() || "claude";
-
   /* Truncate both sides of the conversation snippet so input tokens stay
      small. Title generation doesn't need the full response — the first
      few hundred characters carry enough topic signal. */
@@ -96,109 +81,24 @@ export async function generateTitle(opts: TitleGenOptions): Promise<string | nul
       "\n" +
       "Title:";
 
-  /* PATH enrichment matches SubprocessManager so the binary resolves from a
-     Finder-launched Obsidian even when the shell PATH wasn't inherited.
-     Guard `~/.local/bin` when HOME is unset so we don't inject a bare
-     `/.local/bin`. Also append the dir containing the claude binary when an
-     explicit path was provided, so sibling tooling resolves alongside it. */
-  const home = process.env.HOME ?? "";
-  const claudeDir = opts.claudePath ? dirname(opts.claudePath) : "";
-  const enrichedPath = [
-    process.env.PATH ?? "",
-    home ? `${home}/.local/bin` : "",
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    claudeDir,
-  ].filter(Boolean).join(":");
-
-  const args = [
-    "--print",
-    "--model", opts.model,
-    "--system-prompt", TITLE_SYSTEM_PROMPT,
-    "--tools", "",
-    "--disable-slash-commands",
-    "--setting-sources", "user",
-    "--no-session-persistence",
+  const raw = await runQuickPrompt({
+    claudePath: opts.claudePath,
+    model: opts.model,
+    cwd: opts.cwd,
+    systemPrompt: TITLE_SYSTEM_PROMPT,
     prompt,
-  ];
-
-  /* eslint-disable no-console */
-  const t0 = Date.now();
-  console.log(`[claude-cli-chat] title-gen spawn`, { cmd, model: opts.model });
-
-  /* cwd existence check: a missing cwd causes spawn() to emit ENOENT on the
-     child's `error` event, but pre-checking gives a clearer log and avoids
-     the spawn overhead entirely. */
-  if (!existsSync(opts.cwd)) {
-    console.warn(`[claude-cli-chat] title-gen skipped: cwd does not exist: ${opts.cwd}`);
-    return null;
-  }
-
-  return new Promise<string | null>((resolve) => {
-    const child = spawn(cmd, args, {
-      cwd: opts.cwd,
-      env: {
-        ...process.env,
-        PATH: enrichedPath,
-        CLAUDE_CODE_ENTRYPOINT: "claude-cli-chat-titlegen",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
+    entrypoint: "claude-cli-chat-titlegen",
+    label: "title-gen",
     /* Hard cap so a malformed reply can't bloat memory. */
-    const MAX_OUTPUT = 1024;
-    /* Decode at string boundaries: a multi-byte UTF-8 code point (any
-       non-ASCII title char) can straddle two stdout chunks, and decoding each
-       Buffer independently would turn each half into U+FFFD. StringDecoder
-       holds a straddling sequence's leading bytes until the next chunk
-       completes it. */
-    const decoder = new StringDecoder("utf8");
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (stdout.length < MAX_OUTPUT) stdout += decoder.write(chunk);
-    });
-    let stderrBuf = "";
-    child.stderr.on("data", chunk => { stderrBuf += chunk.toString("utf8"); });
-
-    /* 30s timeout — anything longer indicates a hang. Title gen on Haiku
-       with the optimizations above should be ~1.5-3s typically. */
-    const timeout = setTimeout(() => {
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      /* Escalate to SIGKILL if SIGTERM is ignored (e.g. wedged mid-network
-         retry). We've already resolved(null), so without this a hung
-         `claude --print` survives as an orphan holding the API connection. The
-         kill is harmless if the process already exited. */
-      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 2000);
-      console.warn(`[claude-cli-chat] title-gen TIMEOUT after ${Date.now() - t0}ms`);
-      resolve(null);
-    }, 30000);
-
-    /* Use `close` instead of `exit` so stdout is fully drained before we
-       call cleanTitle(). `exit` fires when the process terminates but
-       stdout may still have buffered data; `close` waits for the stdio
-       streams to flush too. */
-    child.on("close", code => {
-      clearTimeout(timeout);
-      const elapsed = Date.now() - t0;
-      if (code !== 0) {
-        console.warn(`[claude-cli-chat] title-gen failed in ${elapsed}ms (exit ${code})`, { stderr: stderrBuf.slice(0, 400) });
-        resolve(null);
-        return;
-      }
-      /* Flush any final code point the decoder is still holding. */
-      if (stdout.length < MAX_OUTPUT) stdout += decoder.end();
-      const cleaned = cleanTitle(stdout);
-      console.log(`[claude-cli-chat] title-gen done in ${elapsed}ms`, { title: cleaned });
-      resolve(cleaned);
-    });
-    child.on("error", err => {
-      clearTimeout(timeout);
-      console.warn(`[claude-cli-chat] title-gen spawn error`, err);
-      resolve(null);
-    });
+    maxOutputChars: 1024,
+    /* 30s — anything longer indicates a hang. Title gen on Haiku with the
+       QuickPrompt trimming should be ~1.5-3s typically. */
+    timeoutMs: 30000,
   });
+  if (raw === null) return null;
+  const cleaned = cleanTitle(raw);
+  console.log(`[claude-cli-chat] title-gen result`, { title: cleaned });
+  return cleaned;
 }
 
 /* Sanitize the model's reply: trim, strip wrapping quotes, drop a trailing

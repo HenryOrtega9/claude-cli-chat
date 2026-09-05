@@ -361,6 +361,10 @@ function friendlySubModelLabel(modelId: string): "Opus" | "Sonnet" | "Haiku" | n
   return null;
 }
 
+/* Default composer placeholder. Swapped for the reply suggestion's text
+   while one is showing (see setReplySuggestion) and restored after. */
+const DEFAULT_PLACEHOLDER = "How can I help you today?";
+
 export class InputBox {
   private root: HTMLElement;
   private wrapper: HTMLElement;
@@ -432,6 +436,15 @@ export class InputBox {
      re-render itself when shown without needing a fresh data load. */
   private costPayload: CostSurfacePayload | null = null;
   private sendBtn: HTMLElement;
+  /* Reply suggestion (TabController.maybeSuggestReply): the proposed next
+     message, shown as ghost text via the textarea's placeholder while the
+     composer is empty and idle, plus a floating "Tab" hint chip over the
+     textarea's top-right corner. Tab (or tapping the chip) copies it into
+     the textarea; typing anything hides it natively (placeholders vanish
+     when there's a value) and it comes back if the user deletes back to
+     empty. Runtime-only — never persisted, never sent anywhere. */
+  private replySuggestion: string | null = null;
+  private replyHintEl: HTMLElement;
   /* True while the send button is showing its stop affordance (touch hosts
      only — see setBusy). Kept so the icon swap runs on transitions rather
      than on every setBusy call. */
@@ -513,13 +526,38 @@ export class InputBox {
 
     this.textarea = this.wrapper.createEl("textarea", {
       cls: "claudian-input",
-      attr: { placeholder: "How can I help you today?", rows: "3", dir: "auto" },
+      attr: { placeholder: DEFAULT_PLACEHOLDER, rows: "3", dir: "auto" },
     });
     this.textarea.addEventListener("keydown", e => this.handleKeydown(e));
     this.textarea.addEventListener("input", () => {
       this.autoResize();
       this.updateSuggestion();
       this.scheduleDraftPublish();
+      this.refreshReplyGhost();
+    });
+
+    /* Floats over the textarea's top-right corner (wrapper is the offset
+       parent); refreshReplyGhost positions it against the textarea's live
+       offsetTop so the toolbar/context rows above can change height freely.
+       Clickable for touch hosts, which have no Tab key. */
+    this.replyHintEl = this.wrapper.createDiv({
+      cls: "claudian-reply-hint",
+      attr: { role: "button", tabindex: "-1", "aria-label": "Accept suggested reply", title: "Accept suggested reply" },
+    });
+    /* A touch host has no Tab key, so the key cap would be advertising a
+       gesture the device cannot perform. One plain span there instead; the
+       chip is clickable on every host, which is the touch affordance. */
+    if (TOUCH_PRIMARY) {
+      this.replyHintEl.createSpan({ cls: "claudian-reply-hint-text", text: "Tap to use" });
+    } else {
+      this.replyHintEl.createSpan({ cls: "claudian-reply-hint-key", text: "Tab" });
+      this.replyHintEl.createSpan({ cls: "claudian-reply-hint-text", text: "to use" });
+    }
+    this.replyHintEl.style.display = "none";
+    this.replyHintEl.addEventListener("mousedown", e => e.preventDefault());
+    this.replyHintEl.addEventListener("click", e => {
+      e.preventDefault();
+      this.acceptReplySuggestion();
     });
     this.textarea.addEventListener("click", () => this.updateSuggestion());
     this.textarea.addEventListener("blur", () => {
@@ -921,6 +959,7 @@ export class InputBox {
 
   setBusy(busy: boolean) {
     this.busy = busy;
+    this.refreshReplyGhost();
     /* On a touch host the send button doubles as the stop control while a
        turn runs, because cancelling is otherwise Escape-only and a phone has
        no Escape key. On a pointer host nothing changes: the button greys out
@@ -1813,6 +1852,17 @@ export class InputBox {
       return;
     }
 
+    /* Plain Tab with a reply suggestion showing (empty composer, idle)
+       accepts it into the textarea without sending. Only fires while the
+       ghost is actually visible, so Tab keeps its normal focus behavior the
+       rest of the time. */
+    if (e.key === "Tab" && !e.shiftKey && !e.isComposing && this.replyGhostVisible()) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.acceptReplySuggestion();
+      return;
+    }
+
     /* Shift+Tab cycles through permission modes — matches the Claude Code
        terminal's Normal → Accept Edits → Plan → Auto → Bypass cycle.
        stopPropagation prevents Obsidian's focus-cycling from stealing the key. */
@@ -2320,6 +2370,10 @@ export class InputBox {
     if (!text && this.attachments.length === 0 && !this.currentSelection) return;
     this.textarea.value = "";
     this.autoResize();
+    /* Whatever was suggested belonged to the exchange this send just ended.
+       TabController.submit bumps its own sequence too; this is the same-tick
+       UI side so the ghost can't flash back in before that runs. */
+    this.setReplySuggestion(null);
     /* A successful submit definitively ends this draft. Cancel any pending
        debounce (it would otherwise republish the just-cleared text a moment
        later) and publish the clear immediately rather than waiting. */
@@ -2384,6 +2438,57 @@ export class InputBox {
     this.lastPublishedDraft = "";
     this.textarea.value = "";
     this.autoResize();
+    this.refreshReplyGhost();
+  }
+
+  /* ---- Reply suggestion ghost -------------------------------------- */
+
+  /* Set (or clear with null) the proposed next message. Visibility is
+     decided by refreshReplyGhost from the composer's live state. */
+  setReplySuggestion(text: string | null): void {
+    const cleaned = text?.trim() ?? "";
+    this.replySuggestion = cleaned.length > 0 ? cleaned : null;
+    this.refreshReplyGhost();
+  }
+
+  private replyGhostVisible(): boolean {
+    return this.replySuggestion !== null && !this.busy && this.textarea.value.length === 0;
+  }
+
+  private refreshReplyGhost(): void {
+    if (this.destroyed) return;
+    const show = this.replyGhostVisible();
+    if (show) {
+      /* The suggestion rides in the placeholder: it wraps like typed text,
+         disappears natively the moment the user types, and needs no overlay
+         that could drift from the textarea's own padding/font. */
+      this.textarea.placeholder = this.replySuggestion ?? DEFAULT_PLACEHOLDER;
+      this.textarea.addClass("has-reply-suggestion");
+      this.replyHintEl.style.display = "";
+      /* Position against the textarea's live box: offsetParent is the
+         wrapper (position: relative), the same element the hint lives in. */
+      this.replyHintEl.style.top = `${this.textarea.offsetTop + 8}px`;
+    } else {
+      /* Only touch the placeholder when we changed it — the class is the
+         marker — so the default text survives a redundant refresh. */
+      if (this.textarea.hasClass("has-reply-suggestion")) {
+        this.textarea.placeholder = DEFAULT_PLACEHOLDER;
+        this.textarea.removeClass("has-reply-suggestion");
+      }
+      this.replyHintEl.style.display = "none";
+    }
+  }
+
+  private acceptReplySuggestion(): void {
+    if (!this.replyGhostVisible()) return;
+    const text = this.replySuggestion ?? "";
+    this.replySuggestion = null;
+    this.textarea.value = text;
+    this.textarea.selectionStart = this.textarea.selectionEnd = text.length;
+    this.autoResize();
+    this.scheduleDraftPublish();
+    this.refreshReplyGhost();
+    this.textarea.focus();
   }
 
   private autoResize() {

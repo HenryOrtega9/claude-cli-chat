@@ -129,6 +129,33 @@ export class MessageListRenderer {
   private readonly lastStreamRenderAt = new Map<string, number>();
   private static readonly STREAM_THROTTLE_MS = 80;
 
+  /* Typewriter reveal. Without it an assistant bubble paints whatever the
+     stream has delivered so far on every (throttled) upsert, so text lands in
+     jagged chunks — a whole paragraph at once when the CLI flushes a big
+     delta, then nothing for a beat. With it, each animating message owns a
+     reveal cursor (`shown`, a char offset into msg.content) that a single
+     shared ticker advances at the configured characters-per-second, and
+     renderContent paints only content.slice(0, shown). The cursor can never
+     fall more than TYPEWRITER_MAX_LAG_S behind the real stream: the per-tick
+     rate is max(cps, backlog / maxLag), so a reply that streams faster than
+     the setting still finishes within a couple of seconds of the CLI, and a
+     final (non-streaming) upsert that arrives mid-reveal just lets the
+     ticker run out before the full-fidelity render lands.
+
+     Only messages first seen while `typewriterArmed` is true animate —
+     TabController arms it after the constructor's history replay, so a
+     restored conversation appears instantly and only genuinely new replies
+     type out. `typewriterConfig` is a getter so a settings change applies to
+     the next message without a rebuild; flipping it off mid-reveal snaps
+     every in-flight message to its full text on the next tick. */
+  private typewriterConfig: (() => { enabled: boolean; cps: number }) | null = null;
+  private typewriterArmed = false;
+  private readonly reveal = new Map<string, { msg: ChatMessage; shown: number }>();
+  private typewriterTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastTypewriterTick = 0;
+  private static readonly TYPEWRITER_TICK_MS = 48;
+  private static readonly TYPEWRITER_MAX_LAG_S = 2.5;
+
   constructor(app: AppHandle, component: RenderLifecycle, container: HTMLElement) {
     this.app = app;
     this.component = component;
@@ -252,6 +279,12 @@ export class MessageListRenderer {
     if (this.scrollBottomBtn) this.scrollBottomBtn.style.display = "none";
     this.liveEls.clear();
     this.toolEls.clear();
+    /* Drop every reveal cursor and the ticker with them: a tick after reset
+       would dispatch an upsert for a message the cleared container no longer
+       holds (doUpsert's generation check bails, but there's no point paying
+       for the timer). */
+    this.reveal.clear();
+    this.stopTypewriter();
     this.removeEpoch.clear();
     this.thinkingOpenOverride.clear();
     this.agentGroups.reset();
@@ -338,28 +371,17 @@ export class MessageListRenderer {
   }
 
   async upsertMessage(msg: ChatMessage) {
+    /* A message under typewriter control that just grew needs the ticker
+       running again (it idles once it catches up to a live stream). A
+       caught-up message whose stream has ended is finished with the
+       typewriter entirely; release the cursor so nothing lingers per id. */
+    const rev = this.reveal.get(msg.id);
+    if (rev) {
+      if (rev.shown < msg.content.length) this.ensureTypewriterTicking();
+      else if (!msg.streaming) this.reveal.delete(msg.id);
+    }
     if (msg.streaming) {
-      const now = Date.now();
-      const last = this.lastStreamRenderAt.get(msg.id);
-      if (last !== undefined && now - last < MessageListRenderer.STREAM_THROTTLE_MS) {
-        /* Inside the throttle window: fold this call into whichever trailing
-           render is already scheduled (or schedule the one that will catch
-           up) instead of dispatching a fresh doUpsert of our own. Resolves
-           right away rather than waiting on that timer — this call did no
-           DOM work, so there is nothing for the caller to legitimately wait
-           on, and stalling handleStreamEvent's own await here would only
-           slow down how fast it can drain the next buffered delta. */
-        if (!this.streamRenderTimers.has(msg.id)) {
-          const timer = setTimeout(() => {
-            this.streamRenderTimers.delete(msg.id);
-            this.lastStreamRenderAt.set(msg.id, Date.now());
-            void this.dispatchUpsert(msg);
-          }, MessageListRenderer.STREAM_THROTTLE_MS - (now - last));
-          this.streamRenderTimers.set(msg.id, timer);
-        }
-        return;
-      }
-      this.lastStreamRenderAt.set(msg.id, now);
+      if (this.foldIntoThrottle(msg)) return;
     } else {
       /* Not streaming: either this message's authoritative final render
          (content_block_stop's owning `assistant` event already flipped
@@ -368,14 +390,146 @@ export class MessageListRenderer {
          right now, so drop a same-id trailing catch-up still pending —
          letting it fire afterward would redundantly re-render a message
          that's already current — and the rate bookkeeping with it. */
-      const timer = this.streamRenderTimers.get(msg.id);
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        this.streamRenderTimers.delete(msg.id);
-      }
-      this.lastStreamRenderAt.delete(msg.id);
+      this.clearThrottle(msg.id);
     }
     await this.dispatchUpsert(msg);
+  }
+
+  /* The streaming throttle. Returns true when this call was folded into a
+     trailing render (the caller should do nothing more), false when the
+     caller should dispatch right now — in which case the rate bookkeeping
+     has already been stamped for it. Shared by upsertMessage's streaming
+     branch and the typewriter ticker so the two render drivers can't both
+     re-parse the same message inside one throttle window. */
+  private foldIntoThrottle(msg: ChatMessage): boolean {
+    const now = Date.now();
+    const last = this.lastStreamRenderAt.get(msg.id);
+    if (last !== undefined && now - last < MessageListRenderer.STREAM_THROTTLE_MS) {
+      /* Inside the throttle window: fold this call into whichever trailing
+         render is already scheduled (or schedule the one that will catch
+         up) instead of dispatching a fresh doUpsert of our own. Resolves
+         right away rather than waiting on that timer — this call did no
+         DOM work, so there is nothing for the caller to legitimately wait
+         on, and stalling handleStreamEvent's own await here would only
+         slow down how fast it can drain the next buffered delta. */
+      if (!this.streamRenderTimers.has(msg.id)) {
+        const timer = setTimeout(() => {
+          this.streamRenderTimers.delete(msg.id);
+          this.lastStreamRenderAt.set(msg.id, Date.now());
+          void this.dispatchUpsert(msg);
+        }, MessageListRenderer.STREAM_THROTTLE_MS - (now - last));
+        this.streamRenderTimers.set(msg.id, timer);
+      }
+      return true;
+    }
+    this.lastStreamRenderAt.set(msg.id, now);
+    return false;
+  }
+
+  private clearThrottle(id: string): void {
+    const timer = this.streamRenderTimers.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.streamRenderTimers.delete(id);
+    }
+    this.lastStreamRenderAt.delete(id);
+  }
+
+  /* ---- Typewriter reveal (see the field block above) ---------------- */
+
+  /* Install the settings getter. Read on every tick and on every new
+     bubble, so toggling the setting applies immediately. */
+  setTypewriter(getter: () => { enabled: boolean; cps: number }): void {
+    this.typewriterConfig = getter;
+  }
+
+  /* Messages first seen while armed animate; earlier ones (history replay)
+     paint in full. TabController arms after its replay pass resolves. */
+  setTypewriterArmed(armed: boolean): void {
+    this.typewriterArmed = armed;
+  }
+
+  private shouldAnimate(msg: ChatMessage): boolean {
+    if (!this.typewriterArmed || msg.role !== "assistant") return false;
+    const cfg = this.typewriterConfig?.();
+    return !!cfg && cfg.enabled;
+  }
+
+  /* The text renderContent should paint for this message right now: the
+     revealed prefix while the typewriter owns it, the full content otherwise. */
+  private visibleContent(msg: ChatMessage): string {
+    const rev = this.reveal.get(msg.id);
+    if (!rev || rev.shown >= msg.content.length) return msg.content;
+    return msg.content.slice(0, rev.shown);
+  }
+
+  private isRevealing(msg: ChatMessage): boolean {
+    const rev = this.reveal.get(msg.id);
+    return !!rev && rev.shown < msg.content.length;
+  }
+
+  private ensureTypewriterTicking(): void {
+    if (this.typewriterTimer !== null) return;
+    this.lastTypewriterTick = performance.now();
+    this.typewriterTimer = setTimeout(() => this.tickTypewriter(), MessageListRenderer.TYPEWRITER_TICK_MS);
+  }
+
+  private stopTypewriter(): void {
+    if (this.typewriterTimer !== null) {
+      clearTimeout(this.typewriterTimer);
+      this.typewriterTimer = null;
+    }
+  }
+
+  private tickTypewriter(): void {
+    this.typewriterTimer = null;
+    const cfg = this.typewriterConfig?.();
+    const now = performance.now();
+    /* Cap dt so a tab that was throttled in the background (timers coalesced
+       to once a second or slower) doesn't dump the whole backlog in one
+       frame when it comes back; it just runs at the catch-up rate for a
+       moment instead. */
+    const dt = Math.min(0.25, Math.max(0, (now - this.lastTypewriterTick) / 1000));
+    this.lastTypewriterTick = now;
+    let pending = false;
+    for (const [id, rev] of Array.from(this.reveal)) {
+      const { msg } = rev;
+      const total = msg.content.length;
+      if (rev.shown >= total) {
+        /* Caught up. A live stream keeps its cursor for the next delta
+           (upsertMessage re-arms the ticker); a finished message is done. */
+        if (!msg.streaming) this.reveal.delete(id);
+        continue;
+      }
+      if (!cfg || !cfg.enabled) {
+        /* Setting flipped off mid-reveal: snap to the full text. */
+        rev.shown = total;
+      } else {
+        const backlog = total - rev.shown;
+        const rate = Math.max(cfg.cps, backlog / MessageListRenderer.TYPEWRITER_MAX_LAG_S);
+        let next = Math.min(total, rev.shown + Math.max(1, Math.round(rate * dt)));
+        /* Never split a surrogate pair — a lone high surrogate renders as a
+           replacement glyph for one tick, which reads as a flicker. */
+        const code = msg.content.charCodeAt(next - 1);
+        if (code >= 0xd800 && code <= 0xdbff && next < total) next++;
+        rev.shown = next;
+      }
+      if (rev.shown >= total && !msg.streaming) {
+        /* Reveal complete on a finished message: release the cursor and
+           land the authoritative full-fidelity render immediately (with the
+           footer, which renderContent withholds while revealing). Drop any
+           trailing throttle render first so it can't re-paint afterward. */
+        this.reveal.delete(id);
+        this.clearThrottle(id);
+        void this.dispatchUpsert(msg);
+        continue;
+      }
+      if (rev.shown < total) pending = true;
+      if (!this.foldIntoThrottle(msg)) void this.dispatchUpsert(msg);
+    }
+    if (pending) {
+      this.typewriterTimer = setTimeout(() => this.tickTypewriter(), MessageListRenderer.TYPEWRITER_TICK_MS);
+    }
   }
 
   private dispatchUpsert(msg: ChatMessage): Promise<void> {
@@ -426,6 +580,7 @@ export class MessageListRenderer {
     this.liveEls.delete(id);
     this.thinkingOpenOverride.delete(id);
     this.renderChains.delete(id);
+    this.reveal.delete(id);
     /* Same gap as reset()'s: a pending trailing render for this id would
        otherwise fire later, find no liveEls entry, and re-create a bubble
        for a message this fold just removed. */
@@ -449,6 +604,14 @@ export class MessageListRenderer {
     if (!entry) {
       entry = this.createBubble(msg);
       this.liveEls.set(msg.id, entry);
+      /* First sight of a live assistant message: start its reveal at zero.
+         Works the same whether text is already present (non-streaming mode,
+         where the whole reply arrives in one authoritative event) or still
+         empty (a tool-first pass) — the ticker just chases msg.content. */
+      if (this.shouldAnimate(msg)) {
+        this.reveal.set(msg.id, { msg, shown: 0 });
+        this.ensureTypewriterTicking();
+      }
     }
     await this.renderContent(entry.content, msg);
     /* renderContent awaits MarkdownRenderer; removeMessage() (preamble fold)
@@ -862,11 +1025,17 @@ export class MessageListRenderer {
         this.renderThinking(el, msg);
       }
       const block = el.createDiv({ cls: "claudian-text-block" });
-      if (msg.content.trim().length > 0) {
-        await platform.renderMarkdown(msg.content, block, "", this.component);
+      /* Under the typewriter this is the revealed prefix, not the whole
+         message — the same partial-markdown rendering the streaming path
+         already lives with. */
+      const text = this.visibleContent(msg);
+      if (text.trim().length > 0) {
+        await platform.renderMarkdown(text, block, "", this.component);
         this.wireInternalLinks(block);
       }
-      if (msg.durationMs !== undefined && !msg.streaming && this.passHasVisibleContent(msg)) {
+      /* Hold the footer until the reveal has run out, or "Thought for Ns"
+         would sit under a bubble whose text is still typing out. */
+      if (msg.durationMs !== undefined && !msg.streaming && !this.isRevealing(msg) && this.passHasVisibleContent(msg)) {
         /* Idempotent: concurrent upserts can both cross the MarkdownRenderer
            await above, and the later el.empty() only wipes pre-await DOM.
            Drop any prior footer before appending so the second arrival

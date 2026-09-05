@@ -299,6 +299,28 @@ export class TabEngine {
     return msg ? msg.content : null;
   }
 
+  /* The most recent user message plus the most recent non-empty assistant
+     text that follows it — the exchange a reply suggestion is drawn from.
+     Multi-pass tool turns project several assistant messages; the last one
+     carrying text is the answer the user actually read. */
+  lastExchange(): { userMessage: string; assistantResponse: string } | null {
+    const messages = this.state.messages;
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx < 0) return null;
+    const userMessage = messages[lastUserIdx].content;
+    if (!userMessage.trim()) return null;
+    for (let i = messages.length - 1; i > lastUserIdx; i--) {
+      const m = messages[i];
+      if (m.role === "assistant" && m.content.trim().length > 0) {
+        return { userMessage, assistantResponse: m.content };
+      }
+    }
+    return null;
+  }
+
   setTitle(title: string): void {
     this.state.title = title;
     this.state.updatedAt = Date.now();

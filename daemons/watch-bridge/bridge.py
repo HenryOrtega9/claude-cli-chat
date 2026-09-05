@@ -22,6 +22,13 @@ API (all routes require `Authorization: Bearer <token>`):
                  (same shape as /last). 202 {partial:true} on timeout. Used by
                  the watch app's background URLSession to fire a local
                  notification when a turn finishes after the app is closed.
+  GET  /suggest?after_seq=N&timeout=<s> -> long-poll for the suggested next
+                 user message generated after each completed turn. Blocks (default
+                 25s, clamp 1..60) until a suggestion exists whose turn_seq > N,
+                 then 200 {suggestion: str|null, turn_seq: int}; 202
+                 {suggestion: null, turn_seq: <current>, error: "wait_timeout"} on
+                 timeout. /last and /wait also carry "suggestion" when one for the
+                 same turn_seq is already ready, so the watch can skip a round trip.
   POST /command {"command": str} -> 200 {ok}. Fire-and-forget slash command
                  (allowlist: /model, /effort). These run locally in the CLI
                  and produce no assistant turn, so they bypass the turn
@@ -53,6 +60,7 @@ Config (env):
   WATCH_BRIDGE_VAULT           REQUIRED: directory the claude session runs in
   WATCH_BRIDGE_CLAUDE          default: `claude` resolved from an enriched PATH
   WATCH_BRIDGE_REPLY_BUDGET_S  default 90
+  WATCH_BRIDGE_SUGGEST         "0" disables next-message suggestions (default on)
   Token file: ~/.config/watch-bridge/token (chmod 600)
 
 Trust model: the child claude runs with --dangerously-skip-permissions, so
@@ -102,6 +110,11 @@ REPLY_BUDGET_S = float(os.environ.get("WATCH_BRIDGE_REPLY_BUDGET_S", "90"))
 IDLE_FALLBACK_S = 15.0
 JSONL_AUTO_RESET_BYTES = 4 * 1024 * 1024
 SETTLE_S = 3.0
+
+SUGGEST_ENABLED = os.environ.get("WATCH_BRIDGE_SUGGEST", "1") != "0"
+SUGGEST_MODEL = "claude-haiku-4-5-20251001"
+SUGGEST_TIMEOUT_S = 20
+SUGGEST_MAX_OUTPUT_CHARS = 600
 
 APPEND_SYSTEM_PROMPT = (
     "Replies are spoken aloud on a watch. "
@@ -715,6 +728,131 @@ class TranscriptTailer:
         return silent >= IDLE_FALLBACK_S and last_kind == "assistant_text"
 
 
+# ---------------------------------------------------------------- suggestions
+
+# Ported verbatim from the plugin's src/claude/ReplySuggester.ts so the watch
+# chip and the composer ghost text read the same. Phrased emphatically so
+# Haiku writes AS the user rather than answering the assistant's reply itself
+# — the transcript is data, and the only valid output is the next thing the
+# human would type.
+SUGGEST_SYSTEM_PROMPT = (
+    "You write the USER's next message in an ongoing chat between a user and an AI assistant. "
+    "Your input is the user's last message and the assistant's reply to it. "
+    "Output ONE short follow-up the user would plausibly send next, written in the user's own first-person voice: "
+    "for example accepting an offer the assistant made, asking it to continue or go deeper, requesting a concrete next step, or asking a natural clarifying question. "
+    "If the assistant ended with a question or an offer, answer or accept it directly. "
+    "Never reply as the assistant, never answer the user's question, never explain or comment. "
+    "At most 15 words. Reply with ONLY the message text — no quotes, no preamble, no label."
+)
+
+SUGGEST_LABEL_RE = re.compile(
+    r"^(my next message|next message|user|me|suggestion)\s*:\s*", re.I
+)
+SUGGEST_BULLET_RE = re.compile(r"^[-*•]\s+")
+SUGGEST_PARA_RE = re.compile(r"\n\s*\n")
+SUGGEST_ASSISTANT_VOICE_RE = re.compile(
+    r"^(here('s| is| are)|i('d| would) be (happy|glad)|as an ai|great question|i can help|i'll help)\b",
+    re.I,
+)
+
+
+def clean_suggestion(raw):
+    """Port of ReplySuggester.cleanSuggestion. Trim, strip wrapping quotes and
+    stray labels, collapse whitespace, and reject anything that reads like the
+    assistant talking rather than the user."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    # Keep only the first paragraph — a model that "helpfully" lists three
+    # options has already broken the contract, and the first is the best.
+    text = SUGGEST_PARA_RE.split(text)[0].strip()
+    text = SUGGEST_LABEL_RE.sub("", text)
+    text = SUGGEST_BULLET_RE.sub("", text)
+    if ((text.startswith('"') and text.endswith('"'))
+            or (text.startswith("'") and text.endswith("'"))
+            or (text.startswith("“") and text.endswith("”"))):
+        text = text[1:-1].strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if len(text.split()) > 30 or len(text) > 200:
+        return None
+    # Assistant-voice tells: "I'd be happy to", "Here's", "As an AI". Plain
+    # acceptances ("Sure, go ahead") are exactly what a user types back to an
+    # offer, so they stay.
+    if SUGGEST_ASSISTANT_VOICE_RE.match(text):
+        return None
+    return text
+
+
+def build_suggest_prompt(user_message, reply_text):
+    """Same truncation split as ReplySuggester: the user side rarely needs more
+    than its opening; the assistant side is the opposite — offers and questions
+    cluster at the END of a reply, so keep the tail with a little of the head."""
+    user = user_message.strip()
+    reply = reply_text.strip()
+    user_snippet = user[:600] + "…" if len(user) > 600 else user
+    reply_snippet = reply
+    if len(reply) > 1800:
+        reply_snippet = reply[:500] + "\n…\n" + reply[-1300:]
+    return (
+        "Below is the latest exchange in my chat with an AI assistant. "
+        "Write the next message I would send, in my voice. Output only that message.\n"
+        "\n"
+        "<exchange>\n"
+        f"[my message]\n{user_snippet}\n"
+        "\n"
+        f"[the assistant's reply]\n{reply_snippet}\n"
+        "</exchange>\n"
+        "\n"
+        "My next message:"
+    )
+
+
+def run_suggest_pass(claude_path, user_message, reply_text):
+    """One-shot Haiku `claude --print` side pass, mirroring the plugin's
+    QuickPrompt spawn trimming (system prompt override skips CLAUDE.md /
+    memory / skill discovery, empty tool catalog, no slash commands, user
+    settings only, no session persistence). Returns the cleaned suggestion or
+    None on any failure. NOTE: --print bills the subscription caps like the
+    interactive session does, so this stays one small Haiku call per turn."""
+    prompt = build_suggest_prompt(user_message, reply_text)
+    env = dict(os.environ)
+    env["PATH"] = enriched_path()
+    env["CLAUDE_CODE_ENTRYPOINT"] = "watch-bridge-suggest"
+    argv = [
+        claude_path,
+        "--print",
+        "--model", SUGGEST_MODEL,
+        "--system-prompt", SUGGEST_SYSTEM_PROMPT,
+        "--tools", "",
+        "--disable-slash-commands",
+        "--setting-sources", "user",
+        "--no-session-persistence",
+        prompt,
+    ]
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            argv, cwd=VAULT, env=env, timeout=SUGGEST_TIMEOUT_S,
+            capture_output=True, text=True,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"suggest: TIMEOUT after {SUGGEST_TIMEOUT_S}s")
+        return None
+    except OSError as e:
+        log(f"suggest: spawn failed: {e}")
+        return None
+    elapsed = int((time.time() - t0) * 1000)
+    if proc.returncode != 0:
+        log(f"suggest: failed in {elapsed}ms (exit {proc.returncode}): "
+            f"{(proc.stderr or '')[:200]}")
+        return None
+    cleaned = clean_suggestion((proc.stdout or "")[:SUGGEST_MAX_OUTPUT_CHARS])
+    log(f"suggest: done in {elapsed}ms -> {cleaned!r}")
+    return cleaned
+
+
 # ---------------------------------------------------------------- turn manager
 
 
@@ -727,6 +865,14 @@ class TurnManager:
         self.last_session_id = None
         self.last_completed_at = 0.0  # bridge clock, deprecated GET /wait fallback
         self.turn_seq = 0  # monotonic completion counter; the reliable GET /wait key
+        # Suggested next user message for the most recent good reply:
+        # {"turn_seq": int, "suggestion": str|None}. Generated off-turn by a
+        # Haiku side pass, so it lags the reply by a second or two and may
+        # never arrive at all (disabled, failed, or rejected by the cleaner).
+        self.last_suggestion = None
+        self._suggest_gate = threading.Lock()   # at most one pass in flight
+        self._suggest_meta = threading.Lock()   # guards _suggest_target
+        self._suggest_target = -1               # seq whose result is still wanted
 
     def run_turn(self, message, budget_s):
         """Returns (status_code, payload). 409 if a turn is in flight; 202 with
@@ -739,6 +885,7 @@ class TurnManager:
                 self.busy.release()
                 return 503, {"error": "session_not_ready"}
             self._maybe_auto_reset()
+            self._drop_suggestion()
             try:
                 os.remove(SIGNAL_PATH)
             except OSError:
@@ -820,6 +967,8 @@ class TurnManager:
                         self.last_completed_at = time.time()
                         self.turn_seq += 1
                         self.last_reply["turn_seq"] = self.turn_seq
+                        # Fire-and-forget: the turn response never waits on it.
+                        self._kick_suggestion(self.turn_seq, message, reply)
                         emit_state("complete")
                 finally:
                     done.set()
@@ -843,6 +992,56 @@ class TurnManager:
             except RuntimeError:
                 pass
             raise
+
+    # ---- suggestions
+
+    def _drop_suggestion(self):
+        """Forget the current suggestion and disown any pass still running, so
+        a late result for a superseded turn is discarded instead of stamped
+        over the new one. Called when a turn starts and on /reset."""
+        with self._suggest_meta:
+            self._suggest_target = -1
+        self.last_suggestion = None
+
+    def _kick_suggestion(self, seq, user_message, reply_text):
+        if not SUGGEST_ENABLED:
+            return
+        if not (user_message or "").strip() or not (reply_text or "").strip():
+            return
+        with self._suggest_meta:
+            self._suggest_target = seq
+        threading.Thread(
+            target=self._suggest_worker,
+            args=(seq, user_message, reply_text),
+            daemon=True,
+        ).start()
+
+    def _suggest_worker(self, seq, user_message, reply_text):
+        # The gate serializes passes; the target check drops a result whose
+        # turn is no longer the current one (a newer turn supersedes it).
+        with self._suggest_gate:
+            with self._suggest_meta:
+                if self._suggest_target != seq:
+                    return
+            try:
+                suggestion = run_suggest_pass(
+                    self.session.claude_path, user_message, reply_text
+                )
+            except Exception as e:  # never let a side pass take down the daemon
+                log(f"suggest: unexpected error: {e}")
+                suggestion = None
+            with self._suggest_meta:
+                if self._suggest_target != seq:
+                    log(f"suggest: dropping stale result for turn {seq}")
+                    return
+                self.last_suggestion = {"turn_seq": seq, "suggestion": suggestion}
+
+    def suggestion_for(self, seq):
+        """The suggestion text for `seq` if one is ready, else None."""
+        snap = self.last_suggestion
+        if snap and snap.get("turn_seq") == seq:
+            return snap.get("suggestion")
+        return None
 
     def _stop_signaled(self, turn_start):
         try:
@@ -868,6 +1067,7 @@ class TurnManager:
             return 409, {"error": "turn_in_flight"}
         try:
             self.session.respawn()
+            self._drop_suggestion()
             return 200, {"ok": True, "session_id": None}
         finally:
             self.busy.release()
@@ -1610,6 +1810,23 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
             self.end_headers()
             self.wfile.write(body)
 
+        def _query(self):
+            raw = self.path.split("?", 1)[1] if "?" in self.path else ""
+            qs = {}
+            for part in raw.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    qs[k] = v
+            return qs
+
+        def _reply_payload(self):
+            """Copy of last_reply plus the suggestion for that same turn when
+            one is already generated (null otherwise), so the watch can render
+            the chip without a second round trip to /suggest."""
+            payload = dict(turns.last_reply)
+            payload["suggestion"] = turns.suggestion_for(payload.get("turn_seq"))
+            return payload
+
         def do_GET(self):
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
@@ -1630,7 +1847,7 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
             if self.path == "/last":
                 if turns.last_reply is None:
                     return self._send(404, {"error": "no_reply_yet"})
-                return self._send(200, turns.last_reply)
+                return self._send(200, self._reply_payload())
             if self.path == "/wait" or self.path.startswith("/wait?"):
                 qs = {}
                 for part in (self.path.split("?", 1)[1] if "?" in self.path else "").split("&"):
@@ -1667,9 +1884,9 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     if turns.last_reply is not None:
                         if after_seq is not None:
                             if turns.turn_seq > after_seq:
-                                return self._send(200, dict(turns.last_reply))
+                                return self._send(200, self._reply_payload())
                         elif turns.last_completed_at >= since:
-                            return self._send(200, dict(turns.last_reply))
+                            return self._send(200, self._reply_payload())
                     try:
                         r, _, _ = select.select([self.connection], [], [], 0.5)
                         if r and self.connection.recv(1, socket.MSG_PEEK) == b"":
@@ -1677,6 +1894,38 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     except OSError:
                         return
                 return self._send(202, {"reply": None, "partial": True, "error": "wait_timeout"})
+            if self.path == "/suggest" or self.path.startswith("/suggest?"):
+                qs = self._query()
+                try:
+                    after_seq = int(qs.get("after_seq", "0"))
+                except ValueError:
+                    after_seq = 0
+                try:
+                    hold = max(1.0, min(float(qs.get("timeout", "25")), 60.0))
+                except ValueError:
+                    hold = 25.0
+                deadline = time.time() + hold
+                # Same select()-based EOF poll as /wait: the watch cancels
+                # these aggressively, and an aborted poll must free the thread
+                # within a tick instead of pinning it for the full hold.
+                while time.time() < deadline:
+                    snap = turns.last_suggestion
+                    if snap and snap.get("turn_seq", 0) > after_seq:
+                        return self._send(200, {
+                            "suggestion": snap.get("suggestion"),
+                            "turn_seq": snap.get("turn_seq"),
+                        })
+                    try:
+                        r, _, _ = select.select([self.connection], [], [], 0.5)
+                        if r and self.connection.recv(1, socket.MSG_PEEK) == b"":
+                            return  # client disconnected; free the thread quietly
+                    except OSError:
+                        return
+                return self._send(202, {
+                    "suggestion": None,
+                    "turn_seq": turns.turn_seq,
+                    "error": "wait_timeout",
+                })
             if self.path == "/usage":
                 return self._send(*usage.fetch())
             if self.path == "/sessions":

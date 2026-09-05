@@ -1,8 +1,10 @@
 /* Settings sheet — the phone's equivalent of the plugin's settings tab
    (src/settings.ts) for the handful of fields a phone is allowed to own.
 
-   Today that is the Defaults section: the model and reasoning effort every
-   NEW chat is seeded with. Both already flowed through to tab creation
+   Today that is the Defaults section — the model, reasoning effort and
+   permission mode every NEW chat is seeded with — plus Replies, which owns
+   the typewriter reveal and the reply-suggestion pass for this device.
+   The first two already flowed through to tab creation
    (IosChatShell.createTab posts host.settings.defaultModel/defaultEffort,
    and TabController falls back to the same pair at spawn time) — until now
    there was simply no way to change them from the phone, so the seed was
@@ -10,8 +12,8 @@
 
    Persistence rides the existing path, not a new one: writes land on
    host.settings and RemoteHost.saveSettings() mirrors the device-owned
-   subset (defaultModel, defaultEffort, permissionMode, titles, voice) into
-   localStorage under "vaultgw.settings". Nothing here touches the Mac's
+   subset (defaultModel, defaultEffort, permissionMode, titles, voice,
+   typewriter, reply suggestions) into localStorage under "vaultgw.settings". Nothing here touches the Mac's
    data.json — the vault's copy describes the Mac (claudePath, TC001, vault
    addendum) and the phone deliberately does not get a vote on it.
 
@@ -34,6 +36,9 @@ import {
   PERMISSION_MODE_DESCRIPTIONS,
   PERMISSION_MODE_LABELS,
   PERMISSION_MODE_ORDER,
+  TYPEWRITER_SPEED_MAX,
+  TYPEWRITER_SPEED_MIN,
+  clampTypewriterSpeed,
   effortLevelsForModel,
   type EffortLevel,
   type ModelKey,
@@ -116,7 +121,12 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
   const modeRow = body.createDiv({ cls: "vaultgw-settings-row" });
   modeRow.createSpan({ cls: "vaultgw-settings-label", text: "Permission mode" });
   const modeSelect = modeRow.createEl("select", { cls: "vaultgw-settings-select" });
-  const modes = PERMISSION_MODE_ORDER.filter((m) => m !== "bypassPermissions");
+  /* Annotated: TS 5.5+ infers a type predicate for this arrow, which narrows
+     the array's element type to the four offered modes and then rejects the
+     `modes.includes(host.settings.permissionMode)` guard below — the exact
+     widening check that guard exists to perform. Same four options either
+     way; only the static type is widened back. */
+  const modes: PermissionMode[] = PERMISSION_MODE_ORDER.filter((m) => m !== "bypassPermissions");
   for (const mode of modes) {
     modeSelect.createEl("option", { value: mode, text: PERMISSION_MODE_LABELS[mode] });
   }
@@ -184,6 +194,95 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
   });
 
   renderEffort();
+
+  /* ----- Replies ---------------------------------------------------------- */
+
+  /* All three are device-owned (RemoteHost.DeviceSettings): the reveal is a
+     rendering choice made in this WebView, and the suggestion pass is billed
+     the same either way, so the phone can differ from the Mac's plugin
+     without either side rewriting the other's stored settings. */
+
+  body.createDiv({ cls: "vaultgw-settings-section", text: "Replies" });
+
+  const typeRow = body.createDiv({ cls: "vaultgw-settings-row" });
+  typeRow.createSpan({ cls: "vaultgw-settings-label", text: "Animate replies" });
+  const typeToggle = typeRow.createEl("input", {
+    cls: "vaultgw-settings-toggle",
+    attr: { type: "checkbox", "aria-label": "Animate replies" },
+  });
+  typeToggle.checked = host.settings.typewriterEnabled;
+
+  const speedRow = body.createDiv({ cls: "vaultgw-settings-row" });
+  speedRow.createSpan({ cls: "vaultgw-settings-label", text: "Animation speed" });
+  const speedControl = speedRow.createDiv({ cls: "vaultgw-settings-slider-wrap" });
+  const speedValue = speedControl.createSpan({ cls: "vaultgw-settings-value" });
+  const speedSlider = speedControl.createEl("input", {
+    cls: "vaultgw-settings-slider",
+    attr: {
+      type: "range",
+      min: String(TYPEWRITER_SPEED_MIN),
+      max: String(TYPEWRITER_SPEED_MAX),
+      step: "10",
+      "aria-label": "Animation speed in characters per second",
+    },
+  });
+
+  /* One writer for both the slider position and the readout, so a clamp on
+     load (a blob written before the bounds moved) shows the value actually
+     in force rather than the one that was stored. */
+  function renderSpeed(): void {
+    const cps = clampTypewriterSpeed(host.settings.typewriterSpeed);
+    host.settings.typewriterSpeed = cps;
+    speedSlider.value = String(cps);
+    speedValue.setText(`${cps}/s`);
+  }
+  renderSpeed();
+
+  /* The slider only means anything while the reveal is on; dimming it beats
+     hiding the row, which would make the sheet's rows jump on every tap. */
+  function renderTypewriter(): void {
+    speedRow.toggleClass("is-disabled", !host.settings.typewriterEnabled);
+    speedSlider.disabled = !host.settings.typewriterEnabled;
+  }
+  renderTypewriter();
+
+  typeToggle.addEventListener("change", () => {
+    transport.haptic("selection");
+    host.settings.typewriterEnabled = typeToggle.checked;
+    renderTypewriter();
+    void host.saveSettings();
+  });
+
+  /* `input` for the live readout, `change` for the write: dragging a range
+     fires input per pixel, and each one would be a localStorage write. */
+  speedSlider.addEventListener("input", () => {
+    speedValue.setText(`${speedSlider.value}/s`);
+  });
+  speedSlider.addEventListener("change", () => {
+    transport.haptic("selection");
+    host.settings.typewriterSpeed = clampTypewriterSpeed(Number(speedSlider.value));
+    renderSpeed();
+    void host.saveSettings();
+  });
+
+  const suggestRow = body.createDiv({ cls: "vaultgw-settings-row" });
+  suggestRow.createSpan({ cls: "vaultgw-settings-label", text: "Suggest a reply" });
+  const suggestToggle = suggestRow.createEl("input", {
+    cls: "vaultgw-settings-toggle",
+    attr: { type: "checkbox", "aria-label": "Suggest a reply" },
+  });
+  suggestToggle.checked = host.settings.replySuggestions;
+
+  body.createDiv({
+    cls: "vaultgw-settings-hint",
+    text: "After each reply the Mac runs a short Haiku pass to propose your next message. It shows as ghost text in the composer — tap the chip to use it.",
+  });
+
+  suggestToggle.addEventListener("change", () => {
+    transport.haptic("selection");
+    host.settings.replySuggestions = suggestToggle.checked;
+    void host.saveSettings();
+  });
 
   /* ----- Connection ------------------------------------------------------- */
 
