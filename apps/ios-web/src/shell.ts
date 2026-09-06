@@ -347,8 +347,10 @@ export class IosChatShell {
         await this.createTab();
         return;
       }
-      for (const entry of index.tabs) {
-        const state = await this.persistence.loadTab(entry.id);
+      /* Bodies load in parallel (each is an independent GET /tabs/:id), then
+         mount in index order so the tab bar keeps its persisted ordering. */
+      const states = await Promise.all(index.tabs.map(entry => this.persistence.loadTab(entry.id)));
+      for (const state of states) {
         if (!state) continue;
         this.mountTab(state, { silent: true });
       }

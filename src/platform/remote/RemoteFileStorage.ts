@@ -62,7 +62,9 @@
 
    `.claude/mcp.json`
        read   -> synthesized `{disabledServers:[…]}` from GET /catalog's
-                 `mcpServers[].enabled`
+                 `mcpServers[].enabled`, or from the list RemoteHost seeded
+                 via seedDisabledServers() from its own catalog (cached or
+                 fetched), which is what answers the per-tab mount reads.
        write  -> POST /mcp/disable {servers} with the file's `disabledServers`
                  (the route's list is absolute: names absent from it are
                  re-enabled), then the catalog cache is dropped so the next
@@ -154,7 +156,11 @@ export class RemoteFileStorage implements FileStorage {
      MCP manager don't fan out one round trip per row. */
   private tabIndexCache: { at: number; value: TabIndex } | null = null;
   private readonly storedTabCache = new Map<string, { at: number; value: StoredTabResponse | null }>();
-  private catalogCache: { at: number; disabled: string[] } | null = null;
+  /* `ttl` is per entry: a network-sourced entry lives CACHE_MS like the
+     others, while a seeded one (seedDisabledServers) lives until something
+     replaces or invalidates it, because its source is the host's own
+     catalog rather than a snapshot that can drift. */
+  private catalogCache: { at: number; ttl: number; disabled: string[] } | null = null;
   /* GET /conversations — open AND closed tabs. Separate from tabIndexCache
      (GET /tabs, open only) because History listing and the open tab bar have
      different staleness tolerances and different write paths invalidate
@@ -176,6 +182,17 @@ export class RemoteFileStorage implements FileStorage {
     this.storedTabCache.clear();
     this.catalogCache = null;
     this.conversationListCache = null;
+  }
+
+  /* Seeds the `.claude/mcp.json` read with a disabled-server list the host
+     already holds (RemoteHost.applyCatalog, from its cached or freshly
+     fetched /catalog), so the per-tab reads at mount — every TabController
+     constructor's refreshCostSurface() — are answered here without a second
+     GET /catalog behind the host's own. Lives until invalidate(), applyMcp()
+     or a later seed replaces it; a network read only happens once the seed
+     is gone. */
+  seedDisabledServers(names: string[]): void {
+    this.catalogCache = { at: Date.now(), ttl: Number.POSITIVE_INFINITY, disabled: [...names] };
   }
 
   invalidateTab(id: string): void {
@@ -421,13 +438,13 @@ export class RemoteFileStorage implements FileStorage {
 
   private async loadDisabledServers(): Promise<string[]> {
     const cached = this.catalogCache;
-    if (cached && Date.now() - cached.at < RemoteFileStorage.CACHE_MS) return cached.disabled;
+    if (cached && Date.now() - cached.at < cached.ttl) return cached.disabled;
     const res = await this.conn.rpc("GET", "/catalog");
     const servers = (res.json as { mcpServers?: Array<{ name?: unknown; enabled?: unknown }> } | undefined)?.mcpServers;
     const disabled = Array.isArray(servers)
       ? servers.filter(s => s?.enabled === false && typeof s.name === "string").map(s => s.name as string)
       : [];
-    if (res.status === 200) this.catalogCache = { at: Date.now(), disabled };
+    if (res.status === 200) this.catalogCache = { at: Date.now(), ttl: RemoteFileStorage.CACHE_MS, disabled };
     return disabled;
   }
 

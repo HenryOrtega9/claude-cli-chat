@@ -19,10 +19,13 @@
                                      must be installed BEFORE any store or view
                                      code runs; shared modules reach the host
                                      only through it.
-     5. host.prime()                 vault path + /catalog (skills, commands,
-                                     subagents, models, MCP), so the composer's
-                                     pickers are populated before the first tab.
-     6. mount the shell              restores tabs from GET /tabs.
+     5. host.prime({ cwd })          /catalog (skills, commands, subagents,
+                                     models, MCP); cwd comes from the /health
+                                     already made, and a cached catalog makes
+                                     this return at once. Runs concurrently
+                                     with step 6.
+     6. mount the shell              restores tabs from GET /tabs, bodies in
+                                     parallel.
      7. connect the socket           after the UI exists, so replayed frames
                                      land on controllers that can render them.
 
@@ -221,6 +224,7 @@ function parseSharePayload(payload: DispatchPayload): SharePayload {
    ------------------------------------------------------------------------ */
 
 async function boot(): Promise<void> {
+  const bootStart = performance.now();
   installDomHelpers();
   wireKeyboardInset();
   wireTouchToggles();
@@ -285,7 +289,16 @@ async function boot(): Promise<void> {
 
   const host = new RemoteHost(conn, transport, storage);
   applyIosDefaultModel(host);
-  await host.prime();
+  /* The /health above already carries the vault path, so prime() skips its
+     own /health; with a catalog cached from a previous launch it returns at
+     once and refreshes in the background. Started here, awaited alongside
+     shell.mount() below, so the catalog fetch overlaps the tab restore
+     instead of preceding it. mount() needs nothing from the catalog:
+     createTab defaults come from host.settings (loaded in the constructor),
+     and each tab's cost-surface refresh joins the in-flight /catalog
+     request rather than blocking on it. */
+  const cwd = (health.json as { cwd?: unknown } | undefined)?.cwd;
+  const primed = host.prime({ cwd: typeof cwd === "string" ? cwd : undefined });
   vaultFeatures.start();
 
   const persistence = new Persistence(null, IOS_STORE_DIR);
@@ -347,8 +360,9 @@ async function boot(): Promise<void> {
     }
   });
 
-  await shell.mount();
+  await Promise.all([primed, shell.mount()]);
   await conn.connect();
+  console.info(`[vaultgw] boot: mounted in ${Math.round(performance.now() - bootStart)}ms`);
 
   /* The page going away without a `suspend` (dev reload, a WebView the OS
      reclaimed) still owes native its cursor snapshot — and the same

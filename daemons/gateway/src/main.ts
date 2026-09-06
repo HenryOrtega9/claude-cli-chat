@@ -127,6 +127,9 @@ async function main(): Promise<void> {
   /* Warm the catalog off the critical path — the first /catalog would
      otherwise pay for a `claude mcp list` spawn while the phone waits. */
   void server.catalog().then(c => log(`catalog warm (hash ${c.hash}, ${c.mcpServers.length} mcp server(s))`)).catch(() => undefined);
+  /* ...and keep it warm, so a cold open more than 5 minutes after the last
+     one never waits on a stale cache either. */
+  server.startCatalogKeepWarm();
 
   const shutdown = async (signal: string) => {
     log(`${signal} received; shutting down`);

@@ -71,6 +71,10 @@ export type Catalog = {
 };
 
 const SETTINGS_KEY = "vaultgw.settings";
+/* Last successful /catalog payload, so a cold launch can populate pickers,
+   the MCP pill and slash commands before the daemon answers (GET /catalog
+   is 3-4s when the daemon's own cache is cold). */
+const CATALOG_KEY = "vaultgw.catalog";
 
 /* Fields the phone is allowed to own. Everything else in ClaudeChatSettings
    describes the Mac (claudePath, TC001, vault addendum) and is read from the
@@ -143,6 +147,11 @@ export class RemoteHost implements PluginHost {
     this.subprocessManager = new RemoteSubprocessManager(conn);
     this.settings = { ...DEFAULT_SETTINGS, ...this.loadDeviceSettings() };
     this.speech = new RemoteSpeechController(transport, () => this.settings) as unknown as SpeechController;
+    /* Synchronous on purpose: everything catalog-derived must be readable the
+       instant the first tab mounts, and the network refresh (prime) only
+       updates what this already put in place. */
+    const cached = this.loadCachedCatalog();
+    if (cached) this.applyCatalog(cached);
   }
 
   setTabResolver(resolve: (userMessage: string) => string | null): void {
@@ -153,11 +162,30 @@ export class RemoteHost implements PluginHost {
 
   /* Resolves the vault path and the first catalog. Called once from the
      renderer's boot sequence, before any tab mounts, mirroring the order
-     DesktopHost's caller uses (deny patterns primed, then catalogs). */
-  async prime(): Promise<void> {
-    const health = await this.conn.rpc("GET", "/health");
-    const cwd = (health.json as { cwd?: unknown } | undefined)?.cwd;
-    if (typeof cwd === "string") this.vaultPath = cwd;
+     DesktopHost's caller uses (deny patterns primed, then catalogs).
+
+     `opts.cwd`: the renderer has already awaited GET /health by the time it
+     calls this, so it passes the cwd along and the second /health round trip
+     is skipped. Without it the old behavior stands and /health is fetched
+     here.
+
+     The catalog fetch is awaited only on a first-ever launch (no cached
+     catalog in localStorage). Otherwise the constructor already applied the
+     last-known catalog, the refresh runs in the background, and this
+     resolves immediately so tabs mount against the cached pickers, MCP pill
+     and slash commands; the refresh updates them in place when it lands. */
+  async prime(opts?: { cwd?: string }): Promise<void> {
+    if (typeof opts?.cwd === "string") {
+      this.vaultPath = opts.cwd;
+    } else {
+      const health = await this.conn.rpc("GET", "/health");
+      const cwd = (health.json as { cwd?: unknown } | undefined)?.cwd;
+      if (typeof cwd === "string") this.vaultPath = cwd;
+    }
+    if (this.catalog) {
+      void this.refreshCatalog(false);
+      return;
+    }
     await this.refreshCatalog(false);
   }
 
@@ -167,22 +195,59 @@ export class RemoteHost implements PluginHost {
       const res = await this.conn.rpc("GET", force ? "/catalog?refresh=1" : "/catalog");
       if (res.status !== 200 || !res.json || typeof res.json !== "object") return this.catalog;
       const catalog = res.json as Catalog;
-      this.catalog = catalog;
-      this.skillCatalog = {
-        skills: Array.isArray(catalog.skills) ? catalog.skills : [],
-        commands: Array.isArray(catalog.commands) ? catalog.commands : [],
-      };
-      this.subagentCatalog = { agents: Array.isArray(catalog.subagents) ? catalog.subagents : [] };
-      this.mcpDenyPatterns = (catalog.mcpServers ?? [])
-        .filter(s => s.enabled === false)
-        .map(s => `mcp__${s.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`);
-      if (catalog.userName && !this.settings.userName) this.settings.userName = catalog.userName;
+      this.applyCatalog(catalog);
+      this.saveCachedCatalog(catalog);
       return catalog;
     })().finally(() => {
       if (this.catalogInflight === job) this.catalogInflight = null;
     });
     this.catalogInflight = job;
     return job;
+  }
+
+  /* The one place a catalog becomes host state, whether it arrived from
+     GET /catalog or from the localStorage copy of the last one that did.
+     Seeds RemoteFileStorage's disabled-server list as well, so the
+     `.claude/mcp.json` read every TabController does at mount is answered
+     from here rather than by its own GET /catalog. */
+  private applyCatalog(catalog: Catalog): void {
+    this.catalog = catalog;
+    this.skillCatalog = {
+      skills: Array.isArray(catalog.skills) ? catalog.skills : [],
+      commands: Array.isArray(catalog.commands) ? catalog.commands : [],
+    };
+    this.subagentCatalog = { agents: Array.isArray(catalog.subagents) ? catalog.subagents : [] };
+    const disabled = (catalog.mcpServers ?? []).filter(s => s.enabled === false);
+    this.mcpDenyPatterns = disabled
+      .map(s => `mcp__${s.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`);
+    this.storage.seedDisabledServers(disabled.map(s => s.name));
+    if (catalog.userName && !this.settings.userName) this.settings.userName = catalog.userName;
+  }
+
+  private saveCachedCatalog(catalog: Catalog): void {
+    try {
+      window.localStorage.setItem(CATALOG_KEY, JSON.stringify(catalog));
+    } catch {
+      /* Storage unavailable: the next launch just awaits /catalog as a
+         first launch does. */
+    }
+  }
+
+  /* Shape check only (array `models`, string `hash`): the payload was
+     written by refreshCatalog from a 200 the daemon produced, and the
+     per-field guards in applyCatalog cover the rest. */
+  private loadCachedCatalog(): Catalog | null {
+    let raw: string | null = null;
+    try { raw = window.localStorage.getItem(CATALOG_KEY); } catch { raw = null; }
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<Catalog> | null;
+      if (!parsed || typeof parsed !== "object") return null;
+      if (!Array.isArray(parsed.models) || typeof parsed.hash !== "string") return null;
+      return parsed as Catalog;
+    } catch {
+      return null;
+    }
   }
 
   get catalogSnapshot(): Catalog | null {

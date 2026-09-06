@@ -33,6 +33,12 @@ import { UsageFetcher } from "./usage";
 import { acceptUpgrade, isWebSocketUpgrade, rejectUpgrade, traceWs, type WsConnection } from "./ws";
 
 const TICKET_TTL_MS = 60_000;
+/* Catalog freshness: past this age a non-forced /catalog still answers from
+   cache but triggers a background rebuild (stale-while-revalidate). */
+const CATALOG_TTL_MS = 300_000;
+/* Keep-warm cadence, deliberately under CATALOG_TTL_MS so a cold open never
+   finds the cache stale in the first place. */
+const CATALOG_KEEP_WARM_MS = 240_000;
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const WAIT_MAX_S = 300;
 
@@ -78,6 +84,11 @@ export class GatewayServer {
   private vaultIndex: VaultIndex;
   private catalogCache: Catalog | null = null;
   private catalogAt = 0;
+  /* One build at a time: every reader (forced, cold, stale, keep-warm) that
+     wants a rebuild while one is running shares this promise instead of
+     spawning a second `claude mcp list`. */
+  private catalogInflight: Promise<Catalog> | null = null;
+  private catalogKeepWarm: NodeJS.Timeout | null = null;
 
   constructor(private deps: ServerDeps) {
     this.usage = new UsageFetcher(deps.log);
@@ -124,6 +135,7 @@ export class GatewayServer {
   }
 
   async close(): Promise<void> {
+    if (this.catalogKeepWarm) { clearInterval(this.catalogKeepWarm); this.catalogKeepWarm = null; }
     for (const sub of this.subs.values()) sub.conn.close(1001, "shutting_down");
     this.subs.clear();
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.resolve(null); }
@@ -212,7 +224,11 @@ export class GatewayServer {
       const wanted = new Set(servers);
       for (const name of wanted) if (!current.has(name)) await store.setServerDisabled(name, true);
       for (const name of current) if (!wanted.has(name)) await store.setServerDisabled(name, false);
-      this.catalogCache = null;
+      /* The disable list feeds the catalog, so the cached one is now wrong.
+         Rebuild in the background rather than nulling the cache and making
+         the next reader (usually the phone, right after this toggle) pay
+         for the `claude mcp list` spawn. */
+      void this.rebuildCatalog().catch(() => undefined);
       return sendJson(res, 200, { ok: true, disabled: Array.from(wanted) });
     }
 
@@ -320,13 +336,45 @@ export class GatewayServer {
   }
 
   async catalog(force = false): Promise<Catalog> {
-    /* 5-minute cache: the disk scans are cheap but `claude mcp list` spawns a
-       child that can take seconds when a remote connector is slow, and the
-       phone hits /catalog on every cold open. */
-    if (!force && this.catalogCache && Date.now() - this.catalogAt < 300_000) return this.catalogCache;
-    this.catalogCache = await buildCatalog(this.deps.config.vault, this.deps.claudePath, this.deps.log);
-    this.catalogAt = Date.now();
-    return this.catalogCache;
+    /* Stale-while-revalidate: the disk scans are cheap but `claude mcp list`
+       spawns a child that takes 3-4s in practice, and the phone awaits
+       /catalog on every cold open. So a non-forced request answers from
+       whatever cache exists immediately; if that copy is past
+       CATALOG_TTL_MS it kicks off one background rebuild that lands for the
+       next reader. Only a forced request or a fully cold daemon waits. */
+    if (force) return this.rebuildCatalog();
+    if (this.catalogCache) {
+      if (Date.now() - this.catalogAt >= CATALOG_TTL_MS) void this.rebuildCatalog().catch(() => undefined);
+      return this.catalogCache;
+    }
+    return this.rebuildCatalog();
+  }
+
+  /* Build (or join the in-flight build of) a fresh catalog and install it. */
+  private rebuildCatalog(): Promise<Catalog> {
+    if (this.catalogInflight) return this.catalogInflight;
+    const build = buildCatalog(this.deps.config.vault, this.deps.claudePath, this.deps.log)
+      .then(catalog => {
+        this.catalogCache = catalog;
+        this.catalogAt = Date.now();
+        return catalog;
+      })
+      .finally(() => { if (this.catalogInflight === build) this.catalogInflight = null; });
+    this.catalogInflight = build;
+    return build;
+  }
+
+  /* Rebuild the catalog on a cadence under its TTL so the cache is never
+     stale when a phone cold-opens. unref()'d: it must never be the thing
+     keeping the process alive. Idempotent. */
+  startCatalogKeepWarm(): void {
+    if (this.catalogKeepWarm) return;
+    this.catalogKeepWarm = setInterval(() => {
+      void this.rebuildCatalog()
+        .then(c => this.deps.log(`catalog keep-warm (hash ${c.hash}, ${c.mcpServers.length} mcp server(s))`))
+        .catch(() => undefined);
+    }, CATALOG_KEEP_WARM_MS);
+    this.catalogKeepWarm.unref();
   }
 
   private async getCatalog(res: ServerResponse, url: URL): Promise<void> {
@@ -577,7 +625,9 @@ export class GatewayServer {
      to make fast. `catalogHash` is a pure optimization (lets the client skip
      re-rendering its pickers when nothing changed) — a stale or null value
      here costs nothing beyond one redundant `/catalog` fetch, which
-     `RemoteHost.prime()` already makes independently of `hello`. */
+     `RemoteHost.prime()` already makes independently of `hello`. With the
+     keep-warm timer running, `catalogCache` is only null in the window
+     between daemon start and the first build landing. */
   private sendHello(conn: WsConnection): void {
     traceWs(conn.id, `sendHello: registry.list()=${this.deps.registry.list().length} tabs, catalogCache=${this.catalogCache ? "warm" : "cold"}`);
     conn.send(JSON.stringify(makeFrame("hello", null, 0, {
