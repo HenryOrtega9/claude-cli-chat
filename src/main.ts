@@ -39,6 +39,10 @@ import { SelectionTracker } from "./view/SelectionTracker";
    the Claude asterisk. */
 export const CLAUDE_ICON_ID = "claude-asterisk";
 
+/* Minimum spacing between two non-forced catalog scans (see
+   refreshSkillCatalog / refreshSubagentCatalog). */
+const CATALOG_SCAN_MIN_INTERVAL_MS = 30_000;
+
 /* The three sync calls Persistence.flushSync() needs, handed over at boot. */
 const nodeFs = { mkdirSync, renameSync, writeFileSync };
 
@@ -56,6 +60,13 @@ export default class ClaudeChatPlugin extends Plugin {
      on load so the `/agent` slash-command and the agents pill can list the
      full catalog before the first CLI subprocess spawn. */
   subagentCatalog: SubagentCatalog = { agents: [] };
+  /* Wall-clock (ms) of the last disk scan for each catalog. Both scans are
+     synchronous walks of ~/.claude, the vault's .claude and every plugin
+     cache dir, and both are wired to user-driven paths (the `/` popup and
+     the `/agent` command), so without a throttle each keystroke that opens
+     the popup blocks the renderer on a full rescan. 0 = never scanned. */
+  private lastSkillScanAt = 0;
+  private lastSubagentScanAt = 0;
   /* Shared allowlist writer for <vault>/.claude/settings.json. Used by the
      settings tab and by the per-tab attach popup's trusted-folder toggle.
      Holding a single store ensures the serialized write chain is shared so
@@ -316,7 +327,14 @@ export default class ClaudeChatPlugin extends Plugin {
     return job;
   }
 
-  refreshSkillCatalog(): void {
+  /* Skip the disk walk when the last one landed under CATALOG_SCAN_MIN_INTERVAL_MS
+     ago, keeping the existing catalog. `force` bypasses the throttle for
+     callers that represent an explicit user rescan (settings tab / manager
+     modal buttons) or a known change (a subagent was just created). */
+  refreshSkillCatalog(opts?: { force?: boolean }): void {
+    const now = Date.now();
+    if (!opts?.force && now - this.lastSkillScanAt < CATALOG_SCAN_MIN_INTERVAL_MS) return;
+    this.lastSkillScanAt = now;
     try {
       this.skillCatalog = discoverSkillsAndCommands(this.getVaultPath());
     } catch (err) {
@@ -326,7 +344,10 @@ export default class ClaudeChatPlugin extends Plugin {
     }
   }
 
-  refreshSubagentCatalog(): void {
+  refreshSubagentCatalog(opts?: { force?: boolean }): void {
+    const now = Date.now();
+    if (!opts?.force && now - this.lastSubagentScanAt < CATALOG_SCAN_MIN_INTERVAL_MS) return;
+    this.lastSubagentScanAt = now;
     try {
       this.subagentCatalog = discoverSubagents(this.getVaultPath());
     } catch (err) {

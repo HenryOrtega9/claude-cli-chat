@@ -172,8 +172,11 @@ export class TabController {
   private errorBubbleEmitted = false;
 
   /* Resolves when the initial replayMessages() pass finishes. submit() awaits
-     this before mutating state to avoid racing the renderer's catch-up. */
+     this before mutating state to avoid racing the renderer's catch-up.
+     Created eagerly in the constructor; fulfilled by startReplay(). */
   private replayDone: Promise<void>;
+  private resolveReplay: () => void = () => {};
+  private replayStarted = false;
 
   constructor(
     plugin: PluginHost,
@@ -426,17 +429,14 @@ export class TabController {
        that races the renderer's catch-up pass. setBusy(false) re-enables it
        once replay resolves. */
     this.inputBox.setBusy(true);
-    this.replayDone = this.replayMessages().finally(() => {
-      if (!this.state.busy) this.inputBox.setBusy(false);
-      /* Restored history painted in full above; from here on new assistant
-         bubbles type out (when the setting is on). */
-      this.renderer.setTypewriterArmed(true);
-      /* After replay, surface any in-flight Task/Agent tools the persisted
-         state still has marked running. Resumed tabs from a hard reload may
-         carry stale "running" statuses; surfacing them is honest to what's
-         in state and lets the user see something is unresolved. */
-      this.refreshRunningAgentCount();
-    });
+    this.replayDone = new Promise<void>(resolve => { this.resolveReplay = resolve; });
+    /* Replay is deferred until the tab is first shown: the view constructs
+       every persisted tab at load, and replaying all of them up front means
+       an `await renderMarkdown` per message for tabs nobody is looking at.
+       Two cases can't wait for show(): a tab restored mid-turn (`busy`) has
+       live events about to land on top of its history, and an empty tab has
+       nothing to replay, so resolving now keeps its composer enabled. */
+    if (this.state.busy || this.state.messages.length === 0) this.startReplay();
     this.updateWelcomeVisibility();
     /* Reconciliation for a gap that only the remote (iOS gateway) engine
        has: an approval card is normally created ONLY from a live
@@ -462,7 +462,30 @@ export class TabController {
     if (this.state.busy) void this.ensureSession();
   }
 
-  show() { this.root.style.display = ""; }
+  show() {
+    this.root.style.display = "";
+    this.startReplay();
+  }
+
+  /* Idempotent: runs the initial replay pass once, then fulfills replayDone.
+     Called from show() (the view calls show() on the active tab) and from the
+     constructor for busy or empty tabs; see the constructor comment. */
+  private startReplay(): void {
+    if (this.replayStarted) return;
+    this.replayStarted = true;
+    void this.replayMessages().finally(() => {
+      if (!this.state.busy) this.inputBox.setBusy(false);
+      /* Restored history painted in full above; from here on new assistant
+         bubbles type out (when the setting is on). */
+      this.renderer.setTypewriterArmed(true);
+      /* After replay, surface any in-flight Task/Agent tools the persisted
+         state still has marked running. Resumed tabs from a hard reload may
+         carry stale "running" statuses; surfacing them is honest to what's
+         in state and lets the user see something is unresolved. */
+      this.refreshRunningAgentCount();
+      this.resolveReplay();
+    });
+  }
   /* Switching away is one of the moments a relaunch or an iOS background-kill
      can follow soon after — flush any debounced draft before the tab goes
      dark rather than trusting the composer's own 500ms timer. */
@@ -1962,7 +1985,9 @@ export class TabController {
           this.toolToMessage.set(block.id, msg.id);
           if (block.name === "Task" || block.name === "Agent") this.refreshRunningAgentCount();
         }
-        this.streamingBlocks.set(inner.index, { kind: "tool", toolId: block.id, partialJson: "" });
+        /* `block.input` is `{}` from the API; the deltas stream the real JSON
+           from scratch, so the bracket scanner starts at depth 0. */
+        this.streamingBlocks.set(inner.index, { kind: "tool", toolId: block.id, partialJson: "", depth: 0, inString: false, escape: false });
         /* Re-arm the gerund spinner. Tool execution is a silent server-side
            wait — without this the indicator dies on the first text_delta
            and never returns, leaving a void below the running tool. */
@@ -1999,14 +2024,31 @@ export class TabController {
       } else if (inner.delta.type === "input_json_delta") {
         const slot = this.streamingBlocks.get(inner.index);
         if (slot && slot.kind === "tool") {
-          slot.partialJson += inner.delta.partial_json;
-          /* A top-level tool-input object only becomes parseable on the delta
-             that carries its closing brace; skip the full-buffer parse on
-             interior-content deltas to avoid O(n^2) scans + thrown SyntaxErrors
-             while a large value (e.g. Write/Edit content) streams. The
-             authoritative final input is set in handleAssistant, so these
-             intermediate parses are a cosmetic live preview only. */
-          if (inner.delta.partial_json.includes("}")) {
+          const chunk = inner.delta.partial_json;
+          slot.partialJson += chunk;
+          /* Incremental bracket/string scanner over only the NEW characters.
+             The buffer is parseable exactly when every bracket has closed
+             outside a string, so we attempt JSON.parse only then; a
+             `}`-contains heuristic would re-parse the whole buffer (and throw)
+             on nearly every delta while a large Write/Edit `content` value
+             streams, which is O(n^2). The authoritative final input is set in
+             handleAssistant, so these intermediate parses are a cosmetic live
+             preview only. */
+          for (let i = 0; i < chunk.length; i++) {
+            const ch = chunk[i];
+            if (slot.inString) {
+              if (slot.escape) slot.escape = false;
+              else if (ch === "\\") slot.escape = true;
+              else if (ch === '"') slot.inString = false;
+            } else if (ch === '"') {
+              slot.inString = true;
+            } else if (ch === "{" || ch === "[") {
+              slot.depth++;
+            } else if (ch === "}" || ch === "]") {
+              slot.depth--;
+            }
+          }
+          if (slot.depth === 0 && !slot.inString && slot.partialJson.length > 0) {
             try {
               const parsed = JSON.parse(slot.partialJson);
               /* Resolve the owning message via toolToMessage first — that map
@@ -2959,7 +3001,10 @@ export class TabController {
   /* Per-pass map of content-block index → block metadata. Used so streaming
      `input_json_delta` and `thinking_delta` events can find which tool entry
      or thinking buffer to append to. Cleared on each assistant event. */
-  private streamingBlocks = new Map<number, { kind: "tool"; toolId: string; partialJson: string } | { kind: "thinking" }>();
+  private streamingBlocks = new Map<number,
+    | { kind: "tool"; toolId: string; partialJson: string; depth: number; inString: boolean; escape: boolean }
+    | { kind: "thinking" }
+  >();
 
   private getOrCreateStreamingAssistantMessage(): ChatMessage {
     if (this.streamingAssistantMessageId) {

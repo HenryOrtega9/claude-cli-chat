@@ -174,7 +174,7 @@ export class CreateSubagentModal extends PlatformModal {
        pill (via onCreated callback), the /agent picker, and the SubagentManager
        modal next time it opens. Cheap and synchronous — same call the
        Refresh button in the manager modal uses. */
-    this.plugin.refreshSubagentCatalog();
+    this.plugin.refreshSubagentCatalog({ force: true });
     this.onCreated();
     platform.notify(`Created ${scope} subagent "${name}".`);
     this.close();

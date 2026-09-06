@@ -118,6 +118,14 @@ type TabMeta = {
   messageCount: number;
 };
 
+/* Trailing debounce for per-tab writes: coalesce streaming updates so a tab
+   is written at most once per quiet gap of this length. */
+const SAVE_DEBOUNCE_MS = 500;
+/* Upper bound on how long the debounce may keep being re-armed without a
+   write landing. Streaming fires scheduleSaveTab per token, which would
+   otherwise starve the trailing timer for the entire reply. */
+const SAVE_MAX_WAIT_MS = 5000;
+
 type TabIndex = {
   activeTabId: string | null;
   tabs: Array<{ id: string; title: string; sessionId: string | null }>;
@@ -132,7 +140,9 @@ export class Persistence {
   private readonly dir: string;
   private readonly convDir: string;
   private readonly indexPath: string;
-  private pendingWrites = new Map<string, { handle: ReturnType<typeof setTimeout>; state: TabState }>();
+  /* firstScheduledAt is when the tab's current debounce window opened; it
+     survives re-arms so scheduleSaveTab can enforce SAVE_MAX_WAIT_MS. */
+  private pendingWrites = new Map<string, { handle: ReturnType<typeof setTimeout>; state: TabState; firstScheduledAt: number }>();
   /* Per-tab in-flight save promise. Used by deleteTab/flush to await a save
      that's already started before issuing remove() or returning. */
   private inflightSaves = new Map<string, Promise<void>>();
@@ -263,29 +273,51 @@ export class Persistence {
      token only to discard all but the last snapshot before a quiet period. */
   scheduleSaveTab(state: TabState): void {
     const existing = this.pendingWrites.get(state.id);
-    if (existing) clearTimeout(existing.handle);
+    if (existing) {
+      clearTimeout(existing.handle);
+      /* Max-wait guard. A pure trailing debounce never fires while
+         onStateChange keeps re-arming it per streaming token, so a long
+         reply would write nothing until a 500ms gap and a crash mid-stream
+         would lose the whole in-progress turn. Once the window has been
+         open for SAVE_MAX_WAIT_MS, save now instead of re-arming; the next
+         schedule opens a fresh window. */
+      if (Date.now() - existing.firstScheduledAt >= SAVE_MAX_WAIT_MS) {
+        this.pendingWrites.delete(state.id);
+        this.dispatchSave(state);
+        return;
+      }
+    }
+    const firstScheduledAt = existing?.firstScheduledAt ?? Date.now();
     const handle = setTimeout(() => {
       this.pendingWrites.delete(state.id);
-      /* doSaveTab can throw (disk full, EACCES, a transient iCloud rename
-         lock — see writeJsonAtomic's own retry comment), and this dispatch
-         is otherwise fire-and-forget: an uncaught rejection here would be
-         an unhandled promise rejection with zero user-visible signal, and
-         the write is already off pendingWrites so flush()/flushSync() at
-         unload wouldn't know to retry it. Warn and re-arm so it isn't lost
-         from tracking — unless a newer edit already rescheduled this tab. */
-      void this.saveTab(this.snapshotState(state)).catch(err => {
-        console.warn(`[claude-cli-chat] debounced save failed for tab ${state.id}`, err);
-        if (!this.pendingWrites.has(state.id)) this.scheduleSaveTab(state);
-      });
-    }, 500);
-    this.pendingWrites.set(state.id, { handle, state });
+      this.dispatchSave(state);
+    }, SAVE_DEBOUNCE_MS);
+    this.pendingWrites.set(state.id, { handle, state, firstScheduledAt });
+  }
+
+  /* Shared dispatch for the debounce timer and the max-wait path. doSaveTab
+     can throw (disk full, EACCES, a transient iCloud rename lock — see
+     writeJsonAtomic's own retry comment), and this dispatch is otherwise
+     fire-and-forget: an uncaught rejection here would be an unhandled
+     promise rejection with zero user-visible signal, and the write is
+     already off pendingWrites so flush()/flushSync() at unload wouldn't know
+     to retry it. Warn and re-arm so it isn't lost from tracking — unless a
+     newer edit already rescheduled this tab. */
+  private dispatchSave(state: TabState): void {
+    void this.saveTab(this.snapshotState(state)).catch(err => {
+      console.warn(`[claude-cli-chat] debounced save failed for tab ${state.id}`, err);
+      if (!this.pendingWrites.has(state.id)) this.scheduleSaveTab(state);
+    });
   }
 
   /* Shallow-clone the persisted-relevant fields into a fresh object so
      a tab destroy or message mutation between this synchronous snapshot and
      saveTab's async work doesn't surface as a torn write. messages is
      array-cloned with each entry shallow-cloned too, since streaming mutates
-     entry.content in place. */
+     entry.content in place. Each toolCalls entry is shallow-cloned for the
+     same reason: streaming mutates tool.result/tool.status in place, and
+     doSaveTab awaits ensureDirs() before serializing, so a shared ToolCall
+     object could otherwise change between snapshot and write. */
   private snapshotState(state: TabState): TabState {
     return {
       id: state.id,
@@ -293,7 +325,10 @@ export class Persistence {
       title: state.title,
       createdAt: state.createdAt,
       updatedAt: state.updatedAt,
-      messages: state.messages.map(m => ({ ...m })),
+      messages: state.messages.map(m => ({
+        ...m,
+        toolCalls: m.toolCalls?.map(tc => ({ ...tc })),
+      })),
       pendingApprovals: state.pendingApprovals,
       busy: state.busy,
       model: state.model,
@@ -302,6 +337,11 @@ export class Persistence {
       envSnippetId: state.envSnippetId,
       pinnedFilePaths: state.pinnedFilePaths ? [...state.pinnedFilePaths] : undefined,
       stickyPinnedFilePaths: state.stickyPinnedFilePaths ? [...state.stickyPinnedFilePaths] : undefined,
+      /* Every disk write goes through this snapshot and toStored() reads
+         state.voiceEnabled, so omitting it here silently dropped the per-tab
+         Voice pill on every save (the tab re-seeded from voiceDefaultOn on
+         reload). */
+      voiceEnabled: state.voiceEnabled,
       draft: state.draft,
     };
   }

@@ -112,23 +112,70 @@ const EVENT_LOG_PREVIEW_CHARS = 500;
    Every event (assistant content blocks, tool results, echoed user
    attachments, and — since includePartialMessages defaults on — a
    high-frequency stream of partial-message deltas) used to be logged via
-   the raw object reference. That's unbounded (a Read of a large file, a
-   long Grep match, or a pasted image/PDF's base64 all flow through here)
-   and Electron/Chromium's console retains references to logged objects for
-   the life of the console buffer, so a session with a few large payloads
-   accumulates real retained memory. Serializing to a capped string avoids
-   both the size and the retention: a truncated string holds no reference
-   back to the original (possibly much larger) object. */
+   the raw object reference, and later via JSON.stringify(event).slice(500).
+   Both are unbounded in COST even when the output is bounded: a Read of a
+   large file, a long Grep match, or a pasted image/PDF's base64 (echoed back
+   in the `user` event) all get fully serialized just to keep 500 chars, and
+   the hundreds of stream_event deltas per reply each pay that price too.
+   Build the preview from the few fields the debug log actually needs
+   (type / subtype / session_id / a per-block summary) and never touch the
+   bulk payload. A truncated string also holds no reference back to the
+   original object, so the console buffer retains nothing large. */
+function clip(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…(+${s.length - n})` : s;
+}
+
+function summarizeBlock(block: unknown): string {
+  if (typeof block !== "object" || block === null) return typeof block;
+  const b = block as Record<string, unknown>;
+  const t = typeof b.type === "string" ? b.type : "?";
+  switch (t) {
+    case "text":
+      return `text:${JSON.stringify(clip(typeof b.text === "string" ? b.text : "", 120))}`;
+    case "tool_use":
+      return `tool_use:${String(b.name)}#${String(b.id)}`;
+    case "tool_result": {
+      const c = b.content;
+      const len = typeof c === "string" ? c.length : Array.isArray(c) ? c.length : 0;
+      const unit = typeof c === "string" ? "chars" : "blocks";
+      return `tool_result:${String(b.tool_use_id)}${b.is_error ? " is_error" : ""} ${len} ${unit}`;
+    }
+    case "image":
+    case "document": {
+      const src = (b.source ?? {}) as Record<string, unknown>;
+      const data = typeof src.data === "string" ? src.data.length : 0;
+      return `${t}:${String(src.media_type ?? "?")} ${data} b64chars`;
+    }
+    default:
+      return t;
+  }
+}
+
 function previewEvent(event: StreamEvent): string {
-  let json: string;
   try {
-    json = JSON.stringify(event);
+    const e = event as Record<string, unknown>;
+    const parts: string[] = [`type=${String(e.type)}`];
+    if (typeof e.subtype === "string") parts.push(`subtype=${e.subtype}`);
+    if (typeof e.session_id === "string") parts.push(`session_id=${e.session_id}`);
+    if (e.type === "assistant" || e.type === "user") {
+      const msg = (e.message ?? {}) as Record<string, unknown>;
+      const content = msg.content;
+      /* Wire-format gotcha #6: user content may arrive as a plain string. */
+      if (typeof content === "string") parts.push(`content=text(str):${JSON.stringify(clip(content, 120))}`);
+      else if (Array.isArray(content)) parts.push(`content=[${content.map(summarizeBlock).join(", ")}]`);
+    }
+    return clip(parts.join(" "), EVENT_LOG_PREVIEW_CHARS);
   } catch {
     return `[unserializable event type=${event.type}]`;
   }
-  return json.length > EVENT_LOG_PREVIEW_CHARS
-    ? `${json.slice(0, EVENT_LOG_PREVIEW_CHARS)}…(+${json.length - EVENT_LOG_PREVIEW_CHARS} chars)`
-    : json;
+}
+
+/* stream_event deltas are pure noise in the debug log; only the envelope
+   boundaries carry information worth a console line. */
+function shouldLogEvent(event: StreamEvent): boolean {
+  if (event.type !== "stream_event") return true;
+  const inner = (event as { event?: { type?: string } }).event;
+  return inner?.type === "message_start" || inner?.type === "message_stop";
 }
 
 export class TabSession {
@@ -299,7 +346,7 @@ export class TabSession {
 
   private handleEvent(event: StreamEvent) {
     /* eslint-disable no-console */
-    console.log(`[claude-cli-chat] event type=${event.type}`, previewEvent(event));
+    if (shouldLogEvent(event)) console.log(`[claude-cli-chat] event`, previewEvent(event));
     if (event.type === "system" && (event as { subtype?: string }).subtype === "init") {
       const init = event as { session_id?: string };
       if (init.session_id) this.sessionId = init.session_id;

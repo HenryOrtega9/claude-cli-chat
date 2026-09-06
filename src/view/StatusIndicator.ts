@@ -69,6 +69,13 @@ export class StatusIndicator {
      turn time — a turn with long-but-progressing tool calls keeps resetting
      it. Only genuine silence (a wedged/dead CLI emitting nothing) trips it. */
   private static readonly WATCHDOG_MS = 120_000;
+  /* heartbeat() fires on every inbound CLI event, streaming deltas included,
+     and each arm is a clearTimeout + setTimeout pair. Against a 120s ceiling
+     a second of slack is invisible, so heartbeat only re-arms once this much
+     time has passed since the last arm. setThinking() and suspendWatchdog()
+     stay unconditional. */
+  private static readonly HEARTBEAT_MIN_INTERVAL_MS = 1000;
+  private lastArmedAt = 0;
 
   constructor(parent: HTMLElement) {
     this.root = parent.createDiv({ cls: "claudian-status-indicator" });
@@ -112,6 +119,13 @@ export class StatusIndicator {
      mid-turn. No-op unless a thinking spinner is currently showing. */
   heartbeat() {
     if (this.mode !== "thinking") return;
+    /* Throttle only while a watchdog is actually armed. With no timer
+       pending (suspendWatchdog() during an approval, or a fired watchdog)
+       the first sign of life must re-arm immediately, exactly as before. */
+    if (this.watchdogTimer !== null &&
+        Date.now() - this.lastArmedAt < StatusIndicator.HEARTBEAT_MIN_INTERVAL_MS) {
+      return;
+    }
     this.armWatchdog();
   }
 
@@ -122,6 +136,7 @@ export class StatusIndicator {
      never on a long-but-progressing turn. Cleared by hide()/setRetrying()
      via clearTimers. */
   private armWatchdog() {
+    this.lastArmedAt = Date.now();
     if (this.watchdogTimer !== null) window.clearTimeout(this.watchdogTimer);
     this.watchdogTimer = window.setTimeout(() => {
       this.watchdogTimer = null;

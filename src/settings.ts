@@ -299,7 +299,7 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
         btn.setIcon("refresh-cw")
           .setTooltip("Rescan disk for subagent definitions")
           .onClick(() => {
-            this.plugin.refreshSubagentCatalog();
+            this.plugin.refreshSubagentCatalog({ force: true });
             this.display();
             new Notice(`Rescanned subagents: ${this.plugin.subagentCatalog.agents.length} discovered.`);
           });

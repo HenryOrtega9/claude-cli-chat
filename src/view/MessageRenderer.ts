@@ -83,6 +83,22 @@ export class MessageListRenderer {
      on every streaming delta, so a user-collapsed block doesn't auto-reopen
      on the next token. Absent = use the streaming default. */
   private thinkingOpenOverride = new Map<string, boolean>();
+  /* Per-message content signature from the last real renderContent pass,
+     keyed by msg.id. renderContent does el.empty() plus a full markdown
+     re-parse of the whole message, yet many upserts change nothing it reads
+     (a tool status flip, every nested subagent event, agent-detail refreshes,
+     sweep re-renders). doUpsert rebuilds the signature from exactly the
+     inputs renderContent consumes and skips the re-parse when it matches
+     and the bubble already exists. Cleared in reset(), dropped per id in
+     removeMessage(). */
+  private contentSig = new Map<string, string>();
+  /* Per-tool body signature, keyed by tool.id: the `input` object reference
+     (the controller REPLACES tool.input on update rather than mutating it),
+     the result string, and name/status/isError. upsertTool skips the
+     todo/diff/content rebuild (renderToolDiff alone can be hundreds of rows)
+     when nothing it depends on changed; the cheap header/status code keeps
+     its own transition guard. Swept alongside toolEls. */
+  private toolBodySig = new Map<string, { input: Record<string, unknown>; result: string | undefined; key: string }>();
   /* Owns the grouped agent card that replaces per-spawn tool rows. Keyed by
      message id internally; spawn tools never enter `toolEls`. */
   private agentGroups = new AgentGroupRenderer();
@@ -287,6 +303,8 @@ export class MessageListRenderer {
     this.stopTypewriter();
     this.removeEpoch.clear();
     this.thinkingOpenOverride.clear();
+    this.contentSig.clear();
+    this.toolBodySig.clear();
     this.agentGroups.reset();
     /* Clear render chains too: a doUpsert queued behind an in-flight
        MarkdownRenderer.render await would otherwise re-run after reset, miss
@@ -569,6 +587,7 @@ export class MessageListRenderer {
     for (const [toolId, toolEl] of Array.from(this.toolEls)) {
       if (entry.root.contains(toolEl)) {
         this.toolEls.delete(toolId);
+        this.toolBodySig.delete(toolId);
       }
     }
     this.agentGroups.removeForMessage(id);
@@ -579,6 +598,7 @@ export class MessageListRenderer {
     (entry.root.closest(".claudian-message-wrapper") ?? entry.root).remove();
     this.liveEls.delete(id);
     this.thinkingOpenOverride.delete(id);
+    this.contentSig.delete(id);
     this.renderChains.delete(id);
     this.reveal.delete(id);
     /* Same gap as reset()'s: a pending trailing render for this id would
@@ -601,6 +621,7 @@ export class MessageListRenderer {
        re-appends the bubble removeMessage() just tore down. */
     if (idEpoch !== (this.removeEpoch.get(msg.id) ?? 0)) return;
     let entry = this.liveEls.get(msg.id);
+    const isNewBubble = !entry;
     if (!entry) {
       entry = this.createBubble(msg);
       this.liveEls.set(msg.id, entry);
@@ -613,12 +634,23 @@ export class MessageListRenderer {
         this.ensureTypewriterTicking();
       }
     }
-    await this.renderContent(entry.content, msg);
-    /* renderContent awaits MarkdownRenderer; removeMessage() (preamble fold)
-       can run during that await, detaching entry.root and clearing liveEls. If
-       so, bail — otherwise we write to a detached bubble and re-register this
-       message's tools in toolEls pointing at orphaned DOM. */
-    if (this.liveEls.get(msg.id) !== entry) return;
+    /* Skip the markdown re-parse when nothing renderContent reads has changed
+       since the last real render of this bubble. The signature is computed
+       AFTER the reveal bookkeeping above (and after upsertMessage /
+       tickTypewriter have already moved or deleted the cursor), so the
+       typewriter's final full-fidelity pass sees isRevealing flip to false
+       and the post-stream `assistant` event sees `streaming` / `durationMs`
+       change — both still render. A brand-new bubble always renders. */
+    const sig = this.contentSignature(msg);
+    if (isNewBubble || this.contentSig.get(msg.id) !== sig) {
+      await this.renderContent(entry.content, msg);
+      /* renderContent awaits MarkdownRenderer; removeMessage() (preamble fold)
+         can run during that await, detaching entry.root and clearing liveEls. If
+         so, bail — otherwise we write to a detached bubble and re-register this
+         message's tools in toolEls pointing at orphaned DOM. */
+      if (this.liveEls.get(msg.id) !== entry) return;
+      this.contentSig.set(msg.id, sig);
+    }
     if (msg.toolCalls) {
       const spawnTools = msg.toolCalls.filter(isSpawnTool);
       let groupPlaced = false;
@@ -645,6 +677,30 @@ export class MessageListRenderer {
       }
     }
     this.scrollToBottom();
+  }
+
+  /* Everything renderContent reads, folded into one string. Variable-length
+     fields carry a length prefix so adjacent fields can't alias each other.
+     Attachments never change after creation, so count + kind/filename is
+     enough to distinguish them. */
+  private contentSignature(msg: ChatMessage): string {
+    const text = this.visibleContent(msg);
+    const thinking = msg.thinking ?? "";
+    const atts = msg.attachments ?? [];
+    const attSig = atts.length === 0
+      ? "0"
+      : `${atts.length}:` + atts.map(a => `${a.kind ?? "image"}/${a.filename ?? ""}`).join(",");
+    return [
+      msg.role,
+      msg.streaming ? 1 : 0,
+      msg.thinkingStreaming ? 1 : 0,
+      msg.durationMs ?? "",
+      this.isRevealing(msg) ? 1 : 0,
+      this.passHasVisibleContent(msg) ? 1 : 0,
+      attSig,
+      `${thinking.length}:${thinking}`,
+      `${text.length}:${text}`,
+    ].join("|");
   }
 
   upsertTool(parentEl: HTMLElement, tool: ToolCall) {
@@ -729,6 +785,17 @@ export class MessageListRenderer {
     } else if (tool.status === "running" && !toolEl.hasClass("is-user-toggled")) {
       toolEl.addClass("is-expanded");
     }
+
+    /* Body rebuild guard (see toolBodySig). Header subject/status above are
+       cheap and keep their own transition guard; everything below tears down
+       and re-creates DOM proportional to the tool's input + result, and
+       upsertTool runs for every tool of a message on every streaming tick. */
+    const bodyKey = `${tool.name}|${tool.status}|${tool.isError ? 1 : 0}`;
+    const prevBody = this.toolBodySig.get(tool.id);
+    if (prevBody && prevBody.input === tool.input && prevBody.result === tool.result && prevBody.key === bodyKey) {
+      return;
+    }
+    this.toolBodySig.set(tool.id, { input: tool.input, result: tool.result, key: bodyKey });
 
     /* TodoWrite gets special treatment — render the list outside the
        collapsed content area so the user always sees the current todos

@@ -46,7 +46,7 @@ export class SubagentManagerModal extends PlatformModal {
     headerRow.createEl("h3", { text: `${agents.length} discovered` });
     const refreshBtn = headerRow.createEl("button", { text: "Refresh", cls: "mod-cta" });
     refreshBtn.addEventListener("click", () => {
-      this.plugin.refreshSubagentCatalog();
+      this.plugin.refreshSubagentCatalog({ force: true });
       this.render();
       platform.notify(`Rescanned subagents: ${this.plugin.subagentCatalog.agents.length} discovered.`);
     });

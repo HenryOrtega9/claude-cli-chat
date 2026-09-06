@@ -129,8 +129,8 @@ export interface PluginHost {
   saveSettings(): Promise<void>;
   getMcpServers(force?: boolean): Promise<ParsedMcpServer[]>;
   refreshMcpDenyPatterns(): Promise<void>;
-  refreshSkillCatalog(): void;
-  refreshSubagentCatalog(): void;
+  refreshSkillCatalog(opts?: { force?: boolean }): void;
+  refreshSubagentCatalog(opts?: { force?: boolean }): void;
   updateMcpToolCache(grouped: Record<string, string[]>): Promise<void>;
   pruneMcpToolCache(validSids: ReadonlySet<string>): Promise<void>;
   /* UI-component factories for the Obsidian-only widgets TabController

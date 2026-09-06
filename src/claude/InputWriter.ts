@@ -47,8 +47,31 @@ export class InputWriter {
       });
       if (!ok) {
         /* Stream backpressure: wait for the buffer to flush before resolving
-           so the next chained write doesn't pile on top. */
-        this.stdin.once("drain", () => resolve());
+           so the next chained write doesn't pile on top. The stream can also
+           error or close before `drain` ever fires (child died mid-write),
+           and a destroyed stream doesn't always invoke the write callback,
+           so listen for those too — otherwise this promise never settles and
+           the whole writeChain (and every later closeStdin()) hangs. Settle
+           exactly once and remove all three listeners so nothing leaks per
+           write. */
+        let settled = false;
+        const cleanup = () => {
+          this.stdin.off("drain", onDrain);
+          this.stdin.off("error", onError);
+          this.stdin.off("close", onClose);
+        };
+        const settle = (fn: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          fn();
+        };
+        const onDrain = () => settle(() => resolve());
+        const onError = (err: Error) => settle(() => reject(err));
+        const onClose = () => settle(() => reject(new Error("Claude subprocess stdin closed before drain")));
+        this.stdin.on("drain", onDrain);
+        this.stdin.on("error", onError);
+        this.stdin.on("close", onClose);
       }
     });
   }

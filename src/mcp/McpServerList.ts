@@ -120,7 +120,12 @@ export function listMcpServersViaCli(claudePath: string, timeoutMs = 30_000): Pr
     child.stdout.on("data", chunk => { stdout += chunk; });
     child.stderr.on("data", chunk => { stderr += chunk; });
     child.on("error", err => finish(() => reject(err)));
-    child.on("exit", code => finish(() => {
+    /* Resolve on `close`, not `exit`: `exit` can fire while stdout still holds
+       undelivered chunks, so a long server list would be parsed truncated and
+       servers would silently vanish from the modal / pill. `close` only fires
+       after both stdio streams have ended (same hazard QuickPrompt and
+       SubprocessManager guard against). */
+    child.on("close", code => finish(() => {
       if (code === 0) resolve(parseMcpListOutput(stdout));
       else reject(new Error(stderr.trim() || stdout.trim() || `claude mcp list exited ${code}`));
     }));
