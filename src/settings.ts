@@ -10,7 +10,7 @@ import { SubagentManagerModal } from "./view/SubagentManagerModal";
 import {
   MODEL_IDS,
   MODEL_LABELS,
-  MODEL_NOTES,
+  noteForModel,
   EFFORT_ORDER,
   EFFORT_LABELS,
   PERMISSION_MODE_ORDER,
@@ -99,7 +99,7 @@ export class ClaudeChatSettingTab extends PluginSettingTab {
       .addDropdown(dd => {
         const options: Record<string, string> = {};
         for (const key of Object.keys(MODEL_LABELS) as ModelKey[]) {
-          const note = MODEL_NOTES[key];
+          const note = noteForModel(key);
           options[key] = `${MODEL_LABELS[key]} (${MODEL_IDS[key]})${note ? ` - ${note}` : ""}`;
         }
         dd.addOptions(options)

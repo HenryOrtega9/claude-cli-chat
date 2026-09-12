@@ -47,8 +47,12 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
   "haiku": "Haiku",
 };
 
-/* Availability caveats surfaced under the model name in the picker popup
-   and appended to the settings dropdown. fable-5 was relaunched 2026-07-01
+/* Per-model availability caveats, surfaced under the model name in the
+   picker popup and appended to the settings dropdown. Empty today: the
+   Fable caveat applies to the whole family, so it lives on the FABLE entry
+   in MODEL_GROUPS below (see `note`) and covers every current and future
+   Fable model without a per-key entry. Keep this map for a caveat that is
+   genuinely specific to one model. Background: fable-5 was relaunched 2026-07-01
    with promotional plan-included access (up to 50% of weekly limits),
    extended twice (Jul 7 → Jul 12 → Jul 19). On 2026-07-18 Anthropic
    announced the permanent structure effective Jul 20: Fable 5 is included
@@ -63,21 +67,40 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
    TabController fall back gracefully for anyone who had it persisted.
    1M context and xhigh effort are confirmed supported, so it carries the
    `[1m]` suffix and the full effort ladder like the Opus 1M variants. */
-export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {
-  "fable-5": "Included in Max plans (up to 50% of weekly limits) as of Jul 20, 2026. No usage credits needed.",
-};
+export const MODEL_NOTES: Partial<Record<ModelKey, string>> = {};
+
+/* The Fable family caveat. Rendered under the FABLE group header (not under
+   any one row) so it reads as applying to every model in the group. */
+export const FABLE_FAMILY_NOTE =
+  "Included in Max plans (up to 50% of weekly limits) as of Jul 20, 2026. No usage credits needed.";
 
 /* Ordered sections for the model-picker popup; each renders under its own
    header. Fable (the newest family) leads, then Opus variants (including
    the opus-plan alias, which routes to Opus), then Sonnet, then Haiku.
    Keep in sync with MODEL_IDS: every ModelKey must appear in exactly one
-   group. */
-export const MODEL_GROUPS: { header: string; keys: ModelKey[] }[] = [
-  { header: "FABLE", keys: ["fable-5-1", "fable-5"] },
+   group. An optional `note` is a family-wide caveat shown once under the
+   group header and applied to every key in the group. */
+export interface ModelGroup {
+  header: string;
+  keys: ModelKey[];
+  note?: string;
+}
+export const MODEL_GROUPS: ModelGroup[] = [
+  { header: "FABLE", keys: ["fable-5-1", "fable-5"], note: FABLE_FAMILY_NOTE },
   { header: "OPUS", keys: ["opus-5", "opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
   { header: "SONNET", keys: ["sonnet-5", "sonnet-1m"] },
   { header: "HAIKU", keys: ["haiku"] },
 ];
+
+/* The caveat that applies to a model: its own MODEL_NOTES entry wins, else
+   its family's group note, else nothing. Single source for the settings
+   dropdown and the iOS settings sheet, which show one line per model rather
+   than a grouped list with headers. */
+export function noteForModel(model: ModelKey): string | undefined {
+  const own = MODEL_NOTES[model];
+  if (own) return own;
+  return MODEL_GROUPS.find(g => g.keys.includes(model))?.note;
+}
 
 /* Effort levels mirror Claude Code CLI's `--effort` flag (v2.1.141:
    low, medium, high, xhigh, max). xhigh is Opus-only — the UI hides it

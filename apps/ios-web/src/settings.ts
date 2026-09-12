@@ -32,7 +32,7 @@ import {
   MODEL_GROUPS,
   MODEL_IDS,
   MODEL_LABELS,
-  MODEL_NOTES,
+  noteForModel,
   PERMISSION_MODE_DESCRIPTIONS,
   PERMISSION_MODE_LABELS,
   PERMISSION_MODE_ORDER,
@@ -105,7 +105,7 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
   }
   modelSelect.value = safeModel(host.settings.defaultModel);
 
-  /* Availability caveats (MODEL_NOTES) are appended to the option label in
+  /* Availability caveats (noteForModel) are appended to the option label in
      the plugin's dropdown; a phone-width <select> truncates long labels to
      nothing useful, so the note for the SELECTED model gets its own line
      under the row instead. */
@@ -161,7 +161,7 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
       effortSelect.createEl("option", { value: level, text: EFFORT_LABELS[level] });
     }
     effortSelect.value = host.settings.defaultEffort;
-    const note = MODEL_NOTES[model];
+    const note = noteForModel(model);
     modelNote.setText(note ?? "");
     modelNote.toggleClass("is-hidden", !note);
     return clamped;

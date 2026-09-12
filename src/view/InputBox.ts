@@ -1500,6 +1500,11 @@ export class InputBox {
     const popup = this.createPopup("claudian-popup-model");
     for (const group of MODEL_GROUPS) {
       popup.createDiv({ cls: "claudian-popup-header", text: group.header });
+      if (group.note) {
+        /* Family-wide caveat sits directly under the header so it reads as
+           applying to every row in the group, not just one model. */
+        popup.createDiv({ cls: "claudian-popup-header-note", text: group.note });
+      }
       for (const key of group.keys) {
         const row = popup.createDiv({
           cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
