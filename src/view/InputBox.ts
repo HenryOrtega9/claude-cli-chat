@@ -1692,9 +1692,14 @@ export class InputBox {
   private publishPopupHeadroom(popup: HTMLElement, anchorTop: number, availWidth?: number) {
     const clip = this.wrapper.closest(".claudian-tab-content-container");
     const clipTop = clip ? clip.getBoundingClientRect().top : 0;
-    /* 8px keeps the popup off the clip edge; the 160px floor stops it
-       collapsing to nothing in a very short viewport. */
-    const available = Math.max(160, Math.round(anchorTop - clipTop - 8));
+    /* 8px keeps the popup off the clip edge. The floor only guards against a
+       zero or negative measurement (anchor above the clip mid-animation): it
+       is sized to ONE touch row plus the popup padding, because any floor
+       larger than the real headroom defeats the whole point. With the
+       software keyboard up on a phone the space above the composer is often
+       under 160px, and the old 160px floor pushed the top rows back under the
+       tab bar where no amount of scrolling could reach them. */
+    const available = Math.max(56, Math.round(anchorTop - clipTop - 8));
     popup.style.setProperty("--claudian-popup-avail", `${available}px`);
     /* Same idea horizontally: a popup wider than the gap between its pinned
        edge and the far side of the screen hangs off it. The attach popup's

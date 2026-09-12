@@ -662,7 +662,7 @@ body {
 /* min-width beats max-width in CSS, so the attach popup's 280px desktop
    floor would defeat the clamp above and keep hanging off the left edge when
    pinned to the + button. The other popups keep their 140px floor, which is
-   always under the 160px minimum the clamp can report. */
+   always under the 160px minimum the width clamp can report. */
 #app .claudian-popup-attach {
   min-width: 0;
 }
