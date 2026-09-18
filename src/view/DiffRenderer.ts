@@ -110,15 +110,18 @@ export function renderWritePreview(target: HTMLElement, filePath: string, conten
     text: `+${total} line${total === 1 ? "" : "s"} (${content.length} chars)`,
   });
   const block = wrap.createDiv({ cls: "claudian-diff-block" });
-  /* Cap the peek at 30 lines so a giant file doesn't dominate. */
-  const peek = lines.slice(0, 30);
+  /* The preview only renders once the user opens the row, and the block
+     scrolls inside its own height cap, so it shares the same line budget as
+     renderDiff rather than the old 30-line peek. Still capped so a giant
+     generated file doesn't freeze the chat. */
+  const peek = lines.slice(0, MAX_LINES);
   for (const l of peek) {
     const row = block.createDiv({ cls: "claudian-diff-line claudian-diff-add" });
     row.createSpan({ cls: "claudian-diff-marker", text: "+" });
     row.createSpan({ cls: "claudian-diff-text", text: l });
   }
-  if (lines.length > 30) {
-    block.createDiv({ cls: "claudian-diff-truncated", text: `… ${lines.length - 30} more lines` });
+  if (lines.length > MAX_LINES) {
+    block.createDiv({ cls: "claudian-diff-truncated", text: `… ${lines.length - MAX_LINES} more lines` });
   }
   return wrap;
 }

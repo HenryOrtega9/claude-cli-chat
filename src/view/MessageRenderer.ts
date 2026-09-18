@@ -707,33 +707,60 @@ export class MessageListRenderer {
     let toolEl = this.toolEls.get(tool.id);
     if (!toolEl) {
       toolEl = parentEl.createDiv({ cls: "claudian-tool-call", attr: { "data-tool-id": tool.id } });
-      const header = toolEl.createDiv({ cls: "claudian-tool-header" });
+      const header = toolEl.createDiv({
+        cls: "claudian-tool-header",
+        attr: { role: "button", tabindex: "0", "aria-expanded": "false" },
+      });
       const icon = header.createSpan({ cls: "claudian-tool-icon" });
       platform.setIcon(icon, this.iconForTool(tool.name));
       header.createSpan({ cls: "claudian-tool-name", text: tool.name });
       /* Inline subject (e.g. "cortex", "Cortex.md", "git status") shown
          next to the tool name so the row reads as one compact phrase. */
       header.createSpan({ cls: "claudian-tool-subject" });
+      /* Size hint for file writes ("+42 lines", "3 edits") so a collapsed
+         Write/Edit row still says how big the change was without opening it. */
+      header.createSpan({ cls: "claudian-tool-meta is-empty" });
       /* Status surfaces as a tiny right-aligned icon (check / x /
          loader / shield-off) instead of an uppercase text badge. */
       header.createSpan({ cls: "claudian-tool-status" });
-      toolEl.createDiv({ cls: "claudian-tool-content" });
+      /* Callout-style fold chevron. Sits right of the status so the
+         name/subject phrase keeps its left edge; rotates when expanded. */
+      const chevron = header.createSpan({ cls: "claudian-tool-chevron" });
+      platform.setIcon(chevron, "chevron-down");
+      /* Everything foldable (Edit/Write diff + raw input/result) lives in
+         one body so the row collapses to a single line by default. The
+         TodoWrite list stays outside on purpose (see renderTodoList). */
+      const body = toolEl.createDiv({ cls: "claudian-tool-body" });
+      body.createDiv({ cls: "claudian-tool-content" });
       this.toolEls.set(tool.id, toolEl);
 
-      /* Click the header to toggle. Default is collapsed — content is shown
-         only on demand so giant Read/Skill results don't dominate the chat.
-         Record the user's intent via `is-user-toggled` so the running-tool
-         auto-expand guard below leaves their choice alone across the per-delta
-         rebuild — without it a user-collapsed running row snaps back open. */
-      header.addEventListener("click", () => {
-        toolEl!.toggleClass("is-expanded", !toolEl!.hasClass("is-expanded"));
+      /* Click (or Enter/Space) on the header toggles. Default is collapsed —
+         content, including the Write/Edit diff, is shown only on demand so a
+         long command or a whole written note doesn't dominate the chat.
+         `is-user-toggled` records the user's intent so the error auto-expand
+         below never overrides a row they deliberately closed. */
+      const toggle = () => {
+        const next = !toolEl!.hasClass("is-expanded");
+        toolEl!.toggleClass("is-expanded", next);
+        header.setAttr("aria-expanded", next ? "true" : "false");
         toolEl!.addClass("is-user-toggled");
+      };
+      header.addEventListener("click", toggle);
+      header.addEventListener("keydown", e => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggle();
+        }
       });
     }
     const subjectEl = toolEl.querySelector(".claudian-tool-subject") as HTMLElement;
     const subject = this.subjectForTool(tool);
     subjectEl.setText(subject ?? "");
     subjectEl.toggleClass("is-empty", !subject);
+    const metaEl = toolEl.querySelector(".claudian-tool-meta") as HTMLElement;
+    const meta = this.metaForTool(tool);
+    metaEl.setText(meta ?? "");
+    metaEl.toggleClass("is-empty", !meta);
 
     /* stateKey/stateChanged are computed here (rather than down by the
        expand/collapse rules that also need them) because the status icon
@@ -760,30 +787,19 @@ export class MessageListRenderer {
       statusEl.setAttr("aria-label", this.labelForStatus(tool.status));
     }
 
-    /* Auto-expand on first sight while running (so the user sees what's about
-       to execute) and on error (so they don't have to click to find what
-       failed). Collapse on successful completion. */
-    /* Expansion rules must fire on state TRANSITIONS, not on steady state:
-       upsertTool re-runs for the whole message every time any sibling tool or
-       subagent updates, so an unconditional "collapse when completed" would
-       snap a row shut every re-render while the user is trying to read it.
-       stateChanged (computed above alongside the status-icon guard) already
-       tracks exactly that transition. */
-    /* A terminal transition (error or completion) is a fresh system-driven
-       state change, so clear the user's running-tool toggle intent and let the
-       error/complete rules below decide expansion. On later upserts of the
-       same terminal state the user's toggle is theirs to keep. */
-    if (stateChanged && (tool.isError || tool.status === "completed")) {
-      toolEl.removeClass("is-user-toggled");
-    }
-    if (tool.isError) {
-      if (stateChanged) toolEl.addClass("is-expanded");
-    } else if (tool.status === "completed") {
-      /* Collapse back to compact form when the tool finishes so the chat
-         doesn't get swamped — but only on the transition itself. */
-      if (stateChanged) toolEl.removeClass("is-expanded");
-    } else if (tool.status === "running" && !toolEl.hasClass("is-user-toggled")) {
+    /* Rows stay collapsed in every state — pending, running, completed —
+       so the chat reads as a list of one-line callouts and the user opens
+       the ones they care about. (Earlier builds auto-expanded running rows
+       to show the command about to execute; a long Bash script or a whole
+       written note then took over the viewport, which is what this replaces.)
+       The one auto-open is an error, so the user doesn't have to hunt for
+       what failed — and only on the TRANSITION into the error state, never
+       on steady-state re-renders, and never over a row the user has already
+       toggled themselves. Nothing auto-collapses: if the user opened a
+       running row, completion leaves it open for them to finish reading. */
+    if (tool.isError && stateChanged && !toolEl.hasClass("is-user-toggled")) {
       toolEl.addClass("is-expanded");
+      (toolEl.querySelector(".claudian-tool-header") as HTMLElement | null)?.setAttr("aria-expanded", "true");
     }
 
     /* Body rebuild guard (see toolBodySig). Header subject/status above are
@@ -808,8 +824,9 @@ export class MessageListRenderer {
     }
 
     /* Edit / MultiEdit / Write tools — render the proposed change as a
-       unified diff above the collapsed body, always visible. The collapsed
-       content area still holds the raw input JSON for power users. */
+       unified diff at the top of the fold body, so it's one click away but
+       never pushes the conversation down by itself. The raw input JSON still
+       follows it inside the body for power users. */
     const existingDiff = toolEl.querySelector(".claudian-diff");
     if (existingDiff) existingDiff.remove();
     this.renderToolDiff(toolEl, tool);
@@ -855,7 +872,7 @@ export class MessageListRenderer {
   }
 
   /* Wraps the DiffRenderer helpers for the supported edit-shaped tools.
-     The diff lives between the header and the collapsible content. */
+     The diff is the first child of the fold body, above the raw content. */
   private renderToolDiff(toolEl: HTMLElement, tool: ToolCall) {
     const input = (tool.input ?? {}) as Record<string, unknown>;
     let block: HTMLElement | null = null;
@@ -875,12 +892,32 @@ export class MessageListRenderer {
       block = target.firstElementChild as HTMLElement | null;
     }
     if (!block) return;
-    const header = toolEl.querySelector(".claudian-tool-header");
-    if (header && header.nextSibling) {
-      toolEl.insertBefore(block, header.nextSibling);
-    } else {
-      toolEl.appendChild(block);
+    const body = toolEl.querySelector(".claudian-tool-body") as HTMLElement | null;
+    if (!body) return;
+    body.insertBefore(block, body.firstChild);
+  }
+
+  /* Short size hint shown after the subject on the collapsed row. Only the
+     file-writing tools get one; for everything else the subject suffices. */
+  private metaForTool(tool: ToolCall): string | null {
+    const input = (tool.input ?? {}) as Record<string, unknown>;
+    const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+    if (tool.name === "Write" && typeof input.content === "string") {
+      return `+${plural(input.content.split("\n").length, "line")}`;
     }
+    if (tool.name === "Edit") {
+      const ops = editOpsFromInput(tool.name, input);
+      if (!ops || ops.length === 0) return null;
+      const del = ops[0].oldString.length ? ops[0].oldString.split("\n").length : 0;
+      const add = ops[0].newString.length ? ops[0].newString.split("\n").length : 0;
+      return `−${del} +${add}`;
+    }
+    if (tool.name === "MultiEdit") {
+      const ops = editOpsFromInput(tool.name, input);
+      if (!ops || ops.length === 0) return null;
+      return plural(ops.length, "edit");
+    }
+    return null;
   }
 
   private iconForTodoStatus(status: string | undefined): string {

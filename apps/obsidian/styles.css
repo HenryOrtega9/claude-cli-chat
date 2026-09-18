@@ -1084,6 +1084,10 @@ mark.claudian-search-mark.is-active {
 }
 
 /* ---- Tool calls ------------------------------------------- */
+/* Each tool row is a foldable callout: a single header line by default
+   (icon · name · subject · size hint · status · chevron), with everything
+   verbose — the command, the Write/Edit diff, the result — inside
+   .claudian-tool-body, hidden until the row carries is-expanded. */
 .claudian-tool-call {
   margin: 2px 0;
 }
@@ -1091,14 +1095,54 @@ mark.claudian-search-mark.is-active {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 2px 0;
+  padding: 3px 6px 3px 4px;
+  margin: 0 -4px;
+  border-radius: 6px;
   cursor: pointer;
   user-select: none;
   line-height: 1.4;
+  transition: background-color 100ms ease;
+}
+.claudian-tool-header:hover,
+.claudian-tool-header:focus-visible {
+  background: color-mix(in srgb, var(--text-normal) 5%, transparent);
+  outline: none;
 }
 .claudian-tool-header:hover .claudian-tool-name {
   color: var(--claudian-brand);
 }
+.claudian-tool-call.is-expanded > .claudian-tool-header {
+  background: color-mix(in srgb, var(--text-normal) 4%, transparent);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.claudian-tool-chevron {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: var(--text-faint);
+  transition: transform 150ms ease, color 100ms ease;
+  transform: rotate(-90deg);
+}
+.claudian-tool-chevron svg {
+  width: 14px;
+  height: 14px;
+}
+.claudian-tool-header:hover .claudian-tool-chevron {
+  color: var(--text-muted);
+}
+.claudian-tool-call.is-expanded > .claudian-tool-header .claudian-tool-chevron {
+  transform: rotate(0deg);
+}
+.claudian-tool-meta {
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.claudian-tool-meta.is-empty { display: none; }
 .claudian-tool-icon {
   /* Same blue as the active tab badge's border (Obsidian's theme accent).
      Keeps the tool icons readable and brand-neutral so they don't compete
@@ -1155,11 +1199,23 @@ mark.claudian-search-mark.is-active {
 @keyframes claudian-tool-spin {
   to { transform: rotate(360deg); }
 }
-.claudian-tool-content {
+/* The fold body carries the left rail; the diff and the raw content sit
+   inside it as siblings, each with its own height cap and scroller, so a
+   long written note and a long result never nest one scrollbar inside
+   another. */
+.claudian-tool-body {
   display: none;
   padding: 4px 0 4px 14px;
   margin-left: 7px;
   border-inline-start: 2px solid var(--background-modifier-border);
+}
+.claudian-tool-call.is-expanded > .claudian-tool-body {
+  display: block;
+}
+.claudian-tool-body > .claudian-diff {
+  margin: 4px 0 6px 0;
+}
+.claudian-tool-content {
   font-family: var(--font-monospace);
   font-size: 12px;
   color: var(--text-muted);
@@ -1172,9 +1228,7 @@ mark.claudian-search-mark.is-active {
      without disturbing the desktop horizontal wheel case. */
   overscroll-behavior-y: contain;
 }
-.claudian-tool-call.is-expanded .claudian-tool-content {
-  display: block;
-}
+.claudian-tool-content:empty { display: none; }
 .claudian-tool-input {
   white-space: pre-wrap;
   color: var(--text-muted);
