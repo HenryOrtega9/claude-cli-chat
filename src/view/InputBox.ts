@@ -2089,6 +2089,14 @@ export class InputBox {
        the attachment list (Blob.arrayBuffer() is async, so the text paste
        lands first regardless). */
     const hasText = Array.from(items).some(it => it.kind === "string" && it.type === "text/plain");
+    /* Word/Excel/PowerPoint put a rendered picture of the copied selection on
+       the clipboard next to the text, so a plain text copy arrived with a
+       screenshot of itself attached. That image is a duplicate of the text,
+       not content: skip it and let the text paste land on its own. Keyed on
+       the rich-text signature (RTF flavor or Office-generated HTML) rather
+       than on text presence alone, so a browser image copied with alt text
+       still attaches. */
+    if (hasText && this.isRichTextRender(e.clipboardData)) return;
     if (!hasText) e.preventDefault();
     /* Materialize every File synchronously BEFORE the first await: once the
        paste handler yields, the clipboard's data store is disabled and
@@ -2124,6 +2132,15 @@ export class InputBox {
         platform.notify(`Couldn't attach pasted image: ${msg}`);
       }
     }
+  }
+
+  /* True when the clipboard's image is just an app's rendering of copied rich
+     text (Office apps). Must run synchronously inside the paste handler,
+     while the clipboard data store is still readable. */
+  private isRichTextRender(data: DataTransfer | null): boolean {
+    if (!data || !data.getData("text/plain").trim()) return false;
+    if (Array.from(data.types).includes("text/rtf")) return true;
+    return /urn:schemas-microsoft-com:office|content="?Microsoft (Word|Excel|PowerPoint)/i.test(data.getData("text/html"));
   }
 
   private handleDrop(e: DragEvent) {
