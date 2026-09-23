@@ -22,6 +22,7 @@ export function spawnOptionsFromSettings(
     appendSystemPrompt?: string;
     noSessionPersistence?: boolean;
     mcpDenyPatterns?: string[];
+    noTools?: boolean;
   }
 ): SpawnOptions {
   return {
@@ -35,5 +36,6 @@ export function spawnOptionsFromSettings(
     appendSystemPrompt: overrides?.appendSystemPrompt,
     noSessionPersistence: overrides?.noSessionPersistence,
     mcpDenyPatterns: overrides?.mcpDenyPatterns,
+    ...(overrides?.noTools ? { noTools: true } : {}),
   };
 }

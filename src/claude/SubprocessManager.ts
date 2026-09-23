@@ -89,6 +89,11 @@ export type SpawnOptions = {
       Undefined for every existing caller, so spawns are byte-for-byte
       unchanged unless a caller opts in. */
   extraArgs?: string[];
+  /** Empty toolset: `--tools ""` removes every built-in tool and
+      `--strict-mcp-config` (with no `--mcp-config`) loads no MCP servers,
+      mirroring QuickPrompt. For callers that only want text back. Undefined
+      for every existing caller, so their argv is unchanged. */
+  noTools?: boolean;
 };
 
 export type TabSessionStatus = "starting" | "ready" | "running" | "exited" | "error";
@@ -339,6 +344,7 @@ export class TabSession {
     if (opts.mcpDenyPatterns && opts.mcpDenyPatterns.length > 0) {
       args.push("--settings", JSON.stringify({ permissions: { deny: opts.mcpDenyPatterns } }));
     }
+    if (opts.noTools) args.push("--tools", "", "--strict-mcp-config");
     if (opts.extraArgs && opts.extraArgs.length > 0) args.push(...opts.extraArgs);
     if (opts.sessionId) args.push("--resume", opts.sessionId);
     return args;

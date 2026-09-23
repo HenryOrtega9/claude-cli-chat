@@ -56,6 +56,10 @@ export default class ClaudeChatPlugin extends Plugin {
      the CLI's system/init event. Re-runnable via refreshSkillCatalog() so
      freshly added skills can be picked up without a plugin reload. */
   skillCatalog: DiscoveryResult = { skills: [], commands: [] };
+  /* Optional runHeadlessPrompt features, so callers in other plugins can tell
+     whether this build honors `noTools` and `signal` (an older build silently
+     ignores unknown opts). */
+  readonly headlessPromptFeatures: readonly string[] = ["noTools", "signal"];
   /* Disk-scanned subagent definitions from ~/.claude/agents and
      <vault>/.claude/agents (plus any plugin-bundled agents/ dirs). Populated
      on load so the `/agent` slash-command and the agents pill can list the
@@ -479,12 +483,16 @@ export default class ClaudeChatPlugin extends Plugin {
      Spawns a transient TabSession with systemPrompt appended via
      --append-system-prompt, sends userPrompt once, accumulates assistant text
      from `assistant` events, resolves on the `result` event, and disposes the
-     session in finally. */
+     session in finally. `noTools` spawns with an empty toolset (no built-in
+     tools, no MCP servers) for callers that only want text back; `signal`
+     rejects and disposes the session when aborted. */
   async runHeadlessPrompt(
     systemPrompt: string,
     userPrompt: string,
-    opts?: { timeoutMs?: number; cwd?: string },
+    opts?: { timeoutMs?: number; cwd?: string; noTools?: boolean; signal?: AbortSignal },
   ): Promise<string> {
+    const signal = opts?.signal;
+    if (signal?.aborted) throw new Error("runHeadlessPrompt aborted");
     const timeoutMs = opts?.timeoutMs ?? 120_000;
     const tabId = `headless-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const cwd = opts?.cwd ?? this.getVaultPath() ?? process.cwd();
@@ -497,6 +505,7 @@ export default class ClaudeChatPlugin extends Plugin {
          stalling the subprocess until the timeout. Run non-interactive so
          tool use proceeds without an approval round-trip. */
       permissionMode: "bypassPermissions",
+      noTools: opts?.noTools,
     });
     const session = this.subprocessManager.spawn(tabId, spawnOpts);
 
@@ -508,6 +517,7 @@ export default class ClaudeChatPlugin extends Plugin {
         if (resolved) return;
         resolved = true;
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         session.dispose().finally(() => {
           if (err) reject(err);
           else resolve(value ?? "");
@@ -517,6 +527,8 @@ export default class ClaudeChatPlugin extends Plugin {
       const timer = setTimeout(() => {
         finish(null, new Error(`runHeadlessPrompt timed out after ${timeoutMs}ms`));
       }, timeoutMs);
+      const onAbort = () => finish(null, new Error("runHeadlessPrompt aborted"));
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       session.onEvent((e: StreamEvent) => {
         /* `e` is unvalidated CLI wire data (JSON.parse-d, not schema-checked),
