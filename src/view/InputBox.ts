@@ -2310,6 +2310,16 @@ export class InputBox {
 
   getSelection(): ActiveSelection | null { return this.currentSelection; }
 
+  /* Put back the attachments + selection that submit() just took off the
+     composer, for a slash command that ran without them. Merges ahead of
+     anything attached since, and leaves a newer selection in place. */
+  restoreContext(attachments: Attachment[], selection: ActiveSelection | undefined): void {
+    if (attachments.length === 0 && !selection) return;
+    this.attachments = [...attachments, ...this.attachments];
+    if (selection && this.currentSelection === null) this.currentSelection = selection;
+    this.renderContextRow();
+  }
+
   /* Renders both the editor-selection chip (if any) and the attachment
      chips. Single entry point so the row's visual state always matches what
      the user is actually carrying. */

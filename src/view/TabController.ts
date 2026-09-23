@@ -978,6 +978,23 @@ export class TabController {
     }
   }
 
+  /* How the CLI will treat a leading `/name`. "prompt" = a skill or custom
+     command, whose trailing text reaches the model as $ARGUMENTS; "builtin" =
+     a CLI command that takes no prompt context (compact, context, usage…);
+     null = not a command (e.g. a message that starts with a path), which
+     goes out as ordinary text. The init lists are ground truth once the
+     session has announced them; before that, any name-shaped `/word` counts
+     as a built-in so a fresh tab's `/model` isn't demoted by pinned notes. */
+  private classifyCliSlash(name: string): "builtin" | "prompt" | null {
+    const catalog = this.plugin.skillCatalog;
+    if (this.state.availableSkills?.includes(name)) return "prompt";
+    if (catalog.skills.some(s => s.name === name)) return "prompt";
+    if (catalog.commands.some(c => c.name === name && c.source !== "builtin")) return "prompt";
+    const initSlash = this.state.availableSlashCommands;
+    if (initSlash) return initSlash.includes(name) ? "builtin" : null;
+    return "builtin";
+  }
+
   /* Opens the Create-subagent modal. After a successful save the modal
      calls back and we refresh the toolbar pill count so the new agent
      surfaces immediately. */
@@ -1448,18 +1465,35 @@ export class TabController {
        playing. The notify listener re-syncs the pause button. */
     if (this.voiceOn()) this.plugin.speech.stop(this.state.id);
 
-    /* Plugin-side slash commands. Claude Code's stream-json mode does NOT
-       intercept slash commands — they get sent to the model as plain text.
-       For commands the user clearly means as UI operations, we handle them
-       here before anything reaches the subprocess. */
-    if (attachments.length === 0 && !selection && this.handlePluginSlashCommand(text)) {
+    /* Plugin-side slash commands (/clear, /help, /agent) are UI operations,
+       so they run no matter what context rides along — a live editor
+       selection or pinned note used to push /clear through to the model. */
+    const slashName = parseSlashName(text);
+    if (slashName !== null && this.handlePluginSlashCommand(text)) {
+      /* The composer handed its context over on submit; give it back so
+         /help or /agent doesn't cost the user their selection. /clear's
+         reset wipes it again on its own. */
+      this.inputBox.restoreContext(attachments, selection);
       return;
     }
 
+    /* The CLI only runs a slash command when the message STARTS with it, so
+       any context prepended below (pinned @-refs, office inlines, the
+       selection block, text attachments) silently demotes the command to
+       plain text. Built-ins go out bare and leave the context in the
+       composer for the next message; skills and custom commands keep the
+       command first and carry the context after it as $ARGUMENTS. */
+    const cliSlash = slashName !== null ? this.classifyCliSlash(slashName) : null;
+    const sendContext = cliSlash !== "builtin";
+    if (!sendContext) this.inputBox.restoreContext(attachments, selection);
+    const sentAttachments = sendContext ? attachments : [];
+    const sentSelection = sendContext ? selection : undefined;
+
     /* Build the wire text Claude actually sees. The chat bubble still shows
        only the user's typed `text`; pinned-file refs and the selection
-       block are wire-only so the bubble stays clean. */
-    let wireText = text;
+       block are wire-only so the bubble stays clean. For a prompt command
+       the context is assembled on its own and appended after the command. */
+    let wireText = cliSlash === "prompt" ? "" : text;
 
     /* Pinned files from the file-pill bar inject as @-context. The pill bar
        is the new explicit mechanism (replaces the prior autoAttachActiveFile
@@ -1470,7 +1504,7 @@ export class TabController {
        Read tool rejects them. For those we extract plain text on the plugin
        side and inline it as a fenced block; everything else still uses the
        @-ref path so the CLI handles file expansion + caching. */
-    const pinnedPaths = this.activeFileIndicator.getPinnedPaths();
+    const pinnedPaths = sendContext ? this.activeFileIndicator.getPinnedPaths() : [];
     const officePaths = pinnedPaths.filter(p => isExtractableOffice(p));
     const refPaths = pinnedPaths.filter(p => !isExtractableOffice(p));
 
@@ -1521,12 +1555,12 @@ export class TabController {
        receives the full inlined version (fenced selection + question)
        via wireText. */
     let selectionContext: ChatMessage["selectionContext"];
-    if (selection) {
-      wireText = formatSelectionForPrompt(selection, wireText);
+    if (sentSelection) {
+      wireText = formatSelectionForPrompt(sentSelection, wireText);
       selectionContext = {
-        filePath: selection.filePath,
-        startLine: selection.startLine,
-        endLine: selection.endLine,
+        filePath: sentSelection.filePath,
+        startLine: sentSelection.startLine,
+        endLine: sentSelection.endLine,
       };
       this.selectionTracker.clear();
     }
@@ -1536,7 +1570,7 @@ export class TabController {
       role: "user",
       content: text,
       timestamp: Date.now(),
-      attachments: attachments.length > 0 ? attachments : undefined,
+      attachments: sentAttachments.length > 0 ? sentAttachments : undefined,
       selectionContext,
       /* Record the notes pinned for this turn so the bubble can surface them
          as note pills. Captured before the post-submit auto-drop below clears
@@ -1551,11 +1585,11 @@ export class TabController {
          augmented wire text — otherwise tabs would be titled with the
          selection block prefix. */
       this.state.title = text.slice(0, 48);
-    } else if (this.state.title === "New chat" && attachments.length > 0) {
-      const allImages = attachments.every(a => (a.kind ?? "image") === "image");
+    } else if (this.state.title === "New chat" && sentAttachments.length > 0) {
+      const allImages = sentAttachments.every(a => (a.kind ?? "image") === "image");
       this.state.title = allImages
-        ? `Image (${attachments.length})`
-        : `Attachment (${attachments.length})`;
+        ? `Image (${sentAttachments.length})`
+        : `Attachment (${sentAttachments.length})`;
     }
     this.updateWelcomeVisibility();
     await this.renderer.upsertMessage(msg);
@@ -1649,7 +1683,7 @@ export class TabController {
        and skipped rather than silently dropped or sent with bad data. */
     const mediaBlocks: ContentBlock[] = [];
     const textInlines: string[] = [];
-    for (const att of attachments) {
+    for (const att of sentAttachments) {
       const kind = att.kind ?? "image";
       if (kind === "image") {
         if (!att.data) {
@@ -1684,9 +1718,15 @@ export class TabController {
         textInlines.push(`<file path="${path}">\n${att.content}\n</file>`);
       }
     }
-    const finalText = textInlines.length > 0
+    let finalText = textInlines.length > 0
       ? `${textInlines.join("\n\n")}\n\n${wireText}`
       : wireText;
+    /* Prompt command: wireText holds only the context, so lead with the
+       command and let the context follow as its arguments. */
+    if (cliSlash === "prompt") {
+      const context = finalText.trim();
+      finalText = context ? `${text}\n\n${context}` : text;
+    }
     /* sendUserText/sendUserContent throw synchronously when the child's
        stdin has already been destroyed (e.g. a spawn failure whose ENOENT
        'error' event landed during the ensureSession() await above, before
@@ -1702,8 +1742,11 @@ export class TabController {
         session.sendUserText(finalText);
         return;
       }
-      const blocks: ContentBlock[] = [...mediaBlocks];
-      if (finalText) blocks.push({ type: "text", text: finalText });
+      /* The command text leads for slash commands, same reason as above. */
+      const blocks: ContentBlock[] = cliSlash === "prompt"
+        ? [{ type: "text", text: finalText }, ...mediaBlocks]
+        : [...mediaBlocks];
+      if (finalText && cliSlash !== "prompt") blocks.push({ type: "text", text: finalText });
       session.sendUserContent(blocks);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -3395,6 +3438,15 @@ function fenceLanguageFor(filePath: string): string {
   const ext = filePath.split(".").pop() ?? "";
   if (!ext || ext === filePath) return "";
   return ext;
+}
+
+/* The command name when `text` opens with `/name` (letters, digits, `-`,
+   `_`, and `:` for plugin-namespaced skills), else null. Case is kept: CLI
+   command names are matched as-is. `/Users/me/file.md` has a second slash
+   in its first token, so a message opening with a path never matches. */
+function parseSlashName(text: string): string | null {
+  const m = text.trim().match(/^\/([A-Za-z0-9][\w:-]*)(?=\s|$)/);
+  return m ? m[1] : null;
 }
 
 /* Full prompt sent to Claude: fenced selection text labeled with file +
