@@ -22,6 +22,7 @@
 export const MODEL_IDS = {
   "fable-5-1": "claude-fable-5-1[1m]",
   "fable-5": "claude-fable-5[1m]",
+  "opus-5-5": "claude-opus-5-5[1m]",
   "opus-5": "claude-opus-5[1m]",
   "opus-1m": "claude-opus-4-8[1m]",
   "opus-4-7-1m": "claude-opus-4-7[1m]",
@@ -37,6 +38,7 @@ export type ModelKey = keyof typeof MODEL_IDS;
 export const MODEL_LABELS: Record<ModelKey, string> = {
   "fable-5-1": "Fable 5.1 1M",
   "fable-5": "Fable 5 1M",
+  "opus-5-5": "Opus 5.5 1M",
   "opus-5": "Opus 5 1M",
   "opus-1m": "Opus 4.8 1M",
   "opus-4-7-1m": "Opus 4.7 1M",
@@ -87,7 +89,7 @@ export interface ModelGroup {
 }
 export const MODEL_GROUPS: ModelGroup[] = [
   { header: "FABLE", keys: ["fable-5-1", "fable-5"], note: FABLE_FAMILY_NOTE },
-  { header: "OPUS", keys: ["opus-5", "opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
+  { header: "OPUS", keys: ["opus-5-5", "opus-5", "opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
   { header: "SONNET", keys: ["sonnet-5", "sonnet-1m"] },
   { header: "HAIKU", keys: ["haiku"] },
 ];
@@ -116,13 +118,16 @@ export const EFFORT_LABELS: Record<EffortLevel, string> = {
 export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
 
 /* Returns the effort levels available for a given model. xhigh is gated to
-   Fable 5, Opus (Opus 5, Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan which
-   routes to Opus when in plan mode), and Sonnet 5 — the first Sonnet-tier
-   model with xhigh; everything else shows the standard four. Opus 5's full
-   ladder (incl. xhigh/max) is confirmed by the effort docs as of its
-   2026-07-24 release. */
+   Fable 5, Opus (Opus 5.5, Opus 5, Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan
+   which routes to Opus when in plan mode), and Sonnet 5 — the first
+   Sonnet-tier model with xhigh; everything else shows the standard four.
+   Opus 5's full ladder (incl. xhigh/max) is confirmed by the effort docs as
+   of its 2026-07-24 release. Opus 5.5 (2026-09-22) keeps the same ladder;
+   CLI-verified with `--effort xhigh` on its release day. Note Opus 5.5
+   cannot disable thinking and its API-side default effort is medium (one
+   step below Opus 5), so the effort chip is the only depth control. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
@@ -132,7 +137,7 @@ export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
    resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 
