@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         GatewayConfig.seedFromSecretsIfNeeded()
+        GatewayConfig.migrateToMacMiniIfNeeded()
         #if DEBUG
         // After the Secrets seed, so an automated launch wins over it.
         DebugLaunchEnvironment.applyIfPresent()

@@ -14,7 +14,7 @@ import WebKit
 ///
 /// ```sh
 /// SIMCTL_CHILD_VAULTGW_TOKEN="$(cat ~/.config/vault-gateway/token)" \
-/// SIMCTL_CHILD_VAULTGW_HOST=100.96.112.74 \
+/// SIMCTL_CHILD_VAULTGW_HOST=100.114.225.49 \
 /// SIMCTL_CHILD_VAULTGW_SCHEME=http \
 /// SIMCTL_CHILD_VAULTGW_PORT=8788 \
 /// xcrun simctl launch --terminate-running-process booted dev.henryortega.vaultgateway

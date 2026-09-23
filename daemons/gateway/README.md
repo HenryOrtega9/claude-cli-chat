@@ -126,7 +126,7 @@ WebSocket upgrade passes through cleanly (verified end to end):
 
 ```sh
 tailscale serve --bg --http=8790 http://127.0.0.1:8788
-node daemons/gateway/test/smoke.mjs http://henrys-macbook-pro.tail92466c.ts.net:8790
+node daemons/gateway/test/smoke.mjs http://henrys-mac-mini.tail92466c.ts.net:8790
 tailscale serve --http=8790 off
 ```
 

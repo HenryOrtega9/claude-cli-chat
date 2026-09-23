@@ -155,7 +155,7 @@ anything prefixed `SIMCTL_CHILD_` into the launched app:
 
 ```sh
 SIMCTL_CHILD_VAULTGW_TOKEN="$(cat ~/.config/vault-gateway/token)" \
-SIMCTL_CHILD_VAULTGW_HOST=henrys-macbook-pro.tail92466c.ts.net \
+SIMCTL_CHILD_VAULTGW_HOST=henrys-mac-mini.tail92466c.ts.net \
 SIMCTL_CHILD_VAULTGW_SCHEME=http \
 SIMCTL_CHILD_VAULTGW_PORT=8788 \
 xcrun simctl launch --terminate-running-process booted dev.henryortega.vaultgateway
@@ -238,7 +238,7 @@ What's still missing is the TLS cert itself. Checked 2026-08-21:
 ```sh
 tailscale status --json | jq .CertDomains   # → null
 tailscale serve status                      # → "No serve config"
-tailscale cert henrys-macbook-pro.tail92466c.ts.net
+tailscale cert henrys-mac-mini.tail92466c.ts.net
 # → 500 Internal Server Error: your Tailscale account does not support
 #   getting TLS certs
 ```
@@ -251,7 +251,7 @@ admin can turn it on — a CLI agent cannot flip it. To enable it:
 2. Under **HTTPS Certificates**, click **Enable HTTPS...** and confirm. (This
    is the one-click setting; it just needs a human logged into the account.)
 3. Confirm it took: `tailscale status --json | jq .CertDomains` should list
-   `henrys-macbook-pro.tail92466c.ts.net` instead of `null`.
+   `henrys-mac-mini.tail92466c.ts.net` instead of `null`.
 
 Once that's on, front the plain-http gateway with a TLS-terminating `tailscale
 serve` on the standard https port, bound loopback-only so nothing skips the

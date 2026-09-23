@@ -108,7 +108,7 @@ Captured against the live daemon at `100.96.112.74:8788` through
 
 ```sh
 npm run build:ios
-node ios-web/dev-server.mjs http://100.96.112.74:8788   # or 127.0.0.1:8788
+node ios-web/dev-server.mjs http://100.114.225.49:8788   # or 127.0.0.1:8788
 ```
 
 Open `http://127.0.0.1:5173/` and, once:

@@ -20,7 +20,7 @@
 
    Usage:
      node ios-web/dev-server.mjs                       # gateway on 127.0.0.1:8788
-     node ios-web/dev-server.mjs http://100.96.112.74:8788
+     node ios-web/dev-server.mjs http://100.114.225.49:8788
      PORT=5173 node ios-web/dev-server.mjs
 
    Then, in the browser console, once:

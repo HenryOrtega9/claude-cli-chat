@@ -9,7 +9,7 @@ Contract: [`CONTRACTS.md`](CONTRACTS.md). Browser client: [`WAVE2.md`](WAVE2.md)
 
 ## What was verified
 
-Against the launchd daemon at `henrys-macbook-pro.tail92466c.ts.net:8788`, vault
+Against the launchd daemon at `henrys-mac-mini.tail92466c.ts.net:8788`, vault
 `Henry Ortega's Second Brain`, from a Debug build on the iPhone 17 Pro simulator
 (iOS 26.3).
 

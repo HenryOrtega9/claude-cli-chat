@@ -11,7 +11,7 @@ enum GatewayConfig {
     static let appGroup = "group.dev.henryortega.vaultgateway"
     static let suite = UserDefaults(suiteName: GatewayConfig.appGroup) ?? .standard
 
-    static let builtInHost = "henrys-macbook-pro.tail92466c.ts.net"
+    static let builtInHost = "henrys-mac-mini.tail92466c.ts.net"
     static let builtInScheme = "http"
     static let builtInPort = 8788
     static let tokenAccount = "gatewayToken"
@@ -176,5 +176,16 @@ enum GatewayConfig {
         if !Secrets.gatewayHost.isEmpty { host = Secrets.gatewayHost }
         if Secrets.gatewayPort > 0 { port = Secrets.gatewayPort }
         if !Secrets.gatewayToken.isEmpty, !hasToken { setToken(Secrets.gatewayToken) }
+    }
+
+    /// The gateway moved from the MacBook Pro to the Mac mini on 2026-09-22.
+    /// Rewrites a stored host or IP override that still names the MacBook so
+    /// existing installs follow the move; any other value is left alone.
+    static func migrateToMacMiniIfNeeded() {
+        let oldHost = "henrys-macbook-pro.tail92466c.ts.net"
+        let oldIP = "100.96.112.74"
+        let savedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if savedHost == oldHost || savedHost == oldIP { host = builtInHost }
+        if ipOverride.trimmingCharacters(in: .whitespacesAndNewlines) == oldIP { ipOverride = "100.114.225.49" }
     }
 }
