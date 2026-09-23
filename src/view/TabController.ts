@@ -34,6 +34,7 @@ import type {
   AssistantContentBlock,
   SystemInitEvent,
   SystemApiRetryEvent,
+  SystemTaskNotificationEvent,
   StreamEventEvent,
   AssistantEvent,
   ToolUseEvent,
@@ -478,6 +479,27 @@ export class TabController {
       /* Restored history painted in full above; from here on new assistant
          bubbles type out (when the setting is on). */
       this.renderer.setTypewriterArmed(true);
+      /* A host that spawns the CLI itself (plugin, Quick Chat) tears the
+         subprocess down with the old controller, so a background agent the
+         restored state still marks running died with it and will never
+         notify. Left alone it pins "1 agent running…" on the tab for good.
+         The iOS host (no createSubagentTracker) is excluded: its daemon
+         keeps the session, and the agent may really still be working. */
+      if (!this.state.busy && this.plugin.createSubagentTracker) {
+        let orphaned = false;
+        for (const m of this.state.messages) {
+          if (!m.toolCalls) continue;
+          let touched = false;
+          for (const t of m.toolCalls) {
+            if (this.failOrphanedBackgroundAgent(t)) touched = true;
+          }
+          if (touched) {
+            orphaned = true;
+            void this.renderer.upsertMessage(m);
+          }
+        }
+        if (orphaned) this.onStateChangeCb();
+      }
       /* After replay, surface any in-flight Task/Agent tools the persisted
          state still has marked running. Resumed tabs from a hard reload may
          carry stale "running" statuses; surfacing them is honest to what's
@@ -1852,6 +1874,16 @@ export class TabController {
         } else if (sys.subtype === "api_retry") {
           const retry = sys as SystemApiRetryEvent;
           this.statusIndicator.setRetrying(retry.attempt, retry.max_retries, retry.retry_delay_ms);
+        } else if (sys.subtype === "task_notification") {
+          /* A background agent that finishes while the parent turn is still
+             running never produces the <task-notification> user turn — the
+             CLI folds that XML into the model's context as an attachment and
+             reports the stop only through this event. Without it the card
+             and the "N agents running…" pill stay up after the chat ends. */
+          const note = sys as SystemTaskNotificationEvent;
+          if (note.tool_use_id) {
+            await this.settleBackgroundAgent(note.tool_use_id, note.status ?? "", null, note.summary ?? null);
+          }
         }
         break;
       }
@@ -1975,41 +2007,66 @@ export class TabController {
       const body = match[1];
       const toolId = extractNotificationTag(body, "tool-use-id");
       if (!toolId) continue;
-      const found = this.findToolCallById(toolId);
-      if (!found) continue;
-      const { msg, tool } = found;
-
-      /* The CLI's status vocabulary is completed | failed | killed | blocked
-         | stopped | cancelled. Only the first is a success, so anything else
-         — including a value we don't recognise — fails rather than flipping
-         a killed agent's card to Completed. A missing tag stays neutral. */
-      const status = (extractNotificationTag(body, "status") ?? "").trim();
-      const failed = status !== "" && !/^(completed|success)/i.test(status);
-      /* <result> is optional (the CLI omits it for a killed / blocked agent,
-         or one that produced no final message) but <summary> is always
-         written. Without the fallback `result` keeps the launch
-         acknowledgement, which the drill-in would then present as the
-         agent's report. */
-      const result = extractNotificationTag(body, "result") ?? extractNotificationTag(body, "summary");
-      if (result) tool.result = result;
-      tool.status = failed ? "errored" : "completed";
-      if (failed) tool.isError = true;
-      tool.nestedStatus = failed ? "failed" : "completed";
-
-      const spawnedAt = this.subagentSpawnTimes.get(toolId);
-      if (spawnedAt !== undefined) {
-        tool.nestedDurationMs = Date.now() - spawnedAt;
-        this.subagentSpawnTimes.delete(toolId);
-      }
-      const tracker = this.subagentTrackers.get(toolId);
-      if (tracker) {
-        void tracker.stop();
-        this.subagentTrackers.delete(toolId);
-      }
-      this.refreshRunningAgentCount();
-      if (this.agentDetail.isOpenFor(toolId)) this.agentDetail.refresh();
-      await this.renderer.upsertMessage(msg);
+      await this.settleBackgroundAgent(
+        toolId,
+        extractNotificationTag(body, "status") ?? "",
+        extractNotificationTag(body, "result"),
+        extractNotificationTag(body, "summary"),
+      );
     }
+  }
+
+  /* Flips one Task/Agent tool to terminal from a task notification — the
+     <task-notification> XML on an idle-time user turn, or the structured
+     system/task_notification event the CLI emits for one that lands mid-turn.
+     Both can fire for the same agent (and a resumed agent notifies again), so
+     this is idempotent. An id we can't resolve, or one that belongs to a
+     background Bash task rather than an agent, is skipped. */
+  private async settleBackgroundAgent(
+    toolId: string,
+    rawStatus: string,
+    result: string | null,
+    summary: string | null,
+  ): Promise<void> {
+    const found = this.findToolCallById(toolId);
+    if (!found) return;
+    const { msg, tool } = found;
+    if (tool.name !== "Task" && tool.name !== "Agent") return;
+
+    /* The CLI's status vocabulary is completed | failed | killed | blocked
+       | stopped | cancelled. Only the first is a success, so anything else
+       — including a value we don't recognise — fails rather than flipping
+       a killed agent's card to Completed. A missing status stays neutral. */
+    const status = rawStatus.trim();
+    const failed = status !== "" && !/^(completed|success)/i.test(status);
+    /* <result> is optional (the CLI omits it for a killed / blocked agent,
+       or one that produced no final message) but a summary is always
+       written. Without the fallback `result` keeps the launch
+       acknowledgement, which the drill-in would then present as the
+       agent's report. The summary only replaces that acknowledgement, so a
+       later summary-only notification can't clobber a real report. */
+    if (result) {
+      tool.result = result;
+    } else if (summary && (tool.result ?? "").trimStart().startsWith(ASYNC_LAUNCH_ACK)) {
+      tool.result = summary;
+    }
+    tool.status = failed ? "errored" : "completed";
+    if (failed) tool.isError = true;
+    tool.nestedStatus = failed ? "failed" : "completed";
+
+    const spawnedAt = this.subagentSpawnTimes.get(toolId);
+    if (spawnedAt !== undefined) {
+      tool.nestedDurationMs = Date.now() - spawnedAt;
+      this.subagentSpawnTimes.delete(toolId);
+    }
+    const tracker = this.subagentTrackers.get(toolId);
+    if (tracker) {
+      void tracker.stop();
+      this.subagentTrackers.delete(toolId);
+    }
+    this.refreshRunningAgentCount();
+    if (this.agentDetail.isOpenFor(toolId)) this.agentDetail.refresh();
+    await this.renderer.upsertMessage(msg);
   }
 
   private async handleStreamEvent(event: StreamEventEvent) {
@@ -2844,19 +2901,7 @@ export class TabController {
            the subprocess is gone, so its <task-notification> can never
            arrive. Its tool `status` is already "completed" (launch ack), so
            the running-tool sweep below would skip it. */
-        if (t.backgroundAgent && (t.nestedStatus === "spawning" || t.nestedStatus === "running")) {
-          t.nestedStatus = "failed";
-          t.isError = true;
-          /* `result` still holds the launch acknowledgement. Once the card
-             reads terminal the drill-in starts showing `result` as the
-             agent's report, and "launched successfully" would claim an
-             outcome that never arrived. */
-          if ((t.result ?? "").trimStart().startsWith(ASYNC_LAUNCH_ACK)) {
-            t.result = "The session ended before this background agent reported back.";
-          }
-          if (this.agentDetail.isOpenFor(t.id)) this.agentDetail.refresh();
-          touched = true;
-        }
+        if (this.failOrphanedBackgroundAgent(t)) touched = true;
         if (t.status !== "running") continue;
         t.status = "errored";
         t.isError = true;
@@ -3030,6 +3075,23 @@ export class TabController {
        failure emits "error" without an "exit", so without this the bubble is
        shown live but never written to disk and vanishes on reload. */
     this.onStateChangeCb();
+  }
+
+  /* Marks a background agent whose subprocess is gone as ended. Returns true
+     when it changed anything so the caller can re-render the message. */
+  private failOrphanedBackgroundAgent(t: ToolCall): boolean {
+    if (!t.backgroundAgent || (t.nestedStatus !== "spawning" && t.nestedStatus !== "running")) return false;
+    t.nestedStatus = "failed";
+    t.isError = true;
+    /* `result` still holds the launch acknowledgement. Once the card
+       reads terminal the drill-in starts showing `result` as the
+       agent's report, and "launched successfully" would claim an
+       outcome that never arrived. */
+    if ((t.result ?? "").trimStart().startsWith(ASYNC_LAUNCH_ACK)) {
+      t.result = "The session ended before this background agent reported back.";
+    }
+    if (this.agentDetail.isOpenFor(t.id)) this.agentDetail.refresh();
+    return true;
   }
 
   /* Tracks which message ID is the current "in-flight" assistant bubble so

@@ -47,6 +47,7 @@ export type StreamEvent =
   | SystemInitEvent
   | SystemStatusEvent
   | SystemApiRetryEvent
+  | SystemTaskNotificationEvent
   | UserEchoEvent
   | AssistantEvent
   | StreamEventEvent
@@ -99,6 +100,24 @@ export type SystemApiRetryEvent = {
   max_retries: number;
   retry_delay_ms: number;
   error?: string;
+  session_id?: string;
+  uuid?: string;
+};
+
+/** Emitted when a background task (e.g. an async Agent) stops. The
+   <task-notification> XML only reaches stdout as a synthetic user turn when
+   the session is idle; one that lands mid-turn is folded into the model's
+   context as an attachment instead, so this structured event is the only
+   signal the host sees. `status` uses the same completed | failed | killed |
+   stopped | … vocabulary as the XML. */
+export type SystemTaskNotificationEvent = {
+  type: "system";
+  subtype: "task_notification";
+  task_id: string;
+  tool_use_id?: string;
+  status: string;
+  summary?: string;
+  output_file?: string;
   session_id?: string;
   uuid?: string;
 };
