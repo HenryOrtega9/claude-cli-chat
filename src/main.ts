@@ -33,6 +33,7 @@ import type {
 } from "./platform/host";
 import { ActiveFileIndicator } from "./view/ActiveFileIndicator";
 import { SelectionTracker } from "./view/SelectionTracker";
+import { selectionHighlightExtension } from "./view/SelectionHighlight";
 
 /* Icon id we register with Obsidian's icon registry. Used by the ribbon
    button, the view's tab/breadcrumb icon, and any setIcon() call that wants
@@ -120,6 +121,9 @@ export default class ClaudeChatPlugin extends Plugin {
     addIcon(CLAUDE_ICON_ID, CLAUDE_ASTERISK_ICON_SVG);
 
     this.registerView(VIEW_TYPE_CLAUDE_CHAT, (leaf: WorkspaceLeaf) => new ClaudeChatView(leaf, this));
+    /* Paints the composer's pinned selection in its editor after focus moves
+       to the chat input, where the native highlight can't follow. */
+    this.registerEditorExtension(selectionHighlightExtension);
 
     this.addRibbonIcon(CLAUDE_ICON_ID, "Open Claude", () => this.activateView());
 

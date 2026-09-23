@@ -3341,3 +3341,11 @@ mark.claudian-search-mark.is-active {
   margin-top: 2px;
   font-style: italic;
 }
+
+/* Selection pinned to the chat composer, kept visible in its editor after
+   focus moves to the chat input (see src/view/SelectionHighlight.ts). Only
+   drawn while the editor is unfocused; when it has focus the native
+   selection is showing and this would double it up. */
+.cm-editor:not(.cm-focused) .claudian-kept-selection {
+  background-color: var(--text-selection);
+}

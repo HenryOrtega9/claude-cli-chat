@@ -1,4 +1,6 @@
 import { MarkdownView, type App, type EventRef } from "obsidian";
+import type { EditorView } from "@codemirror/view";
+import { clearKeptSelection, setKeptSelection } from "./SelectionHighlight";
 
 export type ActiveSelection = {
   filePath: string;
@@ -30,6 +32,10 @@ export class SelectionTracker {
      refresh re-emits the same selection and the chip the user just dismissed
      immediately reappears. Refreshes within 100ms of a clear are dropped. */
   private clearedAt = 0;
+  /* Editor currently painting the kept-selection highlight (see
+     SelectionHighlight). Tracked so a clear or a move to another note
+     removes the mark from the editor that actually has it. */
+  private highlightView: EditorView | null = null;
 
   constructor(app: App, onChange: (sel: ActiveSelection | null) => void) {
     this.app = app;
@@ -59,6 +65,7 @@ export class SelectionTracker {
   }
 
   destroy() {
+    this.clearHighlight();
     if (this.workspaceRef) {
       this.app.workspace.offref(this.workspaceRef);
       this.workspaceRef = null;
@@ -75,6 +82,7 @@ export class SelectionTracker {
      chip manually or after a submit consumed it. */
   clear() {
     this.clearedAt = Date.now();
+    this.clearHighlight();
     if (this.current !== null) {
       this.current = null;
       this.onChange(null);
@@ -99,9 +107,13 @@ export class SelectionTracker {
 
     const editor = view.editor;
     const text = editor.getSelection();
-    if (!text || text.trim().length === 0) return this.emit(null);
+    if (!text || text.trim().length === 0) {
+      this.clearHighlight();
+      return this.emit(null);
+    }
     const from = editor.getCursor("from");
     const to = editor.getCursor("to");
+    this.paintHighlight(editorViewOf(view), editor.posToOffset(from), editor.posToOffset(to));
     this.emit({
       filePath: view.file.path,
       text,
@@ -110,11 +122,31 @@ export class SelectionTracker {
     });
   }
 
+  private paintHighlight(cm: EditorView | null, from: number, to: number) {
+    if (this.highlightView && this.highlightView !== cm) this.clearHighlight();
+    if (!cm) return;
+    setKeptSelection(cm, from, to);
+    this.highlightView = cm;
+  }
+
+  private clearHighlight() {
+    if (!this.highlightView) return;
+    clearKeptSelection(this.highlightView);
+    this.highlightView = null;
+  }
+
   private emit(sel: ActiveSelection | null) {
     if (selectionEquals(this.current, sel)) return;
     this.current = sel;
     this.onChange(sel);
   }
+}
+
+/* Obsidian's Editor wraps a CM6 EditorView on `.cm`. Not in the public
+   typings, so read it defensively: a missing view just means no highlight. */
+function editorViewOf(view: MarkdownView): EditorView | null {
+  const cm = (view.editor as unknown as { cm?: EditorView }).cm;
+  return cm && typeof cm.dispatch === "function" ? cm : null;
 }
 
 function selectionEquals(a: ActiveSelection | null, b: ActiveSelection | null): boolean {
