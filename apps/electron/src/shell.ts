@@ -79,6 +79,9 @@ export class DesktopChatShell {
   /* Set by renderer.ts before mount(): asks the main process to clear the
      pinned panel bounds and return to the default placement. */
   onResetPosition?: () => void;
+  /* Set by renderer.ts before mount(): open the transparency slider anchored
+     to the header button that was clicked. */
+  onOpacity?: (anchor: HTMLElement) => void;
 
   private readonly host: DesktopHost;
   private readonly root: HTMLElement;
@@ -123,7 +126,11 @@ export class DesktopChatShell {
     activeShellInstance = this;
     await this.acquireWindowLock();
 
-    const header = renderHeader(this.root, {
+    /* One wrapper paints the fill behind both bars (desktop.css). Two
+       translucent siblings meeting on a fractional pixel each cover only part
+       of the boundary row, which reads as a dark seam between them. */
+    const topBar = this.root.createDiv({ cls: "claudesk-top-bar" });
+    const header = renderHeader(topBar, {
       onNewTab: () => this.createTab(),
       onClear: () => this.clearActiveTab(),
       onHistory: () => this.showHistory(),
@@ -133,7 +140,7 @@ export class DesktopChatShell {
     });
     this.mountSettingsButton(header);
 
-    const navRow = this.root.createDiv({ cls: "claudian-input-nav-row" });
+    const navRow = topBar.createDiv({ cls: "claudian-input-nav-row" });
     this.tabBar = new TabBar(navRow, {
       onSelect: (id) => this.selectTab(id),
       onClose: (id) => void this.closeTab(id),
@@ -152,6 +159,14 @@ export class DesktopChatShell {
   private mountSettingsButton(header: HTMLElement): void {
     const actions = header.querySelector<HTMLElement>(".claudian-header-actions");
     if (!actions) return;
+    if (this.onOpacity) {
+      const opacity = actions.createSpan({
+        cls: "claudian-header-btn",
+        attr: { "aria-label": "Transparency", title: "Transparency" },
+      });
+      platform.setIcon(opacity, "blend");
+      opacity.addEventListener("click", () => this.onOpacity?.(opacity));
+    }
     /* Reset sits left of the gear, matching the tray's Reset Window
        Position item so the fix for a mispinned window is one click away. */
     if (this.onResetPosition) {

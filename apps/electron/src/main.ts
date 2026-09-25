@@ -37,13 +37,26 @@ const PANEL_BOTTOM_MARGIN = 24;
 
 const DEFAULT_ACCELERATOR = "Alt+Space";
 
+/* Background level range for the transparency slider. Only the panel's
+   background fades (the renderer scales its CSS tint); text stays opaque, so
+   the window itself is never setOpacity'd. The floor keeps a faint wash so the
+   panel's edges stay findable. */
+const OPACITY_MIN = 0.1;
+const OPACITY_MAX = 1;
+const VIBRANCY = "under-window";
+/* The blur is on at and above this level. The renderer thickens its tint to
+   fully opaque by here (opacity-control.ts, VIBRANCY_THRESHOLD), so the switch
+   happens behind a solid panel and the slider fades with no visible step.
+   Keep the two copies equal. */
+const VIBRANCY_THRESHOLD = 0.85;
+
 /*
  * Duplicated from app/src/config.ts on purpose. That module is renderer code
  * (it imports src/platform, which is DOM-bound), so main cannot import it —
  * the two copies of these three constants have to be kept in step by hand.
  *
- * Field ownership inside config.json: main writes ONLY "hotkey" and
- * "panelBounds", the renderer writes ONLY "workingDir", and both
+ * Field ownership inside config.json: main writes ONLY "hotkey",
+ * "panelBounds" and "opacity", the renderer writes ONLY "workingDir", and both
  * read-modify-write the whole file so neither erases the other's fields. Main
  * never creates the file; seeding it is the renderer's job (it is the side
  * that knows the default working dir).
@@ -73,6 +86,14 @@ const IPC_SET_HOTKEY = "claudesk:set-hotkey";
 /* renderer -> main: header button equivalent of the tray's Reset Window
    Position — clear the pinned bounds and return to default placement. */
 const IPC_RESET_POSITION = "claudesk:reset-position";
+/* renderer -> main, payload number in [OPACITY_MIN, 1]: the background level
+   (fired continuously while the slider drags). The renderer repaints the tint
+   itself; main toggles the vibrancy layer at VIBRANCY_THRESHOLD and persists
+   the value. */
+const IPC_SET_OPACITY = "claudesk:set-opacity";
+/* renderer -> main (invoke): answers the opacity currently applied, so the
+   slider opens at the live value rather than config.json's debounced copy. */
+const IPC_GET_OPACITY = "claudesk:get-opacity";
 /* renderer -> main: the async boot() finished and its ipcRenderer.on handlers
    are attached. Anything main wants to push at the renderer before this is
    queued — webContents.send() into a page with no listener yet is dropped
@@ -139,6 +160,11 @@ let applyingBounds = false;
 
 let persistBoundsTimer: NodeJS.Timeout | null = null;
 
+/* Background level, mirrored from config.json's "opacity" (key kept from the
+   first build, which faded the whole window). */
+let panelOpacity = OPACITY_MAX;
+let persistOpacityTimer: NodeJS.Timeout | null = null;
+
 /*
  * Distinguishes a real quit (tray → Quit) from the incidental window/app
  * lifecycle events that must NOT terminate the process.
@@ -191,6 +217,7 @@ function onReady(): void {
   app.on("web-contents-created", (_event, contents) => installNavigationGuards(contents));
 
   userBounds = readConfiguredBounds();
+  panelOpacity = readConfiguredOpacity();
   createPanel();
   /* Hotkey before the tray: the tray menu labels itself with whatever
      accelerator actually registered, fallback included. */
@@ -198,7 +225,16 @@ function onReady(): void {
   createTray();
 
   /* Re-registration guard: shortcuts are process-global and leak on reload. */
-  app.on("will-quit", () => globalShortcut.unregisterAll());
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
+    /* A quit inside the debounce window would otherwise drop the last slider
+       position. */
+    if (persistOpacityTimer) {
+      clearTimeout(persistOpacityTimer);
+      persistOpacityTimer = null;
+      writeConfiguredOpacity(panelOpacity);
+    }
+  });
 }
 
 function createPanel(): void {
@@ -223,7 +259,14 @@ function createPanel(): void {
      * layer to the native window shape so no frosted square corners bleed
      * past the CSS radius.
      */
-    vibrancy: "under-window",
+    /* Off below VIBRANCY_THRESHOLD: the blur is what hides the windows
+       behind, so a see-through panel has to drop it (applyOpacity toggles it
+       live). */
+    ...(panelOpacity >= VIBRANCY_THRESHOLD ? { vibrancy: VIBRANCY } : {}),
+    /* Same threshold: macOS casts a transparent window's shadow from its
+       opaque pixels, and below the blur that shadow shows THROUGH the panel
+       as dark bands under the header and composer. */
+    hasShadow: panelOpacity >= VIBRANCY_THRESHOLD,
     visualEffectState: "active",
     roundedCorners: true,
     resizable: true,
@@ -797,6 +840,63 @@ function writeConfiguredBounds(bounds: PanelBounds | null): void {
   }
 }
 
+/* ----- background level ----------------------------------------------- */
+
+function clampOpacity(value: number): number {
+  return Math.min(OPACITY_MAX, Math.max(OPACITY_MIN, value));
+}
+
+/* config.json's "opacity", or fully opaque when absent/malformed. Clamped
+   rather than rejected so a hand-edited 0.1 still yields a visible panel. */
+function readConfiguredOpacity(): number {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(APP_CONFIG_PATH, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return OPACITY_MAX;
+    const raw = (parsed as { opacity?: unknown }).opacity;
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return OPACITY_MAX;
+    return clampOpacity(raw);
+  } catch {
+    return OPACITY_MAX;
+  }
+}
+
+/* Main owns this field (same read-modify-write discipline as the hotkey). */
+function writeConfiguredOpacity(opacity: number): void {
+  try {
+    let existing: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(APP_CONFIG_PATH, "utf8"));
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        existing = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* No file yet: the renderer fills in workingDir on its next load. */
+    }
+    existing.opacity = opacity;
+    writeAppConfigSync(existing);
+  } catch (err) {
+    console.error("[claudesk] could not persist opacity to config.json:", err);
+  }
+}
+
+/* Applied on every slider tick for live feedback; the disk write is debounced
+   because a drag fires dozens of these a second. */
+function applyOpacity(value: number): void {
+  const wasFrosted = panelOpacity >= VIBRANCY_THRESHOLD;
+  panelOpacity = clampOpacity(value);
+  const frosted = panelOpacity >= VIBRANCY_THRESHOLD;
+  /* Only on the threshold crossing, not every tick. */
+  if (panel && frosted !== wasFrosted) {
+    panel.setVibrancy(frosted ? VIBRANCY : null);
+    panel.setHasShadow(frosted);
+  }
+  if (persistOpacityTimer) clearTimeout(persistOpacityTimer);
+  persistOpacityTimer = setTimeout(() => {
+    persistOpacityTimer = null;
+    writeConfiguredOpacity(panelOpacity);
+  }, 500);
+}
+
 /*
  * Tray -> Settings…. The panel has to be on screen first: the modal renders
  * inside it, and opening it against a hidden window would leave the user
@@ -819,6 +919,13 @@ ipcMain.on(IPC_HIDE, () => hidePanel());
 
 /* Renderer's header reset button. */
 ipcMain.on(IPC_RESET_POSITION, () => resetPanelPosition());
+
+/* Renderer's transparency slider. */
+ipcMain.on(IPC_SET_OPACITY, (_event, value: unknown) => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return;
+  applyOpacity(value);
+});
+ipcMain.handle(IPC_GET_OPACITY, (): number => panelOpacity);
 
 /* Boot finished: flush whatever was queued while the page had no listeners. */
 ipcMain.on(IPC_READY, () => {

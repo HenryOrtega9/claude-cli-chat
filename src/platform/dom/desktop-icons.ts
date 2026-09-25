@@ -13,7 +13,7 @@
    fill instead of stroke. */
 
 import {
-  ArrowLeft, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, Circle, CircleHelp, CircleX, Copy,
+  ArrowLeft, Blend, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, Circle, CircleHelp, CircleX, Copy,
   ExternalLink, File, FileEdit, FilePlus, FileSpreadsheet, FileText, Folder,
   FolderOpen, Gauge, GitBranch, Globe, History, Image, Layers, LayoutGrid,
   ListChecks, LoaderCircle, LocateFixed, Paperclip, Pause, Pin, Play, PlugZap,
@@ -37,6 +37,7 @@ type IconNode = [tag: string, attrs: Record<string, string | number | undefined>
    renders nothing, exactly as an unresolved icon did before. */
 const iconMap: Record<string, IconNode | undefined> = {
   "arrow-left": ArrowLeft,
+  "blend": Blend,
   "bot": Bot,
   "check": Check,
   "check-circle-2": CheckCircle2,

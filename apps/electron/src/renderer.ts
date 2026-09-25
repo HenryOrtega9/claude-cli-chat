@@ -26,6 +26,7 @@ import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { installDomHelpers } from "../../../src/platform/dom/dom-polyfill";
 import { DesktopPlatform } from "./desktop-platform";
+import { restoreBackgroundLevel, toggleOpacityPopover } from "./opacity-control";
 import { initializePlatform } from "../../../src/platform";
 import { StateEmitter } from "../../../src/claude/StateEmitter";
 import { loadAppConfig, loadDesktopSettings } from "./config";
@@ -333,6 +334,8 @@ async function boot(): Promise<void> {
        handler exists, and the header is built during mount. */
     shell.onOpenSettings = () => openSettings();
     shell.onResetPosition = () => ipcRenderer.send("claudesk:reset-position");
+    shell.onOpacity = (anchor) => toggleOpacityPopover(anchor);
+    await restoreBackgroundLevel();
     await shell.mount();
     /* Overlays hand focus back to the composer when the element they took it
        from is gone (the usual case: the modal was opened from the tray, so

@@ -151,8 +151,14 @@ code {
      app/src/main.ts): the frosted blur shows through here and
      through the container tint below. Readable foreground
      surfaces (bubbles, composer, modals) keep the solid tokens. */
-  background: rgba(13, 17, 23, 0.6);
+  background: rgba(13, 17, 23, var(--claudesk-wash, 0.6));
   border: 1px solid var(--background-modifier-border);
+  /* Legibility halo for the transparency slider (opacity-control.ts):
+     transparent at the default level, darkening as the background thins
+     so text still reads over a bright window behind the panel. */
+  text-shadow:
+    0 0 3px rgba(0, 0, 0, var(--claudesk-halo, 0)),
+    0 1px 2px rgba(0, 0, 0, var(--claudesk-halo, 0));
   box-shadow:
     0 24px 64px rgba(0, 0, 0, 0.55),
     inset 0 0 0 1px rgba(255, 255, 255, 0.035);
@@ -171,7 +177,7 @@ code {
   font-family: var(--font-text);
   /* Tinted, not solid: stacked on #app's wash this lands around
      75% opacity over the vibrancy blur. */
-  background: rgba(22, 27, 34, 0.4);
+  background: rgba(22, 27, 34, var(--claudesk-tint, 0.4));
   color: var(--text-normal);
 }
 
@@ -384,6 +390,31 @@ code {
 
 .claudesk-menu-item:hover .svg-icon {
   color: inherit;
+}
+
+/* Header transparency slider (opacity-control.ts). Reuses .claudesk-menu for
+   the surface; only the contents are styled here. */
+.claudesk-opacity-popover {
+  width: 200px;
+  padding: 10px 12px;
+}
+
+.claudesk-opacity-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+}
+
+.claudesk-opacity-value {
+  color: var(--text-normal);
+  font-variant-numeric: tabular-nums;
+}
+
+.claudesk-opacity-popover input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--claudian-brand);
 }
 
 /* ---- Modals (platform.createModal) -------------------------
@@ -705,6 +736,22 @@ code {
    drag instead of firing. Edge-resize needs no CSS — it comes from the
    BrowserWindow's resizable flag — but the 4px inset keeps the drag region
    from swallowing the top resize edge. */
+/* Header and tab row follow the transparency slider (opacity-control.ts).
+   styles.css paints both solid --background-secondary (#161b22) so sticky
+   content cannot show under them in the Obsidian pane; here the messages
+   scroll in their own wrapper, so a translucent fill is safe. The fill sits
+   on the shared wrapper (shell.ts) rather than on each bar: two translucent
+   bars meeting on a fractional pixel leave a dark seam between them. */
+#app .claudesk-top-bar {
+  flex-shrink: 0;
+  background: rgba(22, 27, 34, var(--claudesk-chrome, 1));
+}
+
+#app .claudian-header,
+#app .claudian-input-nav-row {
+  background: transparent;
+}
+
 .claudian-header {
   -webkit-app-region: drag;
   padding-top: 4px;
