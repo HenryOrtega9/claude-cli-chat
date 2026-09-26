@@ -126,6 +126,10 @@ export type UserEchoEvent = {
   type: "user";
   uuid?: string;
   session_id?: string;
+  /* Set on the CLI's `--replay-user-messages` acknowledgment of a stdin user
+     message, emitted at the moment the CLI actually hands that message to
+     the model. `uuid` is then the one we sent it with. */
+  isReplay?: boolean;
   /* Non-empty when this envelope belongs to a subagent's own stream rather
      than the parent turn — the id is the parent's Task/Agent tool_use id. */
   parent_tool_use_id?: string | null;
@@ -292,6 +296,9 @@ export type UnknownEvent = {
 export type OutboundUserMessage = {
   type: "user";
   session_id?: string;
+  /* Echoed back on the replay acknowledgment (UserEchoEvent.isReplay), which
+     is how a message queued mid-turn learns when the model received it. */
+  uuid?: string;
   message: { role: "user"; content: ContentBlock[] };
   parent_tool_use_id?: null;
 };
@@ -311,4 +318,15 @@ export type OutboundControlResponse = {
   };
 };
 
-export type OutboundJson = OutboundUserMessage | OutboundControlResponse;
+/** Host-initiated request on stdin. The CLI answers with a `control_response`
+   carrying the same `request_id` (`response.response` holds the payload).
+   `cancel_async_message` drops a queued user message by the `uuid` it was
+   sent with; the answer is `{ cancelled: boolean }`, false once the message
+   has already been handed to the model (verified on CLI 2.1.283). */
+export type OutboundControlRequest = {
+  type: "control_request";
+  request_id: string;
+  request: { subtype: "cancel_async_message"; message_uuid: string };
+};
+
+export type OutboundJson = OutboundUserMessage | OutboundControlResponse | OutboundControlRequest;

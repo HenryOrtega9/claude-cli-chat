@@ -76,22 +76,24 @@ export class InputWriter {
     });
   }
 
-  sendUserText(text: string, sessionId?: string) {
+  sendUserText(text: string, sessionId?: string, uuid?: string) {
     const message: OutboundUserMessage = {
       type: "user",
       session_id: sessionId,
       message: { role: "user", content: [{ type: "text", text }] },
       parent_tool_use_id: null,
+      ...(uuid ? { uuid } : {}),
     };
     this.send(message);
   }
 
-  sendUserContent(blocks: ContentBlock[], sessionId?: string) {
+  sendUserContent(blocks: ContentBlock[], sessionId?: string, uuid?: string) {
     const message: OutboundUserMessage = {
       type: "user",
       session_id: sessionId,
       message: { role: "user", content: blocks },
       parent_tool_use_id: null,
+      ...(uuid ? { uuid } : {}),
     };
     this.send(message);
   }
@@ -120,6 +122,14 @@ export class InputWriter {
       },
     };
     this.send(response);
+  }
+
+  sendCancelQueued(requestId: string, messageUuid: string) {
+    this.send({
+      type: "control_request",
+      request_id: requestId,
+      request: { subtype: "cancel_async_message", message_uuid: messageUuid },
+    });
   }
 
   closeStdin(): Promise<void> {

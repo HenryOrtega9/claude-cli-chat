@@ -23,6 +23,7 @@ export function spawnOptionsFromSettings(
     noSessionPersistence?: boolean;
     mcpDenyPatterns?: string[];
     noTools?: boolean;
+    replayUserMessages?: boolean;
   }
 ): SpawnOptions {
   return {
@@ -37,5 +38,6 @@ export function spawnOptionsFromSettings(
     noSessionPersistence: overrides?.noSessionPersistence,
     mcpDenyPatterns: overrides?.mcpDenyPatterns,
     ...(overrides?.noTools ? { noTools: true } : {}),
+    ...(overrides?.replayUserMessages ? { replayUserMessages: true } : {}),
   };
 }

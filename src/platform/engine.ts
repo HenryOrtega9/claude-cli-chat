@@ -34,8 +34,13 @@ export interface TabSessionLike {
   status: TabSessionStatus;
   readonly pid: number | undefined;
 
-  sendUserText(text: string): void;
-  sendUserContent(blocks: ContentBlock[]): void;
+  /* `uuid` tags the message for the CLI's replay ack (see
+     SpawnOptions.replayUserMessages). Engines that don't steer ignore it. */
+  sendUserText(text: string, uuid?: string): void;
+  sendUserContent(blocks: ContentBlock[], uuid?: string): void;
+  /* Drop a queued (steering) message by its uuid before the model gets it.
+     True only if the CLI confirmed. Absent on engines that can't steer. */
+  cancelQueuedMessage?(uuid: string): Promise<boolean>;
   approve(requestId: string, updatedInput?: Record<string, unknown>): void;
   deny(requestId: string, reason?: string): void;
   getPendingApprovals(): ControlRequestEvent[];
@@ -71,4 +76,9 @@ export interface SubprocessManagerLike {
   unregisterRemote(tabId: string): void;
   claimSessionFile(path: string): boolean;
   isSessionFileClaimed(path: string): boolean;
+  /* True when a message written to a busy session's stdin steers the running
+     turn (the local CLI queues it and feeds it to the model at the next tool
+     boundary). The gateway engine answers a busy submit with 409, so it
+     leaves this unset and the composer stays locked mid-turn there. */
+  readonly supportsSteering?: boolean;
 }

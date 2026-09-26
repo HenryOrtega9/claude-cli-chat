@@ -286,6 +286,15 @@ export type InputBoxCallbacks = {
   /* Fired when the user presses Esc while Claude is streaming (busy=true).
      Caller is expected to interrupt the in-flight turn. */
   onCancel: () => void;
+  /* True when a submit made while busy should go through as a queued
+     message that steers the running turn, instead of being swallowed.
+     Optional — without it the composer locks for the whole turn, as it did
+     before steering existed. */
+  canQueueWhileBusy?: () => boolean;
+  /* Take a queued message back before Claude gets it (the strip's × or ↑ in
+     an empty composer). The caller answers by updating setQueuedMessages
+     and, on success, putting the text back via returnQueuedText. */
+  onRetractQueued?: (id: string) => void;
   /* Fired when the user dismisses the selection chip via its (×) button.
      CONTRACT (consumed by Agent C / TabController): wire this to
      SelectionTracker.clear() so the next selectionchange refresh doesn't
@@ -364,10 +373,22 @@ function friendlySubModelLabel(modelId: string): "Opus" | "Sonnet" | "Haiku" | n
 /* Default composer placeholder. Swapped for the reply suggestion's text
    while one is showing (see setReplySuggestion) and restored after. */
 const DEFAULT_PLACEHOLDER = "How can I help you today?";
+/* Shown instead while a turn runs and the engine takes queued messages. */
+const QUEUE_PLACEHOLDER = "Queue a message to steer Claude…";
+
+/* One message waiting in the CLI's queue, as the strip above the composer
+   shows it. `extras` counts attachments + selection riding along.
+   `retractable` shows the take-back control; `retracting` marks a take-back
+   still waiting on the CLI's answer. */
+export type QueuedPreview = { id: string; text: string; extras: number; retractable: boolean; retracting: boolean };
 
 export class InputBox {
   private root: HTMLElement;
   private wrapper: HTMLElement;
+  /* Messages sent mid-turn that the model hasn't picked up yet. Sits above
+     the composer, like Claude Code's queued-prompt list. */
+  private queuedStrip: HTMLElement;
+  private queuedItems: QueuedPreview[] = [];
   private contextRow: HTMLElement;
   private textarea: HTMLTextAreaElement;
   /* Two-row layout: topToolbar frames the input from above with the
@@ -515,6 +536,7 @@ export class InputBox {
     this.currentVoice = initial?.voice ?? false;
 
     this.root = container.createDiv({ cls: "claudian-input-container" });
+    this.queuedStrip = this.root.createDiv({ cls: "claudian-queued-strip" });
     this.wrapper = this.root.createDiv({ cls: "claudian-input-wrapper" });
 
     /* Top toolbar — mode pill (left) + model pill (right). Created BEFORE
@@ -965,7 +987,7 @@ export class InputBox {
        no Escape key. On a pointer host nothing changes: the button greys out
        exactly as before and Escape stays the way to cancel. */
     const asStop = busy && TOUCH_PRIMARY;
-    this.sendBtn.toggleClass("is-disabled", busy && !asStop);
+    this.sendBtn.toggleClass("is-disabled", busy && !asStop && !this.canQueue());
     if (asStop !== this.sendBtnIsStop) {
       this.sendBtnIsStop = asStop;
       this.sendBtn.toggleClass("is-stop", asStop);
@@ -1862,6 +1884,19 @@ export class InputBox {
       return;
     }
 
+    /* ↑ in an empty composer takes back the newest queued message for
+       editing, as in Claude Code. Only with nothing typed, so ↑ still moves
+       the caret in a draft. */
+    if (e.key === "ArrowUp" && !e.isComposing && !e.shiftKey && this.textarea.value.length === 0) {
+      const last = [...this.queuedItems].reverse().find(q => q.retractable && !q.retracting);
+      if (last && this.callbacks.onRetractQueued) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.callbacks.onRetractQueued(last.id);
+        return;
+      }
+    }
+
     /* Plain Tab with a reply suggestion showing (empty composer, idle)
        accepts it into the textarea without sending. Only fires while the
        ghost is actually visible, so Tab keeps its normal focus behavior the
@@ -2401,8 +2436,52 @@ export class InputBox {
     this.renderContextRow();
   }
 
+  private canQueue(): boolean {
+    return this.callbacks.canQueueWhileBusy?.() ?? false;
+  }
+
+  /* Render the queued-message strip. An empty list hides it. */
+  setQueuedMessages(items: QueuedPreview[]): void {
+    if (this.destroyed) return;
+    this.queuedItems = items;
+    this.queuedStrip.empty();
+    this.queuedStrip.toggleClass("has-content", items.length > 0);
+    for (const item of items) {
+      const row = this.queuedStrip.createDiv({ cls: "claudian-queued-row" });
+      row.toggleClass("is-retracting", item.retracting);
+      row.createSpan({ cls: "claudian-queued-label", text: item.retracting ? "Taking back" : "Queued" });
+      const extra = item.extras > 0 ? ` (+${item.extras} attached)` : "";
+      row.createSpan({ cls: "claudian-queued-text", text: `${item.text || "(attachment only)"}${extra}` });
+      if (item.retractable && !item.retracting && this.callbacks.onRetractQueued) {
+        const btn = row.createSpan({
+          cls: "claudian-queued-retract",
+          attr: { "aria-label": "Take back", title: TOUCH_PRIMARY ? "Take back" : "Take back to edit (↑)" },
+        });
+        platform.setIcon(btn, "x");
+        btn.addEventListener("click", e => {
+          e.stopPropagation();
+          this.callbacks.onRetractQueued?.(item.id);
+        });
+      }
+    }
+  }
+
+  /* Hand queued text the model never received back to the composer, ahead
+     of anything typed since, so nothing the user wrote is lost when a turn
+     is stopped with messages still queued. */
+  returnQueuedText(texts: string[]): void {
+    if (this.destroyed) return;
+    const parts = texts.map(t => t.trim()).filter(t => t.length > 0);
+    if (parts.length === 0) return;
+    const current = this.textarea.value.trim();
+    this.textarea.value = current ? `${parts.join("\n\n")}\n\n${current}` : parts.join("\n\n");
+    this.autoResize();
+    this.scheduleDraftPublish();
+    this.refreshReplyGhost();
+  }
+
   private submit() {
-    if (this.busy) return;
+    if (this.busy && !this.canQueue()) return;
     const text = this.textarea.value.trim();
     if (!text && this.attachments.length === 0 && !this.currentSelection) return;
     this.textarea.value = "";
@@ -2506,12 +2585,10 @@ export class InputBox {
          wrapper (position: relative), the same element the hint lives in. */
       this.replyHintEl.style.top = `${this.textarea.offsetTop + 8}px`;
     } else {
-      /* Only touch the placeholder when we changed it — the class is the
-         marker — so the default text survives a redundant refresh. */
-      if (this.textarea.hasClass("has-reply-suggestion")) {
-        this.textarea.placeholder = DEFAULT_PLACEHOLDER;
-        this.textarea.removeClass("has-reply-suggestion");
-      }
+      /* setBusy runs through here, so this is also where the placeholder
+         flips to its queue hint while a steerable turn runs. */
+      this.textarea.removeClass("has-reply-suggestion");
+      this.textarea.placeholder = this.busy && this.canQueue() ? QUEUE_PLACEHOLDER : DEFAULT_PLACEHOLDER;
       this.replyHintEl.style.display = "none";
     }
   }

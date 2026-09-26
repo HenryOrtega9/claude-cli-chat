@@ -94,6 +94,12 @@ export type SpawnOptions = {
       mirroring QuickPrompt. For callers that only want text back. Undefined
       for every existing caller, so their argv is unchanged. */
   noTools?: boolean;
+  /** `--replay-user-messages`: the CLI acknowledges each stdin user message
+      on stdout (`isReplay: true`, same `uuid`) at the moment it hands that
+      message to the model. TabController uses the ack to place a message
+      queued mid-turn (steering) into the transcript. Undefined for every
+      other caller, so their argv is unchanged. */
+  replayUserMessages?: boolean;
 };
 
 export type TabSessionStatus = "starting" | "ready" | "running" | "exited" | "error";
@@ -204,6 +210,11 @@ export class TabSession {
   private errorListeners: ErrorListener[] = [];
   private stderrListeners: StderrListener[] = [];
   private pendingApprovals = new Map<string, ControlRequestEvent>();
+  /* Our own control requests awaiting the CLI's control_response, keyed by
+     request_id. Settled with the response payload, or null on an error
+     response, timeout, or exit. */
+  private pendingControl = new Map<string, (payload: Record<string, unknown> | null) => void>();
+  private controlSeq = 0;
   /* Set the instant dispose() begins tearing the child down. Lets a concurrent
      spawn() in the same tick (e.g. ensureSession after a wedged restart that
      only resolves on the 2s SIGKILL timeout) see the session as terminal and
@@ -308,6 +319,7 @@ export class TabSession {
       if (exitDispatched) return;
       exitDispatched = true;
       this.parser.detach();
+      for (const settle of Array.from(this.pendingControl.values())) settle(null);
       for (const cb of this.exitListeners) cb(code, signal);
     };
     this.child.on("exit", (code, signal) => {
@@ -345,6 +357,9 @@ export class TabSession {
       args.push("--settings", JSON.stringify({ permissions: { deny: opts.mcpDenyPatterns } }));
     }
     if (opts.noTools) args.push("--tools", "", "--strict-mcp-config");
+    if (opts.replayUserMessages && !opts.extraArgs?.includes("--replay-user-messages")) {
+      args.push("--replay-user-messages");
+    }
     if (opts.extraArgs && opts.extraArgs.length > 0) args.push(...opts.extraArgs);
     if (opts.sessionId) args.push("--resume", opts.sessionId);
     return args;
@@ -362,29 +377,60 @@ export class TabSession {
       this.pendingApprovals.set(req.request_id, req);
     } else if (event.type === "result") {
       this.status = "ready";
+    } else if ((event as { type: string }).type === "control_response") {
+      /* Answers to requests this session made are ours alone; anything else
+         (none today) still reaches the listeners. */
+      const res = (event as { response?: { subtype?: string; request_id?: string; response?: Record<string, unknown> } }).response;
+      const settle = res?.request_id ? this.pendingControl.get(res.request_id) : undefined;
+      if (settle) {
+        settle(res?.subtype === "success" ? res.response ?? {} : null);
+        return;
+      }
     }
 
     for (const cb of this.eventListeners) cb(event);
   }
 
-  sendUserText(text: string) {
+  /* Take back a message sent mid-turn (steering) before the CLI hands it to
+     the model. Resolves true only when the CLI confirms it dropped the
+     message; false when it was already delivered, the CLI refused, or no
+     answer came within 5s. */
+  cancelQueuedMessage(uuid: string): Promise<boolean> {
+    const requestId = `cancel-queued-${++this.controlSeq}`;
+    return new Promise<boolean>(resolve => {
+      const settle = (payload: Record<string, unknown> | null) => {
+        clearTimeout(timer);
+        this.pendingControl.delete(requestId);
+        resolve(payload?.cancelled === true);
+      };
+      const timer = setTimeout(() => settle(null), 5000);
+      this.pendingControl.set(requestId, settle);
+      try {
+        this.writer.sendCancelQueued(requestId, uuid);
+      } catch {
+        settle(null);
+      }
+    });
+  }
+
+  sendUserText(text: string, uuid?: string) {
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] sendUserText`, { textPreview: text.slice(0, 80), sessionId: this.sessionId });
     this.status = "running";
     try {
-      this.writer.sendUserText(text, this.sessionId ?? undefined);
+      this.writer.sendUserText(text, this.sessionId ?? undefined, uuid);
     } catch (err) {
       console.error(`[claude-cli-chat] sendUserText failed:`, err);
       throw err;
     }
   }
 
-  sendUserContent(blocks: ContentBlock[]) {
+  sendUserContent(blocks: ContentBlock[], uuid?: string) {
     /* eslint-disable no-console */
     console.log(`[claude-cli-chat] sendUserContent`, { blockCount: blocks.length, sessionId: this.sessionId });
     this.status = "running";
     try {
-      this.writer.sendUserContent(blocks, this.sessionId ?? undefined);
+      this.writer.sendUserContent(blocks, this.sessionId ?? undefined, uuid);
     } catch (err) {
       console.error(`[claude-cli-chat] sendUserContent failed:`, err);
       throw err;
@@ -510,6 +556,9 @@ export class TabSession {
    Phase C will hook this into the view: tab creation calls .spawn(), tab close
    calls .kill(), and the view subscribes to .onEvent() per tab for rendering. */
 export class SubprocessManager {
+  /* See SubprocessManagerLike.supportsSteering. */
+  readonly supportsSteering = true;
+
   /* Optional observer, called with each spawned child's pid — `alive: true`
      on spawn, `alive: false` when it exits. The Obsidian plugin leaves it
      unset (Obsidian's own process owns the children and outlives them); the

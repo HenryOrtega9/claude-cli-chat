@@ -165,6 +165,26 @@ export class TabController {
      the old process hasn't died, reusing the stale model and double-binding
      listeners. Awaiting the dispose closes that ~2s window. */
   private pendingRestartTeardown: Promise<void> | null = null;
+  /* Messages sent while a turn was running (steering). The CLI queues each
+     one and hands it to the model at the next tool boundary, or as a fresh
+     turn if it arrived during the final reply; its `--replay-user-messages`
+     ack (matched on `uuid`) is when the bubble joins the transcript. Until
+     then they show in the composer's queued strip. Runtime-only: the CLI's
+     queue dies with the process, so nothing here is worth persisting. */
+  private queuedSteers: Array<{
+    uuid: string;
+    text: string;
+    msg: ChatMessage;
+    attachments: SubmitPayload["attachments"];
+    selection: SubmitPayload["selection"];
+    /* A cancel_async_message for it is in flight. */
+    retracting?: boolean;
+  }> = [];
+  /* Set when a turn ended with messages still queued, so the tab is being
+     held busy for the follow-up turn the CLI will run. If those messages
+     are all taken back instead, nothing will run and the tab must go idle
+     on its own (see retractQueuedSteer). */
+  private awaitingQueuedTurn = false;
 
   /* Tracks whether handleError has already pushed an error bubble for the
      current pass. onError and onExit can both fire for the same failure
@@ -283,6 +303,8 @@ export class TabController {
         onMentionQuery: query => this.queryFileSuggestions(query),
         onSlashQuery: query => this.querySlashCommands(query),
         onCancel: () => void this.cancelStream(),
+        canQueueWhileBusy: () => this.canSteer(),
+        onRetractQueued: id => void this.retractQueuedSteer(id),
         onSelectionDismissed: () => this.selectionTracker?.clear(),
         /* Pill click opens the Create-subagent modal. Launching an existing
            agent is still reachable via the /agent slash command, which keeps
@@ -716,6 +738,7 @@ export class TabController {
       this.streamingBlocks.clear();
       this.passStartedAt = null;
       this.errorBubbleEmitted = false;
+      this.flushQueuedSteers(reason !== "clear" && reason !== "destroy");
       if (reason !== "switch") {
         this.state.busy = false;
         this.inputBox.setBusy(false);
@@ -1295,6 +1318,9 @@ export class TabController {
          fresh by refreshMcpDenyPatterns on every toggle). Empty unless the
          user switched a server off in the MCP manager. */
       mcpDenyPatterns: this.plugin.mcpDenyPatterns,
+      /* Replay acks are what place a queued steering message in the
+         transcript; see queuedSteers. */
+      replayUserMessages: this.plugin.subprocessManager.supportsSteering === true,
     });
     this.session = this.plugin.subprocessManager.spawn(this.state.id, opts);
     /* The incognito decision is now baked into the live subprocess — lock the
@@ -1471,11 +1497,27 @@ export class TabController {
        renderer's catch-up loop. */
     await this.replayDone;
 
+    /* A submit while the turn is still running steers it: the message goes
+       to the live CLI, which feeds it to the model at the next tool boundary
+       without stopping the turn (Claude Code's queued-message behavior). An
+       engine that can't do that keeps the old lock; the composer normally
+       blocks this already, so this only catches a stray programmatic call. */
+    const steering = this.state.busy;
+    if (steering && !this.canSteer()) {
+      platform.notify("Wait for the current turn to finish before sending another message.");
+      this.inputBox.restoreContext(attachments, selection);
+      this.inputBox.returnQueuedText([text]);
+      return;
+    }
+
     /* Reset per-pass dedup flags so a new submit can emit a fresh error
      bubble and so any lingering cancel intent from a previous interaction
-     doesn't suppress the new turn's events. */
-    this.errorBubbleEmitted = false;
-    this.userCancelInitiated = false;
+     doesn't suppress the new turn's events. A steering message joins the
+     running turn, so it leaves that turn's flags alone. */
+    if (!steering) {
+      this.errorBubbleEmitted = false;
+      this.userCancelInitiated = false;
+    }
 
     /* A new turn makes the previous turn's reply suggestion stale — including
        one still being generated, which the sequence bump discards on arrival. */
@@ -1485,7 +1527,7 @@ export class TabController {
        response — matches the mobile voice-mode feel where talking over
        Claude cuts it off. Channel-scoped: sibling tabs and note reads keep
        playing. The notify listener re-syncs the pause button. */
-    if (this.voiceOn()) this.plugin.speech.stop(this.state.id);
+    if (!steering && this.voiceOn()) this.plugin.speech.stop(this.state.id);
 
     /* Plugin-side slash commands (/clear, /help, /agent) are UI operations,
        so they run no matter what context rides along — a live editor
@@ -1506,6 +1548,14 @@ export class TabController {
        composer for the next message; skills and custom commands keep the
        command first and carry the context after it as $ARGUMENTS. */
     const cliSlash = slashName !== null ? this.classifyCliSlash(slashName) : null;
+    /* The CLI only parses a slash command at the start of a turn; queued
+       mid-turn it would reach the model as plain text. */
+    if (steering && cliSlash !== null) {
+      platform.notify(`/${slashName} can't be queued mid-turn. Send it once this turn finishes.`);
+      this.inputBox.restoreContext(attachments, selection);
+      this.inputBox.returnQueuedText([text]);
+      return;
+    }
     const sendContext = cliSlash !== "builtin";
     if (!sendContext) this.inputBox.restoreContext(attachments, selection);
     const sentAttachments = sendContext ? attachments : [];
@@ -1587,6 +1637,20 @@ export class TabController {
       this.selectionTracker.clear();
     }
 
+    /* Office extraction above can await, and the turn may have moved on
+       meanwhile. Finished: send this as an ordinary new turn. Stopped or
+       torn down: nothing live to queue into, so hand it back. */
+    let queued = steering;
+    if (queued && !this.state.busy) {
+      queued = false;
+      this.errorBubbleEmitted = false;
+      this.userCancelInitiated = false;
+    } else if (queued && !this.canSteer()) {
+      this.inputBox.restoreContext(sentAttachments, sentSelection);
+      this.inputBox.returnQueuedText([text]);
+      return;
+    }
+
     const msg: ChatMessage = {
       id: makeMessageId(),
       role: "user",
@@ -1599,28 +1663,36 @@ export class TabController {
          non-sticky pins off the bar. */
       attachedNotePaths: pinnedPaths.length > 0 ? [...pinnedPaths] : undefined,
     };
-    this.state.messages.push(msg);
-    this.state.busy = true;
-    this.state.updatedAt = Date.now();
-    if (this.state.title === "New chat" && text) {
-      /* Use the user's original typed text for the fallback title, not the
-         augmented wire text — otherwise tabs would be titled with the
-         selection block prefix. */
-      this.state.title = text.slice(0, 48);
-    } else if (this.state.title === "New chat" && sentAttachments.length > 0) {
-      const allImages = sentAttachments.every(a => (a.kind ?? "image") === "image");
-      this.state.title = allImages
-        ? `Image (${sentAttachments.length})`
-        : `Attachment (${sentAttachments.length})`;
+    const steerUuid = queued ? globalThis.crypto.randomUUID() : undefined;
+    if (steerUuid) {
+      /* No bubble yet: the model hasn't seen it. deliverQueuedSteer adds it
+         to the transcript when the CLI's replay ack says it has. */
+      this.queuedSteers.push({ uuid: steerUuid, text, msg, attachments: sentAttachments, selection: sentSelection });
+      this.refreshQueuedStrip();
+    } else {
+      this.state.messages.push(msg);
+      this.state.busy = true;
+      this.state.updatedAt = Date.now();
+      if (this.state.title === "New chat" && text) {
+        /* Use the user's original typed text for the fallback title, not the
+           augmented wire text — otherwise tabs would be titled with the
+           selection block prefix. */
+        this.state.title = text.slice(0, 48);
+      } else if (this.state.title === "New chat" && sentAttachments.length > 0) {
+        const allImages = sentAttachments.every(a => (a.kind ?? "image") === "image");
+        this.state.title = allImages
+          ? `Image (${sentAttachments.length})`
+          : `Attachment (${sentAttachments.length})`;
+      }
+      this.updateWelcomeVisibility();
+      await this.renderer.upsertMessage(msg);
+      this.renderer.forceStickToBottom();
+      this.inputBox.setBusy(true);
+      this.statusIndicator.setThinking();
+      this.plugin.stateEmitter?.setState("thinking");
+      this.passStartedAt = Date.now();
+      this.onStateChangeCb();
     }
-    this.updateWelcomeVisibility();
-    await this.renderer.upsertMessage(msg);
-    this.renderer.forceStickToBottom();
-    this.inputBox.setBusy(true);
-    this.statusIndicator.setThinking();
-    this.plugin.stateEmitter?.setState("thinking");
-    this.passStartedAt = Date.now();
-    this.onStateChangeCb();
 
     /* Auto-drop non-sticky pins THAT WERE PART OF THIS TURN. The file
        contents are already inlined into THIS turn's wireText (built
@@ -1652,47 +1724,54 @@ export class TabController {
        follow-up turns and when the setting is off. */
     void this.maybeGenerateTitle();
 
-    const session = await this.ensureSession();
-    /* The tab can be closed while ensureSession awaits a restart teardown —
-       the session just spawned then belongs to a dead tab. Kill it instead of
-       leaking a full turn (and its persistence writes) into a deleted
-       conversation. */
-    if (this.destroyed) {
-      void session.dispose();
-      return;
-    }
-    /* Esc pressed while ensureSession was awaiting a restart teardown: the
-       cancel's own teardownSession no-op'd behind the re-entrancy guard, so
-       nothing stopped this turn from proceeding — the user's Stop would be
-       silently overridden and the message sent anyway. Honor the cancel:
-       leave the bubble in place but never send. */
-    if (this.userCancelInitiated) {
-      /* This session was just spawned by the ensureSession() await above but
-         never got a message written to its stdin, so nothing else will ever
-         tear it down (wire-format gotcha #1: no user message means the CLI
-         never even emits system/init, let alone exits on its own). Dispose it
-         here like the destroyed branch above — guarded on identity in case a
-         concurrent submit() already claimed this.session, so we never dispose
-         a session out from under a legitimate in-flight turn. */
-      if (this.session === session) {
-        this.session = null;
+    /* A queued message rides the live session. canSteer() confirmed it just
+       above and nothing has awaited since, so it can't have been torn down;
+       ensureSession() is only for starting turns (after a teardown it would
+       spawn a fresh process, which is exactly wrong here). */
+    const liveSession = steerUuid ? this.session : null;
+    const session = liveSession ?? await this.ensureSession();
+    if (!liveSession) {
+      /* The tab can be closed while ensureSession awaits a restart teardown —
+         the session just spawned then belongs to a dead tab. Kill it instead of
+         leaking a full turn (and its persistence writes) into a deleted
+         conversation. */
+      if (this.destroyed) {
         void session.dispose();
+        return;
       }
-      this.state.busy = false;
-      this.inputBox.setBusy(false);
-      this.statusIndicator.hide();
-      this.plugin.stateEmitter?.setState("ready");
-      this.onStateChangeCb();
-      return;
+      /* Esc pressed while ensureSession was awaiting a restart teardown: the
+         cancel's own teardownSession no-op'd behind the re-entrancy guard, so
+         nothing stopped this turn from proceeding — the user's Stop would be
+         silently overridden and the message sent anyway. Honor the cancel:
+         leave the bubble in place but never send. */
+      if (this.userCancelInitiated) {
+        /* This session was just spawned by the ensureSession() await above but
+           never got a message written to its stdin, so nothing else will ever
+           tear it down (wire-format gotcha #1: no user message means the CLI
+           never even emits system/init, let alone exits on its own). Dispose it
+           here like the destroyed branch above — guarded on identity in case a
+           concurrent submit() already claimed this.session, so we never dispose
+           a session out from under a legitimate in-flight turn. */
+        if (this.session === session) {
+          this.session = null;
+          void session.dispose();
+        }
+        this.state.busy = false;
+        this.inputBox.setBusy(false);
+        this.statusIndicator.hide();
+        this.plugin.stateEmitter?.setState("ready");
+        this.onStateChangeCb();
+        return;
+      }
+      /* ensureSession may have awaited a restart teardown whose epilogue clears
+         busy (teardownSession's non-switch tail runs AFTER we set busy above).
+         Re-assert so the live turn keeps Esc-cancel armed, Send in its
+         queue-a-steer role, and the tab badge accurate. */
+      this.state.busy = true;
+      this.inputBox.setBusy(true);
     }
-    /* ensureSession may have awaited a restart teardown whose epilogue clears
-       busy (teardownSession's non-switch tail runs AFTER we set busy above).
-       Re-assert so the live turn keeps Send disabled, Esc-cancel armed, and
-       the tab badge accurate. */
-    this.state.busy = true;
-    this.inputBox.setBusy(true);
     /* eslint-disable no-console */
-    console.log(`[claude-cli-chat] submit -> session.status=${session.status}`);
+    console.log(`[claude-cli-chat] submit -> session.status=${session.status}${steerUuid ? " (queued)" : ""}`);
     /* Claude Code stream-json mode does NOT emit `system/init` until it has
        read at least one user message from stdin. Writing immediately after
        spawn is the correct pattern. The CLI processes the message, then
@@ -1761,7 +1840,7 @@ export class TabController {
        error bubble, busy cleared, status hidden, trackers reconciled. */
     try {
       if (mediaBlocks.length === 0) {
-        session.sendUserText(finalText);
+        session.sendUserText(finalText, steerUuid);
         return;
       }
       /* The command text leads for slash commands, same reason as above. */
@@ -1769,10 +1848,153 @@ export class TabController {
         ? [{ type: "text", text: finalText }, ...mediaBlocks]
         : [...mediaBlocks];
       if (finalText && cliSlash !== "prompt") blocks.push({ type: "text", text: finalText });
-      session.sendUserContent(blocks);
+      session.sendUserContent(blocks, steerUuid);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (steerUuid) {
+        /* A dead stdin mid-turn means the process is going down; its own
+           exit path reports that. Just give the message back. */
+        this.dropQueuedSteer(steerUuid);
+        platform.notify(`Couldn't queue message: ${message}`);
+        return;
+      }
       await this.handleError({ type: "error", message: `Failed to send message: ${message}` });
+    }
+  }
+
+  /* Whether a submit right now can steer the running turn. See queuedSteers. */
+  private canSteer(): boolean {
+    return this.mode === "local"
+      && this.plugin.subprocessManager.supportsSteering === true
+      && this.session !== null
+      && !this.session.isTerminal()
+      && !this.userCancelInitiated
+      && !this.tearingDown;
+  }
+
+  private refreshQueuedStrip(): void {
+    const retractable = typeof this.session?.cancelQueuedMessage === "function";
+    this.inputBox.setQueuedMessages(this.queuedSteers.map(q => ({
+      id: q.uuid,
+      text: q.text,
+      extras: q.attachments.length + (q.selection ? 1 : 0) + (q.msg.attachedNotePaths?.length ?? 0),
+      retractable,
+      retracting: q.retracting === true,
+    })));
+  }
+
+  /* Take a queued message back before the model gets it (cancel_async_message)
+     and return it to the composer for editing. Racy by nature: the CLI may
+     hand it over at a tool boundary while the cancel is in flight, in which
+     case it answers cancelled=false and the replay ack delivers it as usual. */
+  private async retractQueuedSteer(uuid: string): Promise<void> {
+    const entry = this.queuedSteers.find(q => q.uuid === uuid);
+    const session = this.session;
+    if (!entry || entry.retracting || !session?.cancelQueuedMessage) return;
+    entry.retracting = true;
+    this.refreshQueuedStrip();
+    const cancelled = await session.cancelQueuedMessage(uuid);
+    const idx = this.queuedSteers.indexOf(entry);
+    if (idx === -1) {
+      /* Left the queue while we waited: delivered (it's in the transcript
+         now) or returned to the composer by a stop, which needs no notice. */
+      if (this.state.messages.includes(entry.msg)) {
+        platform.notify("Too late to take back: Claude already has that message.");
+      }
+      return;
+    }
+    entry.retracting = false;
+    if (!cancelled) {
+      /* Already dequeued for delivery, or the CLI didn't answer. Its replay
+         ack will move it into the transcript. */
+      this.refreshQueuedStrip();
+      platform.notify("Couldn't take that message back. Claude is picking it up.");
+      return;
+    }
+    this.queuedSteers.splice(idx, 1);
+    this.refreshQueuedStrip();
+    this.returnSteersToComposer([entry]);
+    if (this.awaitingQueuedTurn && this.queuedSteers.length === 0) this.settleAfterRetractedQueue();
+  }
+
+  /* The turn already ended and was only being held busy for queued messages
+     that have all been taken back, so no follow-up turn is coming. Run the
+     idle half of handleResult that it skipped. */
+  private settleAfterRetractedQueue(): void {
+    this.awaitingQueuedTurn = false;
+    this.state.busy = false;
+    this.inputBox.setBusy(false);
+    this.statusIndicator.hide();
+    this.refreshRunningAgentCount();
+    this.plugin.stateEmitter?.setState("complete");
+    void this.maybeSuggestReply();
+    this.onStateChangeCb();
+  }
+
+  /* The CLI's replay ack for a queued message: the model has it now, so it
+     joins the transcript here, after whatever the turn produced before the
+     tool boundary where it was picked up. */
+  private async deliverQueuedSteer(uuid: string): Promise<void> {
+    const idx = this.queuedSteers.findIndex(q => q.uuid === uuid);
+    if (idx === -1) return;
+    const [entry] = this.queuedSteers.splice(idx, 1);
+    this.refreshQueuedStrip();
+    this.awaitingQueuedTurn = false;
+    const msg = entry.msg;
+    msg.timestamp = Date.now();
+    /* Claude's reply to this message must open a new bubble below it rather
+       than append to the one above. */
+    this.clearStreamingPointer();
+    this.state.messages.push(msg);
+    this.state.updatedAt = Date.now();
+    /* Normally still busy (handleResult holds busy while anything is
+       queued). If some other path went idle first, the CLI is starting a
+       turn for this message regardless, so reflect that. */
+    if (!this.state.busy) {
+      this.state.busy = true;
+      this.inputBox.setBusy(true);
+    }
+    this.statusIndicator.setThinking();
+    this.plugin.stateEmitter?.setState("thinking");
+    await this.renderer.upsertMessage(msg);
+    this.renderer.forceStickToBottom();
+    this.onStateChangeCb();
+  }
+
+  private dropQueuedSteer(uuid: string): void {
+    const idx = this.queuedSteers.findIndex(q => q.uuid === uuid);
+    if (idx === -1) return;
+    const [entry] = this.queuedSteers.splice(idx, 1);
+    this.refreshQueuedStrip();
+    this.returnSteersToComposer([entry]);
+  }
+
+  /* The CLI's queue dies with the process, so on a stop or crash every
+     message it never delivered goes back into the composer for the user to
+     edit or resend, like Claude Code does on interrupt. A clear or tab close
+     discards them with the conversation instead. */
+  private flushQueuedSteers(returnToComposer: boolean): void {
+    if (this.queuedSteers.length === 0) return;
+    const entries = this.queuedSteers;
+    this.queuedSteers = [];
+    this.awaitingQueuedTurn = false;
+    this.refreshQueuedStrip();
+    if (returnToComposer) this.returnSteersToComposer(entries);
+  }
+
+  private returnSteersToComposer(entries: typeof this.queuedSteers): void {
+    this.inputBox.returnQueuedText(entries.map(e => e.text));
+    /* restoreContext prepends, so walk backwards to keep the original order. */
+    for (const e of [...entries].reverse()) this.inputBox.restoreContext(e.attachments, e.selection);
+    /* Non-sticky pins fell off the bar when the message was queued. */
+    const pinned = new Set(this.activeFileIndicator.getPinnedPaths());
+    for (const e of entries) {
+      for (const p of e.msg.attachedNotePaths ?? []) {
+        if (!pinned.has(p)) {
+          this.activeFileIndicator.addPinnedPath(p);
+          pinned.add(p);
+        }
+      }
     }
   }
 
@@ -1888,7 +2110,7 @@ export class TabController {
         break;
       }
       case "user": {
-        await this.handleUserEcho(event as { type: "user"; message: { role: "user"; content: string | Array<{ type: string; text?: string }> } });
+        await this.handleUserEcho(event as { type: "user"; uuid?: string; isReplay?: boolean; message: { role: "user"; content: string | Array<{ type: string; text?: string }> } });
         break;
       }
       case "stream_event": {
@@ -1934,7 +2156,15 @@ export class TabController {
     this.onStateChangeCb();
   }
 
-  private async handleUserEcho(event: { message: { content: string | Array<{ type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } }) {
+  private async handleUserEcho(event: { uuid?: string; isReplay?: boolean; message: { content: string | Array<{ type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } }) {
+    /* `--replay-user-messages` acks echo stdin messages back verbatim. They
+       carry no tool results, and every one that isn't a queued steer is a
+       message this tab (or, over the gateway, another client) already
+       showed, so only the queued-steer match matters. */
+    if (event.isReplay) {
+      if (event.uuid) await this.deliverQueuedSteer(event.uuid);
+      return;
+    }
     /* Synthetic user turns from the CLI carry two kinds of blocks:
        - text blocks (real user input echoed back, OR skill bodies / file
          contents the CLI injects into the model's context behind the scenes)
@@ -2651,9 +2881,17 @@ export class TabController {
   }
 
   private handleResult(event: ResultEvent) {
-    this.state.busy = false;
-    this.inputBox.setBusy(false);
-    this.statusIndicator.hide();
+    /* A message still queued at the result arrived during the final reply,
+       past the last tool boundary. The CLI runs it as the next turn right
+       away (its replay ack lands after a fresh system/init), so the tab
+       stays busy instead of flashing idle and inviting a normal submit. */
+    const moreQueued = this.queuedSteers.length > 0;
+    this.awaitingQueuedTurn = moreQueued;
+    if (!moreQueued) {
+      this.state.busy = false;
+      this.inputBox.setBusy(false);
+      this.statusIndicator.hide();
+    }
     this.clearStreamingPointer();
     this.passStartedAt = null;
     /* Turn-level failures (error_max_turns, error_during_execution,
@@ -2743,7 +2981,7 @@ export class TabController {
        so without this sweep they'd accumulate for the plugin's lifetime.
        Audio is untouched; queued chunks keep playing. */
     this.plugin.speech.forgetChannel(this.state.id);
-    this.plugin.stateEmitter?.setState(turnFailed ? "ready" : "complete");
+    this.plugin.stateEmitter?.setState(moreQueued ? "thinking" : turnFailed ? "ready" : "complete");
     /* Do NOT use event.usage here — it sums across every API call in the
        turn (each tool round-trip counts the shared context again), inflating
        the displayed token count. handleAssistant updates the indicator
@@ -2754,7 +2992,7 @@ export class TabController {
 
     /* Reply suggestion: needs the finished reply, so this is the earliest it
        can start. A failed turn has nothing sensible to follow up on. */
-    if (!turnFailed) void this.maybeSuggestReply();
+    if (!turnFailed && !moreQueued) void this.maybeSuggestReply();
   }
 
   /* Monotonic guard for the reply-suggestion pass. Bumped by every submit
@@ -3045,6 +3283,8 @@ export class TabController {
        "thinking" with no turn running. */
     this.state.pendingApprovals.clear();
     this.approvalArea.dismissAll();
+    /* Its queue went with it. A no-op after a teardown, which flushed first. */
+    this.flushQueuedSteers(true);
     this.state.busy = false;
     this.inputBox.setBusy(false);
     this.statusIndicator.hide();
