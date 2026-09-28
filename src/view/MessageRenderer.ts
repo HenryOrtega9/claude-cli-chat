@@ -736,14 +736,11 @@ export class MessageListRenderer {
 
       /* Click (or Enter/Space) on the header toggles. Default is collapsed —
          content, including the Write/Edit diff, is shown only on demand so a
-         long command or a whole written note doesn't dominate the chat.
-         `is-user-toggled` records the user's intent so the error auto-expand
-         below never overrides a row they deliberately closed. */
+         long command or a whole written note doesn't dominate the chat. */
       const toggle = () => {
         const next = !toolEl!.hasClass("is-expanded");
         toolEl!.toggleClass("is-expanded", next);
         header.setAttr("aria-expanded", next ? "true" : "false");
-        toolEl!.addClass("is-user-toggled");
       };
       header.addEventListener("click", toggle);
       header.addEventListener("keydown", e => {
@@ -762,16 +759,12 @@ export class MessageListRenderer {
     metaEl.setText(meta ?? "");
     metaEl.toggleClass("is-empty", !meta);
 
-    /* stateKey/stateChanged are computed here (rather than down by the
-       expand/collapse rules that also need them) because the status icon
-       rebuild right below is the expensive part: renderIcon builds an SVG
+    /* stateKey/stateChanged gate the status icon rebuild because it is the
+       expensive part: renderIcon builds an SVG
        node-by-node via createElementNS, and upsertTool re-runs for every
        tool on every streaming delta of the message. Skipping the rebuild
        when the tool's error/status hasn't actually transitioned avoids that
-       allocation at the stream's tick rate. The expand/collapse rules further
-       down reuse this same stateChanged rather than recomputing it — recomputing
-       after data-state is already written below would always read "unchanged"
-       and silently disable those transitions. */
+       allocation at the stream's tick rate. */
     const stateKey = tool.isError ? "error" : tool.status;
     const stateChanged = toolEl.getAttribute("data-state") !== stateKey;
     toolEl.setAttribute("data-state", stateKey);
@@ -787,20 +780,13 @@ export class MessageListRenderer {
       statusEl.setAttr("aria-label", this.labelForStatus(tool.status));
     }
 
-    /* Rows stay collapsed in every state — pending, running, completed —
-       so the chat reads as a list of one-line callouts and the user opens
-       the ones they care about. (Earlier builds auto-expanded running rows
-       to show the command about to execute; a long Bash script or a whole
-       written note then took over the viewport, which is what this replaces.)
-       The one auto-open is an error, so the user doesn't have to hunt for
-       what failed — and only on the TRANSITION into the error state, never
-       on steady-state re-renders, and never over a row the user has already
-       toggled themselves. Nothing auto-collapses: if the user opened a
-       running row, completion leaves it open for them to finish reading. */
-    if (tool.isError && stateChanged && !toolEl.hasClass("is-user-toggled")) {
-      toolEl.addClass("is-expanded");
-      (toolEl.querySelector(".claudian-tool-header") as HTMLElement | null)?.setAttr("aria-expanded", "true");
-    }
+    /* Rows stay collapsed in every state — pending, running, completed,
+       errored — so the chat reads as a list of one-line callouts and the
+       user opens the ones they care about. (Earlier builds auto-expanded
+       running rows, and later only errored rows; a failed Bash call's
+       command + stderr still took over the viewport, and the red X on the
+       collapsed row is enough to flag it.) Nothing auto-collapses either:
+       if the user opened a running row, completion leaves it open. */
 
     /* Body rebuild guard (see toolBodySig). Header subject/status above are
        cheap and keep their own transition guard; everything below tears down
