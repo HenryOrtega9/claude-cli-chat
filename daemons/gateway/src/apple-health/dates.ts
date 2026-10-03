@@ -71,14 +71,21 @@ export function addDays(date: string, days: number): string {
   return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
 }
 
-/* 0 = Monday ... 6 = Sunday. */
-export function isoWeekday(date: string): number {
+/* 0 = Sunday ... 6 = Saturday. */
+export function weekday(date: string): number {
   const [y, m, d] = date.split("-").map(Number);
-  return (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
 }
 
-export function mondayOf(date: string): string {
-  return addDays(date, -isoWeekday(date));
+/* The Sunday that starts the Sunday-to-Saturday week containing `date`. */
+export function sundayOf(date: string): string {
+  return addDays(date, -weekday(date));
+}
+
+/* Inclusive number of calendar days from `from` to `to` (1 when equal). */
+export function daySpan(from: string, to: string): number {
+  const ms = (x: string) => { const [y, m, d] = x.split("-").map(Number); return Date.UTC(y, m - 1, d); };
+  return Math.round((ms(to) - ms(from)) / 86_400_000) + 1;
 }
 
 export function dateRange(from: string, to: string): string[] {

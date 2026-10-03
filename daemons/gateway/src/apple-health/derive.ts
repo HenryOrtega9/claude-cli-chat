@@ -9,7 +9,7 @@
      single-source rule: per night, only the source with the most staged
      sleep counts. */
 
-import { addDays, dateRange, mondayOf } from "./dates";
+import { addDays, dateRange, sundayOf } from "./dates";
 import type { DatabaseSync, Row, SqlValue } from "./sqlite";
 import type { WorkoutInfo } from "./store";
 
@@ -345,21 +345,25 @@ export const WEEKLY_SUMMARY_ROWS = [
   "Other Workouts [list type and count]",
 ] as const;
 
-/* Monday-to-Sunday week containing `date`. */
+/* The Sunday-to-Saturday week containing `date`. The weekly review runs on
+   the Sunday after the week (review day R = end + 1). */
 export function weekBounds(date: string): { start: string; end: string } {
-  const start = mondayOf(date);
+  const start = sundayOf(date);
   return { start, end: addDays(start, 6) };
 }
 
-/* The most recent COMPLETED week: the one before the week `today` is in. */
-export function lastCompletedWeekOf(today: string): string {
-  // Sunday is check-in day, so the week ending today counts as completed.
-  const monday = mondayOf(today);
-  return addDays(monday, 6) === today ? monday : addDays(monday, -7);
+/* The most recent COMPLETED Sunday-to-Saturday week: the one ending on the
+   most recent Saturday strictly before `today`. On a Sunday that is
+   yesterday's week; on a Saturday today is still in progress, so it is the
+   week that ended a week ago. Returns that week's bounds. */
+export function lastCompletedWeek(today: string): { start: string; end: string } {
+  return weekBounds(addDays(sundayOf(today), -7));
 }
 
-export function weeklyCsv(db: DatabaseSync, weekOf: string): string {
-  const { start, end } = weekBounds(weekOf);
+/* The export for any inclusive date range: a Sunday-to-Saturday week from
+   weekBounds(), or an arbitrary --from/--to range. The range only changes
+   which rows appear and the dates in the DAILY METRICS title. */
+export function weeklyCsv(db: DatabaseSync, start: string, end: string): string {
   const days = dailyMetrics(db, start, end);
   const body = bodyComposition(db, start, end);
   const sleep = sleepNights(db, start, end);

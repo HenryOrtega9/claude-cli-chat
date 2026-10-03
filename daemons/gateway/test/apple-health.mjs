@@ -13,6 +13,8 @@
      5. Payload validation (bad uuid / date / oversize batch)
      6. The note renders and is written atomically into the temp vault
      7. The CLI: weekly-csv headers match the vault's export prompt exactly,
+        Sunday-to-Saturday weeks (default = last completed week on a Sunday,
+        a Saturday and a weekday), --from/--to ranges and their validation,
         daily/samples/status work, sql refuses writes, missing DB message
      8. The real GatewayServer class on an ephemeral 127.0.0.1 port: 401
         without the token, 400 on a malformed payload, 200 on a good one,
@@ -328,11 +330,11 @@ function cli(args, env = {}) {
   return { code: res.status, out: res.stdout, err: res.stderr };
 }
 
-const weekly = cli(["weekly-csv", "--week-of", "2026-09-24"]);
+const weekly = cli(["weekly-csv", "--week-of", "2026-09-24"]); // Thu: week Sun 09-20 .. Sat 09-26
 check(weekly.code === 0 && weekly.err === "", "weekly-csv runs with no stderr (no ExperimentalWarning)", weekly.err);
 const lines = weekly.out.split("\n");
 const EXPECTED = [
-  "=== DAILY METRICS (2026-09-21 to 2026-09-27) ===",
+  "=== DAILY METRICS (2026-09-20 to 2026-09-26) ===",
   "Date, Resting Energy (kcal), Active Energy (kcal), Total Energy (kcal), Resting HR (bpm), HRV (ms), Max HR (bpm), VO2 Max (mL/min/kg)",
   "=== BODY COMPOSITION ===",
   "Date, Weight (lbs), Body Fat (%), Lean Mass (lbs)",
@@ -343,6 +345,7 @@ const EXPECTED = [
   "=== WEEKLY SUMMARY ===",
   "Metric, Value",
 ];
+const WEEKLY_SUMMARY_LABELS_OK = (ls) => H.WEEKLY_SUMMARY_ROWS.length === 13 && H.WEEKLY_SUMMARY_ROWS.every(label => ls.some(l => l.startsWith(`${label}, `)));
 let cursor = -1;
 const inOrder = EXPECTED.every(line => (cursor = lines.indexOf(line, cursor + 1)) >= 0);
 check(inOrder, "weekly-csv section titles and headers appear exactly and in order", weekly.out);
@@ -369,6 +372,53 @@ check(lines.includes("2026-09-23, Running, 30.6, 413, 3.21, 9:31 /mi, 151, 172")
 check(lines.includes("Total Runs, 1") && lines.includes("Total Running Distance (mi), 3.21") && lines.includes("Total Lifting Sessions, 1")
   && lines.includes("Other Workouts [list type and count], Walking x1") && lines.includes("Body Fat (%) [most recent], 18.3"),
   "weekly-csv summary counts runs, lifts and other workouts");
+
+check(lines.filter(l => /^2026-09-\d\d, /.test(l)).length > 0 && lines.includes("2026-09-20, , , , , , , 38.4")
+  && !lines.some(l => l.startsWith("2026-09-27, ") || l.startsWith("2026-09-19, ")),
+  "weekly-csv --week-of covers Sunday 09-20 through Saturday 09-26 only", weekly.out);
+
+/* Week arithmetic: Sunday-to-Saturday weeks, default = last completed week. */
+const wk = (b) => `${b.start}..${b.end}`;
+check(wk(H.weekBounds("2026-09-30")) === "2026-09-27..2026-10-03" && wk(H.weekBounds("2026-09-27")) === "2026-09-27..2026-10-03"
+  && wk(H.weekBounds("2026-10-03")) === "2026-09-27..2026-10-03" && wk(H.weekBounds("2026-10-04")) === "2026-10-04..2026-10-10",
+  "weekBounds: the Sunday-to-Saturday week containing the date");
+check(wk(H.lastCompletedWeek("2026-10-04")) === "2026-09-27..2026-10-03",
+  "default week on a Sunday (review day) is the week that ended yesterday", wk(H.lastCompletedWeek("2026-10-04")));
+check(wk(H.lastCompletedWeek("2026-10-03")) === "2026-09-20..2026-09-26",
+  "default week on a Saturday skips the incomplete current week", wk(H.lastCompletedWeek("2026-10-03")));
+check(wk(H.lastCompletedWeek("2026-10-02")) === "2026-09-20..2026-09-26" && wk(H.lastCompletedWeek("2026-09-28")) === "2026-09-20..2026-09-26",
+  "default week on a weekday is the last full Sunday-to-Saturday week", wk(H.lastCompletedWeek("2026-10-02")));
+const defaultWeek = cli(["weekly-csv"]);
+const expectDefault = H.lastCompletedWeek(new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" }));
+check(defaultWeek.code === 0 && defaultWeek.out.startsWith(`=== DAILY METRICS (${expectDefault.start} to ${expectDefault.end}) ===`),
+  "weekly-csv with no flags exports the last completed week", defaultWeek.err || defaultWeek.out.split("\n")[0]);
+
+/* --from/--to: any inclusive range up to 31 days, same sections and rows. */
+const ranged = cli(["weekly-csv", "--from", "2026-09-22", "--to", "2026-09-23"]);
+const rLines = ranged.out.split("\n");
+cursor = -1;
+check(ranged.code === 0 && rLines[0] === "=== DAILY METRICS (2026-09-22 to 2026-09-23) ==="
+  && EXPECTED.slice(1).every(line => (cursor = rLines.indexOf(line, cursor + 1)) >= 0),
+  "weekly-csv --from/--to titles the actual range and keeps every header", ranged.err || ranged.out);
+check(rLines.filter(l => /^2026-09-2[23], \d/.test(l) || /^2026-09-2[23], , /.test(l)).length >= 2
+  && !rLines.some(l => l.startsWith("2026-09-21, ") || l.startsWith("2026-09-24, "))
+  && rLines.includes("Total Runs, 1") && rLines.includes("Total Lifting Sessions, 0"),
+  "weekly-csv --from/--to includes only the range's days and workouts", ranged.out);
+check(WEEKLY_SUMMARY_LABELS_OK(rLines), "weekly-csv --from/--to keeps all 13 WEEKLY SUMMARY rows");
+const bad = [
+  [["weekly-csv", "--from", "2026-09-22"], /go together/, "--from without --to"],
+  [["weekly-csv", "--to", "2026-09-22"], /go together/, "--to without --from"],
+  [["weekly-csv", "--from", "2026-09-23", "--to", "2026-09-22"], /after --to/, "--from after --to"],
+  [["weekly-csv", "--from", "2026-09-01", "--to", "2026-10-02"], /at most 31 days/, "a 32-day range"],
+  [["weekly-csv", "--week-of", "2026-09-22", "--from", "2026-09-20", "--to", "2026-09-26"], /not both/, "--week-of with --from/--to"],
+  [["weekly-csv", "--from", "2026-09-31", "--to", "2026-10-02"], /YYYY-MM-DD/, "an invalid --from date"],
+];
+for (const [argv, re, what] of bad) {
+  const r = cli(argv);
+  check(r.code === 1 && re.test(r.err), `weekly-csv rejects ${what}`, r.err);
+}
+const month = cli(["weekly-csv", "--from", "2026-09-01", "--to", "2026-10-01"]);
+check(month.code === 0 && month.out.startsWith("=== DAILY METRICS (2026-09-01 to 2026-10-01) ==="), "weekly-csv accepts exactly 31 days", month.err);
 
 const dailyJson = cli(["daily", "--from", "2026-09-22", "--to", "2026-09-23", "--format", "json"]);
 const parsed = dailyJson.code === 0 ? JSON.parse(dailyJson.out) : [];

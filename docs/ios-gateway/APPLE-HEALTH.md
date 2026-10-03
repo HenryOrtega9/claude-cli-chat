@@ -97,7 +97,7 @@ SQLite via the builtin `node:sqlite` (no dependency), WAL mode, at `VAULT_GATEWA
 
 - `apple-health status`
 - `apple-health daily [--from D] [--to D] [--format md|csv|json]` (default: last 14 days, md)
-- `apple-health weekly-csv [--week-of YYYY-MM-DD]`: the exact five-section CSV defined in the vault's Weekly Health Log export prompt, for the Monday-to-Sunday week containing the date (default: the most recent completed week; on a Sunday, the week ending today)
+- `apple-health weekly-csv [--week-of YYYY-MM-DD | --from YYYY-MM-DD --to YYYY-MM-DD]`: the exact five-section CSV defined in the vault's Weekly Health Log export prompt, for the Sunday-to-Saturday week containing the date. Default: the most recent completed week, the one ending on the last Saturday strictly before today (run on the review Sunday, the week that ended yesterday; run on a Saturday, the week that ended a week ago, since today is still in progress). `--from`/`--to` export any inclusive range of up to 31 days instead (both required, from <= to, not combined with `--week-of`). The range only changes which rows appear and the dates in the DAILY METRICS title; every header and WEEKLY SUMMARY row stays identical
 - `apple-health samples --type <id or suffix> [--from D] [--to D] [--limit N] [--format json|csv]`
 - `apple-health sql "<SELECT ...>"` (read-only connection)
 

@@ -10,9 +10,9 @@
 import { existsSync } from "node:fs";
 
 import { healthDbPath } from "../config";
-import { addDays, isIsoDate, localToday } from "./dates";
+import { addDays, daySpan, isIsoDate, localToday } from "./dates";
 import {
-  dailyCells, DAILY_COLUMNS, dailyMetrics, lastCompletedWeekOf, mdTable, plainCsv, weeklyCsv,
+  dailyCells, DAILY_COLUMNS, dailyMetrics, lastCompletedWeek, mdTable, plainCsv, weekBounds, weeklyCsv,
 } from "./derive";
 import { openDatabase, type DatabaseSync, type Row, type SqlValue } from "./sqlite";
 import { readStatus } from "./store";
@@ -23,9 +23,11 @@ Usage:
   apple-health status
   apple-health daily [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--format md|csv|json]
       default: the last 14 days, md
-  apple-health weekly-csv [--week-of YYYY-MM-DD]
-      the Weekly Health Log export for the Monday-to-Sunday week containing the
-      date (default: the most recent completed week; on a Sunday, the week ending today)
+  apple-health weekly-csv [--week-of YYYY-MM-DD | --from YYYY-MM-DD --to YYYY-MM-DD]
+      the Weekly Health Log export for the Sunday-to-Saturday week containing the
+      date (default: the most recent completed week, the one ending on the last
+      Saturday before today; run on a Sunday, that is the week ending yesterday).
+      --from/--to export any inclusive range of up to 31 days instead
   apple-health samples --type <identifier or suffix> [--from D] [--to D] [--limit N] [--format json|csv]
       newest first; --limit defaults to 100 (max 100000)
   apple-health sql "<SELECT ...>" [--format csv|json|md]
@@ -157,9 +159,23 @@ function run(argv: string[]): string {
       return format === "csv" ? plainCsv(DAILY_COLUMNS, cells) : `${mdTable(DAILY_COLUMNS, cells)}\n`;
     }
     case "weekly-csv": {
-      const weekOf = dateFlag(args, "week-of", lastCompletedWeekOf(localToday()));
+      const hasFrom = args.flags.has("from");
+      const hasTo = args.flags.has("to");
+      let range: { start: string; end: string };
+      if (hasFrom || hasTo) {
+        if (args.flags.has("week-of")) throw new CliError("weekly-csv: use --week-of or --from/--to, not both");
+        if (!hasFrom || !hasTo) throw new CliError("weekly-csv: --from and --to go together");
+        const start = dateFlag(args, "from", "");
+        const end = dateFlag(args, "to", "");
+        if (start > end) throw new CliError("--from is after --to");
+        if (daySpan(start, end) > 31) throw new CliError("weekly-csv: --from/--to may span at most 31 days");
+        range = { start, end };
+      } else {
+        const weekOf = args.flags.get("week-of");
+        range = weekOf === undefined ? lastCompletedWeek(localToday()) : weekBounds(dateFlag(args, "week-of", ""));
+      }
       const db = openReadOnly(dbPath);
-      return weeklyCsv(db, weekOf);
+      return weeklyCsv(db, range.start, range.end);
     }
     case "samples": {
       const wanted = args.flags.get("type");

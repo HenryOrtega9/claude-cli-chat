@@ -131,7 +131,7 @@ export function renderHealthNote(db: DatabaseSync, opts: { dbPath: string; now?:
     "```sh",
     "apple-health status                                   # totals, last batch, per-type coverage",
     "apple-health daily --from 2026-09-01 --format csv     # daily metrics (default: last 14 days, md)",
-    "apple-health weekly-csv --week-of 2026-09-21          # the Weekly Health Log export, Monday to Sunday",
+    "apple-health weekly-csv --week-of 2026-09-27          # the Weekly Health Log export, Sunday to Saturday",
     "apple-health samples --type HeartRate --limit 50      # raw samples for one type (id or suffix)",
     "apple-health sql \"SELECT type, COUNT(*) FROM samples GROUP BY type\"",
     "```",
