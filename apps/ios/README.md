@@ -506,3 +506,75 @@ info-level records without it. Expect `armed /wait …`, then
 `wait delivered t=turn_done …`, then `notification posted: Claude finished`.
 `arm skipped: busy=0` means the turn finished before the app backgrounded,
 which is correct rather than a failure.
+
+## Apple Health
+
+Settings sheet → **Apple Health** → **Sync Apple Health** reads HealthKit
+(read only) and uploads it to the gateway's `POST /apple-health/ingest`. Wire
+format, storage and the vault note: `docs/ios-gateway/APPLE-HEALTH.md`. Code:
+`Sources/HealthTypes.swift` (type catalog, unit map, labels),
+`Sources/HealthSyncEngine.swift` (the serialized upload actor) and
+`Sources/HealthSync.swift` (enable flag, observer queries, background
+delivery, the `healthSync` dispatch). Everything it remembers (enabled flag,
+per-type anchors and stats dates, last sync, totals) lives in the App Group
+defaults under `health*` keys.
+
+### First build after adding the capability
+
+`project.yml` now declares `com.apple.developer.healthkit`,
+`com.apple.developer.healthkit.access` (empty) and
+`com.apple.developer.healthkit.background-delivery`. The existing team profile
+does not carry them, so the first signed build has to register HealthKit on the
+`dev.henryortega.vaultgateway` App ID and regenerate the profile. That needs a
+signed-in Apple account in Xcode (Settings → Accounts); a command-line build
+without one fails with `Provisioning profile ... doesn't include the HealthKit
+capability`. Either build once from Xcode (⌘B on the phone) or run:
+
+```sh
+xcodebuild -project apps/ios/VaultGateway.xcodeproj -scheme VaultGateway \
+  -destination 'generic/platform=iOS' -allowProvisioningUpdates \
+  -derivedDataPath <scratch dir> build
+```
+
+Then install as usual. Turning the toggle on shows the Health permission sheet
+(about 190 types); "Turn On All" is the intended answer. Changing the choice
+later happens in the Health app (Sharing → Apps → Claude & Second Brain), and a
+type granted later still backfills its full history on the next sync.
+
+### What runs when
+
+- Toggle on: authorization, then one `HKObserverQuery` plus
+  `enableBackgroundDelivery(.hourly)` per type and a full sync. The first sync
+  backfills everything, priority types first (body mass, body fat, lean mass,
+  resting HR, HRV, VO2 max, energy, sleep, workouts, steps). It is resumable:
+  each type's anchor is saved only after the gateway answers 200.
+- Foreground: a catch-up sync whenever the app becomes active and the last run
+  is over 15 minutes old, plus **Sync now**.
+- Background: an observer wake syncs that type inside a background task.
+  HealthKit data is unreadable while the phone is locked, so a wake that lands
+  on a locked phone stops quietly and the next one retries.
+- Toggle off: observers stop, background delivery is disabled, and a running
+  sync is cancelled. Anchors are kept, so turning it back on resumes rather
+  than resending everything.
+
+Logs: `subsystem == "dev.henryortega.vaultgateway" AND category == "health"`
+(the `log show` command under "Background turns" with that predicate).
+
+### Testing in the simulator
+
+The simulator has its own Health database, empty by default:
+
+1. Build and run on a simulator (HealthKit works there; background delivery
+   does not fire reliably, so use **Sync now**).
+2. Open the simulator's Health app → Browse → pick a category (Body
+   Measurements → Weight, Heart → Resting Heart Rate, Activity → Steps, Sleep)
+   → **Add Data**, a few entries across different days.
+3. Back in Claude & Second Brain: Settings → Apple Health → toggle on → allow
+   all in the sheet. The status line shows `types x/y` while it runs, then
+   `Last synced …`.
+4. On the Mac: `apple-health status` and `apple-health daily` should show the
+   entries; deleting one in the Health app and syncing again removes it.
+
+Point the simulator at a gateway with the `VAULTGW_*` launch hooks above. A
+gateway without the `/apple-health/` routes answers 404, which the status line
+reports as "The gateway has no Apple Health route".

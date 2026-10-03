@@ -147,6 +147,7 @@ fronting it this way.
 | `VAULT_GATEWAY_CLAUDE` | autodetected | Path to the `claude` binary |
 | `VAULT_GATEWAY_STATE_FILE` | `/tmp/claude_state.ios` | TC001 state mirror |
 | `VAULT_GATEWAY_PARTIAL` | on | `0` drops `--include-partial-messages` |
+| `VAULT_GATEWAY_HEALTH_DB` | `~/Library/Application Support/vault-gateway/apple-health.sqlite` | Apple Health SQLite store (outside the vault; parent dir created on first open). The `apple-health` CLI reads the same variable |
 
 ## On-disk footprint
 
@@ -158,6 +159,9 @@ fronting it this way.
 | `~/.config/vault-gateway/token` | Bearer token, mode 600 |
 | `/tmp/claude_state.ios` | TC001 state mirror, `"<epoch> <state>\n"` |
 | `/tmp/vault-gateway.log`, `.err` | launchd logs |
+| `~/Library/Application Support/vault-gateway/apple-health.sqlite` (+ `-wal`, `-shm`) | Apple Health samples, daily stats, characteristics, ingest log (WAL). Raw health data; never in the vault |
+| `<vault>/Health/Metrics/Apple Health Feed.md` | Generated Apple Health summary note, rewritten atomically at most once per 60 s after an ingest |
+| `daemons/gateway/dist/apple-health.js` | Read-only `apple-health` CLI, symlinked as `~/.local/bin/apple-health` |
 
 The store is namespaced under `apps/ios/`, disjoint from the plugin's
 `.claude-cli-chat/` and the desktop app's `.claude-cli-chat/desktop/`, so all

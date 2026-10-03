@@ -33,6 +33,7 @@ export type GatewayConfig = {
   approvalTimeoutS: number;
   claudePath: string;
   stateMirrorPath: string;
+  healthDb: string;
 };
 
 function envInt(name: string, fallback: number): number {
@@ -56,7 +57,18 @@ export function loadConfig(): GatewayConfig {
     approvalTimeoutS: envInt("VAULT_GATEWAY_APPROVAL_TIMEOUT_S", 600),
     claudePath: process.env.VAULT_GATEWAY_CLAUDE || "",
     stateMirrorPath: process.env.VAULT_GATEWAY_STATE_FILE || "/tmp/claude_state.ios",
+    healthDb: healthDbPath(),
   };
+}
+
+/* Apple Health SQLite path, shared by the daemon and the `apple-health` CLI
+   so both always agree. Deliberately outside the vault (raw health samples
+   must never land in a git repo synced through iCloud). The parent directory
+   is created by the store when it first opens, not here, so a bad path costs
+   the health routes a 500 rather than the daemon its boot. */
+export function healthDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.VAULT_GATEWAY_HEALTH_DB || `${HOME}/Library/Application Support/vault-gateway/apple-health.sqlite`;
+  return resolve(raw.startsWith("~/") ? `${HOME}${raw.slice(1)}` : raw);
 }
 
 function tailnetIpFromInterfaces(): string | null {

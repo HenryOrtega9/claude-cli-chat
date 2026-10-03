@@ -46,10 +46,52 @@ import {
 } from "../../../src/settings-data";
 import type { RemoteHost } from "../../../src/platform/remote/RemoteHost";
 import type { GatewayTransport } from "../../../src/platform/remote/transport";
+import { healthApi, parseHealthStatus, type HealthStatus } from "./native";
 
 /* The open sheet's close(), if any — the singleton branch below routes a
    second tap through it rather than detaching the DOM behind its own back. */
 let activeClose: (() => void) | null = null;
+
+/* The open sheet's Apple Health renderer, if any. renderer.ts forwards every
+   native `healthSync` dispatch here; with no sheet open it is dropped, since
+   the sheet asks for a fresh healthStatus each time it opens. */
+let activeHealthRender: ((status: HealthStatus) => void) | null = null;
+
+export function applyHealthSyncStatus(payload: unknown): void {
+  activeHealthRender?.(parseHealthStatus(payload));
+}
+
+function relativeTime(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "at an unknown time";
+  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "yesterday" : `${days} days ago`;
+}
+
+function healthStatusText(status: HealthStatus): string {
+  const count = (n: number) => n.toLocaleString("en-US");
+  if (!status.available) return "Apple Health isn't available on this device.";
+  if (status.syncing) {
+    const p = status.progress;
+    return p
+      ? `Syncing: types ${p.typesDone}/${p.typesTotal}, ${count(p.samplesSent)} samples sent.`
+      : "Syncing…";
+  }
+  if (!status.enabled) return "Off.";
+  /* lastError is self-describing ("Sync failed: …", "Health access request
+     failed: …", or "Some types were skipped: …" after a run that otherwise
+     synced), so it is shown as-is next to the last successful sync. */
+  if (!status.lastSyncAt) return status.lastError ?? "Not synced yet.";
+  const synced = `Last synced ${relativeTime(status.lastSyncAt)}.`;
+  if (status.lastError) return `${synced} ${status.lastError}`;
+  return `${synced} ${count(status.totals.samplesSent)} samples and ${count(status.totals.dailySent)} daily totals sent so far.`;
+}
 
 /* A ModelKey the catalog no longer carries (a key deleted from MODEL_IDS
    between the write and this read, or a hand-edited localStorage blob) has
@@ -83,7 +125,11 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
   function close(): void {
     overlay.remove();
     if (activeClose === close) activeClose = null;
+    if (activeHealthRender === renderHealth) activeHealthRender = null;
   }
+  /* Hoisted so close() can compare against it; assigned by the Apple Health
+     section below, which only exists on the native host. */
+  let renderHealth: ((status: HealthStatus) => void) | null = null;
   activeClose = close;
 
   const body = sheet.createDiv({ cls: "vaultgw-settings-body" });
@@ -283,6 +329,76 @@ export function showSettingsSheet(host: RemoteHost, transport: GatewayTransport)
     host.settings.replySuggestions = suggestToggle.checked;
     void host.saveSettings();
   });
+
+  /* ----- Apple Health ---------------------------------------------------- */
+
+  /* Native-only, like Connection: HealthKit lives in the Swift shell
+     (HealthSync.swift), and every bit of its state (enabled flag, anchors,
+     last sync) stays in the App Group defaults, never this page's storage.
+     The sheet only mirrors it: healthStatus on open, then the `healthSync`
+     dispatch through applyHealthSyncStatus while the sheet stays up. */
+  if (transport.isNative) {
+    const health = healthApi();
+    body.createDiv({ cls: "vaultgw-settings-section", text: "Apple Health" });
+
+    const healthRow = body.createDiv({ cls: "vaultgw-settings-row" });
+    healthRow.createSpan({ cls: "vaultgw-settings-label", text: "Sync Apple Health" });
+    const healthToggle = healthRow.createEl("input", {
+      cls: "vaultgw-settings-toggle",
+      attr: { type: "checkbox", "aria-label": "Sync Apple Health" },
+    });
+    healthToggle.disabled = true;
+
+    const syncLink = body.createDiv({ cls: "vaultgw-settings-link is-disabled" });
+    syncLink.createSpan({ text: "Sync now" });
+    const syncIcon = syncLink.createSpan({ cls: "vaultgw-settings-link-icon" });
+    platform.setIcon(syncIcon, "refresh-cw");
+
+    const healthNote = body.createDiv({ cls: "vaultgw-settings-note", text: "Checking…" });
+    body.createDiv({
+      cls: "vaultgw-settings-hint",
+      text: "Reads your Health data on this iPhone and uploads it to the gateway on your Mac. Raw samples stay in a database on the Mac, outside the vault; Claude reads a generated summary note.",
+    });
+
+    /* A toggle tap waits on the system permission sheet, so it stays
+       disabled until native answers rather than letting a second tap race. */
+    let pending = false;
+    let last: HealthStatus | null = null;
+
+    const render = (status: HealthStatus): void => {
+      last = status;
+      healthToggle.checked = status.enabled;
+      healthToggle.disabled = pending || !status.available;
+      syncLink.toggleClass("is-disabled", !status.enabled || status.syncing);
+      healthNote.setText(healthStatusText(status));
+    };
+    renderHealth = render;
+    activeHealthRender = render;
+
+    void health.status().then((status) => {
+      if (activeHealthRender === render) render(status);
+    });
+
+    healthToggle.addEventListener("change", () => {
+      transport.haptic("selection");
+      const wanted = healthToggle.checked;
+      pending = true;
+      healthToggle.disabled = true;
+      healthNote.setText(wanted ? "Waiting for Health access…" : "Turning off…");
+      void health.setEnabled(wanted).then((status) => {
+        pending = false;
+        if (activeHealthRender === render) render(status);
+      });
+    });
+
+    syncLink.addEventListener("click", () => {
+      if (!last?.enabled || last.syncing) return;
+      transport.haptic("selection");
+      void health.syncNow().then((status) => {
+        if (activeHealthRender === render) render(status);
+      });
+    });
+  }
 
   /* ----- Connection ------------------------------------------------------- */
 

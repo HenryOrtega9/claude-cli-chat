@@ -21,6 +21,8 @@ import type { ContentBlock } from "../../../src/claude/Events";
 import { PermissionsConfigStore, RECOMMENDED_ALLOW_PATTERNS } from "../../../src/permissions/PermissionsConfig";
 import { MCPConfigStore } from "../../../src/mcp/MCPConfig";
 
+import { AppleHealthService } from "./apple-health/service";
+import { PayloadError } from "./apple-health/store";
 import type { GatewayConfig } from "./config";
 import { buildCatalog, type Catalog } from "./catalog";
 import { BusyError, TabEngine } from "./engine";
@@ -89,10 +91,12 @@ export class GatewayServer {
      spawning a second `claude mcp list`. */
   private catalogInflight: Promise<Catalog> | null = null;
   private catalogKeepWarm: NodeJS.Timeout | null = null;
+  private appleHealth: AppleHealthService;
 
   constructor(private deps: ServerDeps) {
     this.usage = new UsageFetcher(deps.log);
     this.vaultIndex = new VaultIndex(deps.config.vault);
+    this.appleHealth = new AppleHealthService({ dbPath: deps.config.healthDb, vault: deps.config.vault, log: deps.log });
     this.http = createServer((req, res) => {
       this.route(req, res).catch(err => {
         deps.log(`unhandled route error: ${String(err)}`);
@@ -140,6 +144,7 @@ export class GatewayServer {
     this.subs.clear();
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.resolve(null); }
     this.waiters.clear();
+    this.appleHealth.close();
     await new Promise<void>(resolve => this.http.close(() => resolve()));
   }
 
@@ -201,6 +206,19 @@ export class GatewayServer {
       return sendJson(res, 200, { path: result.path, text: result.text });
     }
     if (method === "GET" && path === "/wait") return this.getWait(res, url);
+
+    /* --- apple health (docs/ios-gateway/APPLE-HEALTH.md) ---
+       Prefixed /apple-health/, never /health...: /health is liveness, and the
+       phone's NativeBridge.rpc special-cases any /health prefix. */
+    if (method === "POST" && path === "/apple-health/ingest") return this.postAppleHealthIngest(req, res);
+    if (method === "GET" && path === "/apple-health/status") {
+      try {
+        return sendJson(res, 200, this.appleHealth.status());
+      } catch (err) {
+        this.deps.log(`apple-health status failed: ${String(err)}`);
+        return sendJson(res, 500, { error: "health_store_error", message: String(err) });
+      }
+    }
 
     /* --- permissions --- */
     if (method === "GET" && path === "/permissions") {
@@ -477,6 +495,27 @@ export class GatewayServer {
       incognito: engine.incognito,
     });
     sendJson(res, 200, { suggestion });
+  }
+
+  private async postAppleHealthIngest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readBodyCapped(req, res, MAX_BODY_BYTES);
+    if (body === null) return; // 413 already sent
+    let raw: unknown;
+    try {
+      raw = JSON.parse(body.toString("utf8"));
+    } catch {
+      return sendJson(res, 400, { error: "bad_payload", message: "body is not valid JSON" });
+    }
+    const t0 = Date.now();
+    try {
+      const { payload, result } = this.appleHealth.ingest(raw);
+      this.deps.log(`apple-health ingest ${payload.batchId}: ${result.samples} samples, ${result.deleted} deleted, ${result.daily} daily (${Date.now() - t0} ms)`);
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (err) {
+      if (err instanceof PayloadError) return sendJson(res, 400, { error: "bad_payload", message: err.message });
+      this.deps.log(`apple-health ingest failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      return sendJson(res, 500, { error: "health_store_error", message: String(err) });
+    }
   }
 
   private async getEvents(res: ServerResponse, engine: TabEngine, url: URL): Promise<void> {
@@ -813,6 +852,33 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown> |
   } catch {
     return null;
   }
+}
+
+/* Reads a request body of at most `limit` bytes, answering 413
+   {"error":"body_too_large"} itself and returning null when it is larger.
+   A declared Content-Length over the cap is answered before reading a byte;
+   a chunked body that grows past it is answered once it ends. In both cases
+   the rest of the upload is read and discarded rather than the socket being
+   closed: closing while the client is still writing makes it see a reset
+   (ECONNRESET / URLSession -1005) instead of the 413. */
+async function readBodyCapped(req: IncomingMessage, res: ServerResponse, limit: number): Promise<Buffer | null> {
+  const tooLarge = () => sendJson(res, 413, { error: "body_too_large" });
+  const declared = Number(req.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > limit) {
+    tooLarge();
+    req.resume();
+    return null;
+  }
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let over = false;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > limit) { over = true; chunks.length = 0; continue; }
+    chunks.push(chunk as Buffer);
+  }
+  if (over) { tooLarge(); return null; }
+  return Buffer.concat(chunks);
 }
 
 /* Accepts either a ContentBlock[] or a bare string, so a minimal client can

@@ -117,6 +117,13 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
         case "copy":
             UIPasteboard.general.string = params["text"] as? String ?? ""
             reply(["ok": true], nil)
+        case "healthStatus":
+            reply(HealthSync.shared.status(), nil)
+        case "healthSetEnabled":
+            let enabled = params["enabled"] as? Bool ?? false
+            reply(await HealthSync.shared.setEnabled(enabled), nil)
+        case "healthSyncNow":
+            reply(HealthSync.shared.syncNow(), nil)
         default:
             reply(nil, "unknown_method: \(method)")
         }
@@ -243,11 +250,20 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
 
     // MARK: - Native → page
 
+    private static let latestWinsDispatches: Set<String> = ["healthSync"]
+
     func dispatch(_ name: String, _ payload: [String: Any] = [:]) {
         guard pageReady else {
             // Bounded for the same reason the JS-side queue in renderer.ts is:
             // native never sends a burst, so an unbounded queue during a
             // stuck/failed load would be a leak with no reader.
+            // `healthSync` is a full status snapshot that can fire per
+            // upload batch while a cold page is still loading: only the
+            // latest one matters, and a burst of them must not crowd a
+            // `share` or `connectivity` out of the bounded queue.
+            if Self.latestWinsDispatches.contains(name) {
+                pendingDispatches.removeAll { $0.name == name }
+            }
             if pendingDispatches.count < 32 { pendingDispatches.append((name, payload)) }
             return
         }

@@ -1231,6 +1231,13 @@ body {
   color: var(--text-normal);
 }
 
+/* Apple Health's "Sync now" while sync is off or already running:
+   dimmed in place (same reasoning as .is-disabled rows above). */
+.vaultgw-settings-link.is-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 .vaultgw-settings-link-icon {
   display: flex;
   color: var(--text-faint);

@@ -46,6 +46,7 @@ import { nativeTransport } from "./native";
 import { IosPlatform } from "./platform";
 import { RemoteVaultFeatures } from "./vault";
 import { IosChatShell, type ConnectivityPayload, type SharePayload } from "./shell";
+import { applyHealthSyncStatus } from "./settings";
 
 /* The shared DEFAULT_SETTINGS.defaultModel is "sonnet-1m" (Sonnet 4.6 1M),
    which the CLI rejects on this account with "Usage credits required for 1M
@@ -71,7 +72,8 @@ function applyIosDefaultModel(host: RemoteHost): void {
   }
 }
 
-type DispatchName = "suspend" | "resume" | "connectivity" | "theme" | "safeArea" | "share" | "hardwareKeyboard";
+type DispatchName =
+  | "suspend" | "resume" | "connectivity" | "theme" | "safeArea" | "share" | "hardwareKeyboard" | "healthSync";
 type DispatchPayload = Record<string, unknown>;
 type Handler = (name: DispatchName, payload: DispatchPayload) => void;
 
@@ -89,7 +91,13 @@ function dispatch(name: string, payload?: DispatchPayload): void {
     return;
   }
   /* Bounded: native never sends a burst, and an unbounded queue during a
-     failed boot would be a leak with no reader. */
+     failed boot would be a leak with no reader. `healthSync` is a full status
+     snapshot that can arrive once per upload batch during a slow boot, so
+     only the newest is kept and it can never crowd out a `share`. */
+  if (name === "healthSync") {
+    const stale = queued.findIndex(([queuedName]) => queuedName === "healthSync");
+    if (stale !== -1) queued.splice(stale, 1);
+  }
   if (queued.length < 32) queued.push(args);
 }
 
@@ -355,6 +363,12 @@ async function boot(): Promise<void> {
         shell.handleShare(parseSharePayload(payload));
         return;
       }
+      case "healthSync":
+        /* HealthSync.swift's status push: progress, completion, errors.
+           Only the settings sheet shows it; with the sheet closed this is a
+           no-op and the next open asks for a fresh healthStatus. */
+        applyHealthSyncStatus(payload);
+        return;
       default:
         return;
     }

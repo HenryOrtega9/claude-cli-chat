@@ -117,10 +117,75 @@ function devValue(key: string): string {
 }
 
 /* ---------------------------------------------------------------------------
+   Apple Health (iOS only)
+   ------------------------------------------------------------------------ */
+
+/* The `healthStatus` / `healthSetEnabled` / `healthSyncNow` bridge methods and
+   the `healthSync` dispatch from docs/ios-gateway/APPLE-HEALTH.md. Kept out of
+   the shared GatewayTransport interface (src/platform/remote/transport.ts):
+   no other host has HealthKit, so this is an iOS-only API reached through
+   healthApi() below. HealthSync.swift is the native side. */
+export type HealthStatus = {
+  available: boolean;
+  enabled: boolean;
+  syncing: boolean;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  progress: { typesDone: number; typesTotal: number; samplesSent: number } | null;
+  totals: { samplesSent: number; dailySent: number };
+};
+
+export interface HealthApi {
+  status(): Promise<HealthStatus>;
+  setEnabled(enabled: boolean): Promise<HealthStatus>;
+  syncNow(): Promise<HealthStatus>;
+}
+
+const UNAVAILABLE_HEALTH: HealthStatus = {
+  available: false,
+  enabled: false,
+  syncing: false,
+  lastSyncAt: null,
+  lastError: null,
+  progress: null,
+  totals: { samplesSent: 0, dailySent: 0 },
+};
+
+function num(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/* Native replies and dispatches arrive untyped; narrow field by field so a
+   missing or malformed value degrades to "off" instead of a broken sheet. */
+export function parseHealthStatus(raw: unknown): HealthStatus {
+  if (!raw || typeof raw !== "object") return { ...UNAVAILABLE_HEALTH };
+  const r = raw as Record<string, unknown>;
+  const progress = r.progress && typeof r.progress === "object"
+    ? r.progress as Record<string, unknown>
+    : null;
+  const totals = r.totals && typeof r.totals === "object" ? r.totals as Record<string, unknown> : {};
+  return {
+    available: r.available === true,
+    enabled: r.enabled === true,
+    syncing: r.syncing === true,
+    lastSyncAt: typeof r.lastSyncAt === "string" ? r.lastSyncAt : null,
+    lastError: typeof r.lastError === "string" ? r.lastError : null,
+    progress: progress
+      ? {
+        typesDone: num(progress.typesDone),
+        typesTotal: num(progress.typesTotal),
+        samplesSent: num(progress.samplesSent),
+      }
+      : null,
+    totals: { samplesSent: num(totals.samplesSent), dailySent: num(totals.dailySent) },
+  };
+}
+
+/* ---------------------------------------------------------------------------
    Native transport
    ------------------------------------------------------------------------ */
 
-class NativeTransport implements GatewayTransport {
+class NativeTransport implements GatewayTransport, HealthApi {
   readonly isNative = true;
 
   constructor(private readonly handler: { postMessage(body: unknown): Promise<unknown> }) {}
@@ -181,13 +246,35 @@ class NativeTransport implements GatewayTransport {
   openSettings(): void {
     void this.call("openSettings").catch(() => undefined);
   }
+
+  /* HealthApi. A rejected call (an older native build without these methods
+     answers "unknown_method") reads as unavailable rather than throwing. */
+  private async health(method: string, params?: Record<string, unknown>): Promise<HealthStatus> {
+    try {
+      return parseHealthStatus(await this.call(method, params));
+    } catch {
+      return { ...UNAVAILABLE_HEALTH };
+    }
+  }
+
+  status(): Promise<HealthStatus> {
+    return this.health("healthStatus");
+  }
+
+  setEnabled(enabled: boolean): Promise<HealthStatus> {
+    return this.health("healthSetEnabled", { enabled });
+  }
+
+  syncNow(): Promise<HealthStatus> {
+    return this.health("healthSyncNow");
+  }
 }
 
 /* ---------------------------------------------------------------------------
    Browser fallback (development only)
    ------------------------------------------------------------------------ */
 
-class BrowserTransport implements GatewayTransport {
+class BrowserTransport implements GatewayTransport, HealthApi {
   readonly isNative = false;
 
   private base(): string {
@@ -285,15 +372,29 @@ class BrowserTransport implements GatewayTransport {
   openSettings(): void {
     console.info("[vaultgw] openSettings is a native-only affordance; set vaultgw.dev.* in localStorage instead.");
   }
+
+  /* No HealthKit in a desktop browser. */
+  async status(): Promise<HealthStatus> { return { ...UNAVAILABLE_HEALTH }; }
+  async setEnabled(): Promise<HealthStatus> { return { ...UNAVAILABLE_HEALTH }; }
+  async syncNow(): Promise<HealthStatus> { return { ...UNAVAILABLE_HEALTH }; }
 }
 
-let cached: GatewayTransport | null = null;
+let cached: (GatewayTransport & HealthApi) | null = null;
 
-export function nativeTransport(): GatewayTransport {
+function transportInstance(): GatewayTransport & HealthApi {
   if (cached) return cached;
   const handler = webkitHandler();
   cached = handler ? new NativeTransport(handler) : new BrowserTransport();
   return cached;
+}
+
+export function nativeTransport(): GatewayTransport {
+  return transportInstance();
+}
+
+/* The iOS-only Apple Health API, on the same transport instance. */
+export function healthApi(): HealthApi {
+  return transportInstance();
 }
 
 export function isNativeHost(): boolean {

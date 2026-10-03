@@ -65,6 +65,8 @@ Git: all work on `main`, commit per agent with a clear scope prefix (`shared-ui:
 | GET | `/usage` | port of bridge.py `UsageFetcher` payload (same JSON), 60 s cache |
 | POST | `/mcp/disable` | `{servers:[...]}` → `{ok, disabled:[...]}`. The list is absolute: names absent from it are re-enabled. Invalidates the `/catalog` cache |
 | POST | `/ws-ticket` | → `{ticket, expiresIn}` |
+| POST | `/apple-health/ingest` | Apple Health batch `{schema:1, batchId, device, samples?, deleted?, daily?, characteristics?}` (shapes in [`APPLE-HEALTH.md`](APPLE-HEALTH.md); at most 2,000 samples, 5,000 deletions, 5,000 daily rows) → `{ok:true, samples, deleted, daily, deletedFrom}` (`deletedFrom`: earliest local date among deleted samples that existed, or null; the app resends daily stats from there); 400 `{error:"bad_payload", message}` (nothing written), 413 `{error:"body_too_large"}` past 16 MiB. One SQLite transaction per batch, stored outside the vault; the vault note `Health/Metrics/Apple Health Feed.md` regenerates at most once per 60 s afterwards |
+| GET | `/apple-health/status` | `{dbPath, samples, daily, lastIngestAt, lastBatch:{batchId,at,samples,deleted,daily}\|null, types:[{type,kind,count,first,last}]}` |
 
 Errors: `{error:"<snake_case>", message?}` with proper status (400/401/404/409/500).
 
@@ -119,6 +121,11 @@ Methods (native implements; page wraps in `apps/ios-web/src/native.ts`):
 | `setState` | `{activeTabId, lastSeq:{[tabId]:seq}, busyTabs:[ids]}` | `{ok}` — native persists for background `/wait` arming |
 | `speak` | `{text}` / `{stop:true}` | `{ok}` (AVSpeechSynthesizer) |
 | `copy` | `{text}` | `{ok}` |
+| `healthStatus` | | `HealthStatus` (below) |
+| `healthSetEnabled` | `{enabled:bool}` | `HealthStatus`; enabling shows the HealthKit read-permission sheet first and the reply waits for it, then observers start and a full sync begins |
+| `healthSyncNow` | | `HealthStatus`; starts a sync of every type and returns without waiting for it |
+
+The three `health*` methods are Apple Health sync (`apps/ios/Sources/HealthSync.swift`; full contract in `docs/ios-gateway/APPLE-HEALTH.md`). The page reaches them through `healthApi()` in `apps/ios-web/src/native.ts`, an iOS-only API that is deliberately not part of the shared `GatewayTransport` interface; the browser dev transport answers them with `available:false`. `HealthStatus` is `{available, enabled, syncing, lastSyncAt: ISO|null, lastError: string|null, progress: {typesDone, typesTotal, samplesSent}|null, totals: {samplesSent, dailySent}}`; all of its state lives in the App Group defaults, never page storage.
 
 Native → page (native calls `window.__vaultgw.dispatch(name, payload)` via `evaluateJavaScript`; the page defines `__vaultgw` before anything else):
 
@@ -130,6 +137,7 @@ Native → page (native calls `window.__vaultgw.dispatch(name, payload)` via `ev
 | `theme` | `{theme}` |
 | `safeArea` | `{top,bottom,left,right}` |
 | `share` | `{text}` — insert into the active composer |
+| `healthSync` | `HealthStatus` — sent whenever Apple Health sync starts, makes progress (per uploaded batch and per finished type) or ends. Latest wins: both native's pre-load queue and the page's pre-boot queue keep only the newest one. The page forwards it to the settings sheet's Apple Health section when that sheet is open |
 
 The native connectivity banner is a native view; the page may also show an inline state but must not be the only indicator.
 

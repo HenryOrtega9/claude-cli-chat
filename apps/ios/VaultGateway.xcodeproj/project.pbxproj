@@ -14,6 +14,7 @@
 		47DD83B146FE7DF3ED8C6806 /* Web in Resources */ = {isa = PBXBuildFile; fileRef = 0FDF4E4B00D8A1CBB0695CF4 /* Web */; };
 		4B1D68BDCCA3D71066BE2929 /* GatewayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B870DB873970D7A12AB3179A /* GatewayClient.swift */; };
 		55447A040EB86A1F8234EE15 /* NativeBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */; };
+		5569A7AD62FAE50024D6E3D0 /* HealthSyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18498067BB938CB304D56811 /* HealthSyncEngine.swift */; };
 		5A0BA34A95404F6D3333DFFB /* GatewayConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */; };
 		64463D6ED640DC5ECE5665E2 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */; };
 		679BCC6B623837AB82963D0B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2648DC2BCD105AD42D1B031B /* Assets.xcassets */; };
@@ -25,6 +26,9 @@
 		8D481D2184EF47F6F062F63D /* DebugLaunchEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */; };
 		AA23C8716CAC5116BAC2D7A3 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F62FE8262D4AE91B7C11641A /* ShareViewController.swift */; };
 		AE960D92DE40972C25EB280B /* ShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 300F67370639EDDF766F84A0 /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		CEF750F3B619C82D6886346D /* HealthAuthorization.m in Sources */ = {isa = PBXBuildFile; fileRef = 6EA74AB48C61EB9930D1E198 /* HealthAuthorization.m */; };
+		D82073991B59AD08E1A70708 /* HealthSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9406269B597773E2442F1EB3 /* HealthSync.swift */; };
+		D93535A9F12D90BF58C7DE35 /* HealthTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA36C73A4012625A28D7FE67 /* HealthTypes.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -54,7 +58,9 @@
 /* Begin PBXFileReference section */
 		0FDF4E4B00D8A1CBB0695CF4 /* Web */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Web; sourceTree = SOURCE_ROOT; };
 		16D1D8704BB039E4573C7BDD /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		18498067BB938CB304D56811 /* HealthSyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthSyncEngine.swift; sourceTree = "<group>"; };
 		222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		24952808E46157C636AE44E3 /* VaultGateway-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "VaultGateway-Bridging-Header.h"; sourceTree = "<group>"; };
 		2648DC2BCD105AD42D1B031B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		289B9DC854FA17A849B935DA /* VaultGatewayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultGatewayApp.swift; sourceTree = "<group>"; };
 		300F67370639EDDF766F84A0 /* ShareExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = ShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -63,15 +69,19 @@
 		4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLaunchEnvironment.swift; sourceTree = "<group>"; };
 		626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeBridge.swift; sourceTree = "<group>"; };
+		6EA74AB48C61EB9930D1E198 /* HealthAuthorization.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = HealthAuthorization.m; sourceTree = "<group>"; };
 		7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayConfig.swift; sourceTree = "<group>"; };
+		9406269B597773E2442F1EB3 /* HealthSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthSync.swift; sourceTree = "<group>"; };
 		974CE13A018174AE54FE0929 /* ConnectivityBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectivityBanner.swift; sourceTree = "<group>"; };
 		986F81B16897C2358026503A /* VaultGateway.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VaultGateway.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9BA707DB287AFEF61FBC40AD /* ShareInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareInbox.swift; sourceTree = "<group>"; };
+		AA36C73A4012625A28D7FE67 /* HealthTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthTypes.swift; sourceTree = "<group>"; };
 		B7113B675BCE7B8D5B0CA854 /* Secrets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Secrets.swift; sourceTree = "<group>"; };
 		B870DB873970D7A12AB3179A /* GatewayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayClient.swift; sourceTree = "<group>"; };
 		CF805F7F96FD1EE807EAA231 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		DF5EA183CCB56D6CD43BE323 /* WebSchemeHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSchemeHandler.swift; sourceTree = "<group>"; };
 		E5C0CFB45E0E6A7F4DE47CC4 /* ShareExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ShareExtension.entitlements; sourceTree = "<group>"; };
+		EDF00BA0710FFE8408806054 /* HealthAuthorization.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = HealthAuthorization.h; sourceTree = "<group>"; };
 		F5E597D913997A8DFD01C3E2 /* VaultGateway.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VaultGateway.entitlements; sourceTree = "<group>"; };
 		F62FE8262D4AE91B7C11641A /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		FC67CF8EB9B724931E86AC1D /* ConnectivityMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectivityMonitor.swift; sourceTree = "<group>"; };
@@ -116,6 +126,11 @@
 				5E1B3CAAA74EC2EA1CABB3DB /* DebugLaunchEnvironment.swift */,
 				B870DB873970D7A12AB3179A /* GatewayClient.swift */,
 				7FEF1EC5E828667B10E0CF5F /* GatewayConfig.swift */,
+				EDF00BA0710FFE8408806054 /* HealthAuthorization.h */,
+				6EA74AB48C61EB9930D1E198 /* HealthAuthorization.m */,
+				9406269B597773E2442F1EB3 /* HealthSync.swift */,
+				18498067BB938CB304D56811 /* HealthSyncEngine.swift */,
+				AA36C73A4012625A28D7FE67 /* HealthTypes.swift */,
 				CF805F7F96FD1EE807EAA231 /* Info.plist */,
 				222BADE2C12AB2D7EFDFFC1A /* KeychainStore.swift */,
 				626FD9D9023ED11FAA1F8872 /* NativeBridge.swift */,
@@ -123,6 +138,7 @@
 				4E329B2B8BA13F9EE7E13708 /* SettingsView.swift */,
 				9BA707DB287AFEF61FBC40AD /* ShareInbox.swift */,
 				4041BF1C59EF00F173A0256D /* TurnNotifier.swift */,
+				24952808E46157C636AE44E3 /* VaultGateway-Bridging-Header.h */,
 				F5E597D913997A8DFD01C3E2 /* VaultGateway.entitlements */,
 				289B9DC854FA17A849B935DA /* VaultGatewayApp.swift */,
 				487B5693410A068B4A5E21CE /* WebHost.swift */,
@@ -240,6 +256,10 @@
 				8D481D2184EF47F6F062F63D /* DebugLaunchEnvironment.swift in Sources */,
 				4B1D68BDCCA3D71066BE2929 /* GatewayClient.swift in Sources */,
 				5A0BA34A95404F6D3333DFFB /* GatewayConfig.swift in Sources */,
+				CEF750F3B619C82D6886346D /* HealthAuthorization.m in Sources */,
+				D82073991B59AD08E1A70708 /* HealthSync.swift in Sources */,
+				5569A7AD62FAE50024D6E3D0 /* HealthSyncEngine.swift in Sources */,
+				D93535A9F12D90BF58C7DE35 /* HealthTypes.swift in Sources */,
 				719887B024880E7B5AAD2BE8 /* KeychainStore.swift in Sources */,
 				55447A040EB86A1F8234EE15 /* NativeBridge.swift in Sources */,
 				6AECBC61B45F0AC194E5B99F /* Secrets.swift in Sources */,
@@ -278,6 +298,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.henryortega.vaultgateway;
 				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/VaultGateway-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
@@ -381,6 +402,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.henryortega.vaultgateway;
 				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/VaultGateway-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;

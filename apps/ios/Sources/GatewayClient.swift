@@ -43,6 +43,17 @@ enum GatewayClient {
         return URLSession(configuration: config)
     }()
 
+    /// Apple Health ingest batches (up to 2,000 samples or 5,000 daily rows,
+    /// a few MB of JSON) need far more than the `rpc` budget, especially on a
+    /// first-run backfill over cellular.
+    private static let uploadSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 120
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
     static func request(
         path: String, method: String = "GET", body: Any? = nil,
         scheme overrideScheme: String? = nil, port overridePort: Int? = nil,
@@ -70,6 +81,19 @@ enum GatewayClient {
     /// 15 s timeout: the `rpc` bridge method's budget.
     static func send(path: String, method: String = "GET", body: Any? = nil) async -> Outcome {
         await send(request: request(path: path, method: method, body: body), session: rpcSession)
+    }
+
+    /// POSTs an already-encoded JSON body with the long upload timeouts
+    /// (60 s per request, 120 s overall). Same URL and auth building as every
+    /// other call; the body is pre-encoded so the caller controls (and can
+    /// validate) serialization instead of `request`'s silent `try?`.
+    static func upload(path: String, json: Data) async -> Outcome {
+        guard var req = request(path: path, method: "POST") else {
+            return await send(request: nil, session: uploadSession)
+        }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = json
+        return await send(request: req, session: uploadSession)
     }
 
     /// 3 s timeout: the connectivity probe's budget, short enough that a

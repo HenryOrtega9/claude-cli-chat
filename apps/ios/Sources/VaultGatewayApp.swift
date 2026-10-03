@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         #endif
         UNUserNotificationCenter.current().delegate = TurnNotifier.shared
         TurnNotifier.shared.registerCategories()
+        // Before returning: a HealthKit background-delivery wake relaunches
+        // the app with no UI, and only observer queries registered during
+        // launch receive it. No-op unless Apple Health sync is enabled.
+        HealthSync.shared.registerAtLaunch()
         return true
     }
 
@@ -126,6 +130,7 @@ struct RootView: View {
             // before this line runs, in which case it queues on the
             // singleton and this assignment's didSet flushes it.
             TurnNotifier.shared.bridge = bridge
+            HealthSync.shared.bridge = bridge
             #if DEBUG
             DebugLaunchEnvironment.startCommandChannel(bridge: bridge)
             #endif
@@ -168,6 +173,9 @@ struct RootView: View {
                 bridge.dispatch("resume")
                 if let state = monitor.state { bridge.dispatchConnectivity(state) }
                 ShareInbox.drain(bridge: bridge)
+                // Catch-up sync when Apple Health is on and the last run is
+                // over 15 minutes old (background delivery is best-effort).
+                HealthSync.shared.syncIfStale()
             case .inactive:
                 // Transient: Control Center, a call banner, a permission
                 // alert can all land here without the app actually

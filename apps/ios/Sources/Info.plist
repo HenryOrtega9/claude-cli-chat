@@ -50,6 +50,8 @@
 			</dict>
 		</dict>
 	</dict>
+	<key>NSHealthShareUsageDescription</key>
+	<string>Claude &amp; Second Brain reads your Health data and uploads it to your own Mac mini so Claude can summarize it in your Second Brain.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Claude &amp; Second Brain connects to the Claude gateway running on your Mac. If your Mac is on the same Wi-Fi instead of Tailscale, iOS needs local network access to reach it.</string>
 	<key>UILaunchScreen</key>
