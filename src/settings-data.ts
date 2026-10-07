@@ -28,9 +28,11 @@ export const MODEL_IDS = {
   "opus-4-7-1m": "claude-opus-4-7[1m]",
   "opus-4-6-1m": "claude-opus-4-6[1m]",
   "opus-plan": "opusplan",
+  "sonnet-5-5": "claude-sonnet-5-5[1m]",
   "sonnet-5": "claude-sonnet-5[1m]",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
-  "haiku": "haiku",
+  "haiku-5-5": "claude-haiku-5-5[1m]",
+  "haiku": "claude-haiku-4-5",
 } as const;
 
 export type ModelKey = keyof typeof MODEL_IDS;
@@ -44,9 +46,11 @@ export const MODEL_LABELS: Record<ModelKey, string> = {
   "opus-4-7-1m": "Opus 4.7 1M",
   "opus-4-6-1m": "Opus 4.6 1M",
   "opus-plan": "Opus Plan",
+  "sonnet-5-5": "Sonnet 5.5 1M",
   "sonnet-5": "Sonnet 5 1M",
   "sonnet-1m": "Sonnet 4.6 1M",
-  "haiku": "Haiku",
+  "haiku-5-5": "Haiku 5.5 1M",
+  "haiku": "Haiku 4.5",
 };
 
 /* Per-model availability caveats, surfaced under the model name in the
@@ -90,8 +94,8 @@ export interface ModelGroup {
 export const MODEL_GROUPS: ModelGroup[] = [
   { header: "FABLE", keys: ["fable-5-1", "fable-5"], note: FABLE_FAMILY_NOTE },
   { header: "OPUS", keys: ["opus-5-5", "opus-5", "opus-1m", "opus-4-7-1m", "opus-4-6-1m", "opus-plan"] },
-  { header: "SONNET", keys: ["sonnet-5", "sonnet-1m"] },
-  { header: "HAIKU", keys: ["haiku"] },
+  { header: "SONNET", keys: ["sonnet-5-5", "sonnet-5", "sonnet-1m"] },
+  { header: "HAIKU", keys: ["haiku-5-5", "haiku"] },
 ];
 
 /* The caveat that applies to a model: its own MODEL_NOTES entry wins, else
@@ -119,15 +123,22 @@ export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "l
 
 /* Returns the effort levels available for a given model. xhigh is gated to
    Fable 5, Opus (Opus 5.5, Opus 5, Opus 4.8, Opus 4.7, Opus 4.6, and opus-plan
-   which routes to Opus when in plan mode), and Sonnet 5 — the first
-   Sonnet-tier model with xhigh; everything else shows the standard four.
+   which routes to Opus when in plan mode), and Sonnet 5.5 and Sonnet 5 (the
+   first Sonnet-tier model with xhigh); everything else shows the standard four.
    Opus 5's full ladder (incl. xhigh/max) is confirmed by the effort docs as
    of its 2026-07-24 release. Opus 5.5 (2026-09-22) keeps the same ladder;
    CLI-verified with `--effort xhigh` on its release day. Note Opus 5.5
    cannot disable thinking and its API-side default effort is medium (one
-   step below Opus 5), so the effort chip is the only depth control. */
+   step below Opus 5), so the effort chip is the only depth control.
+   Sonnet 5.5 (2026-09-28) keeps the full ladder too; CLI-verified with
+   `--effort xhigh` on its release day. Its levels are recalibrated from
+   Sonnet 5, so the same chip setting is not the same depth across the two.
+   Haiku 5.5 (2026-10-07) stays on the standard four: the CLI accepts
+   `--effort xhigh` for it, but it accepts it for Haiku 4.5 too, so that is
+   no proof of support. Its `[1m]` suffix is CLI-verified (the same suffix
+   fails on Haiku 4.5), so haiku-5-5 counts as 1M in contextWindowForModel. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5") return EFFORT_ORDER;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5-5" || model === "sonnet-5") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
@@ -137,7 +148,7 @@ export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
    resolve to either Opus (1M) or Sonnet (200k) at runtime; we display 1M
    as the upper bound so the donut doesn't overflow when in plan mode. */
 export function contextWindowForModel(model: ModelKey): number {
-  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5" || model === "sonnet-1m" || model === "opus-plan") return 1_000_000;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "sonnet-5-5" || model === "sonnet-5" || model === "sonnet-1m" || model === "haiku-5-5" || model === "opus-plan") return 1_000_000;
   return 200_000;
 }
 

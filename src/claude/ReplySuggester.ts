@@ -12,7 +12,7 @@ export type ReplySuggestOptions = {
   assistantResponse: string;
   /* Path to the `claude` binary. Empty falls back to PATH lookup. */
   claudePath?: string;
-  /* Model alias (e.g. "haiku" or "claude-haiku-4-5-20251001"). */
+  /* Model alias (e.g. "haiku" or "claude-haiku-5-5"). */
   model: string;
   /* Working dir for the subprocess (vault root usually). */
   cwd: string;

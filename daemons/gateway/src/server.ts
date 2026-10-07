@@ -466,7 +466,7 @@ export class GatewayServer {
       userMessage: first,
       assistantResponse: engine.firstAssistantMessage() ?? undefined,
       claudePath: this.deps.claudePath,
-      model: "haiku",
+      model: "claude-haiku-5-5",
       cwd: this.deps.config.vault,
       incognito: engine.incognito,
     });
@@ -490,7 +490,7 @@ export class GatewayServer {
       userMessage: exchange.userMessage,
       assistantResponse: exchange.assistantResponse,
       claudePath: this.deps.claudePath,
-      model: "haiku",
+      model: "claude-haiku-5-5",
       cwd: this.deps.config.vault,
       incognito: engine.incognito,
     });

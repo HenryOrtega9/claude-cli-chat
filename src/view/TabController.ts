@@ -3028,14 +3028,14 @@ export class TabController {
     }
     if (!lastAssistant) return;
     const seq = this.replySuggestionSeq;
-    /* Hard-pinned to Haiku 4.5 for the same reason as title generation: a
+    /* Hard-pinned to Haiku 5.5 for the same reason as title generation: a
        one-shot, ~15-word side pass after every turn must not drift onto a
        frontier model through a settings typo. */
     const suggestion = (await this.plugin.suggestReply({
       userMessage: lastUser.content,
       assistantResponse: lastAssistant.content,
       claudePath: this.plugin.settings.claudePath || undefined,
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-haiku-5-5",
       cwd: this.plugin.getVaultPath(),
       incognito: this.state.incognito,
     })) ?? null;
@@ -3078,7 +3078,8 @@ export class TabController {
        back to a user-only prompt when assistantResponse is empty. */
     const firstAssistant = this.state.messages.find(m => m.role === "assistant" && m.content.trim().length > 0);
     this.titleGenerationStarted = true;
-    /* Title generation is hard-pinned to Haiku 4.5. Rationale: under the
+    /* Title generation is hard-pinned to Haiku 5.5 (Haiku 4.5 until its
+       2026-10-07 release). Rationale: under the
        2026-06-15 Agent SDK credit pool, every chat turn drains a $100/mo
        budget; auto-titling a tab is a one-shot summarization that Haiku
        does well at ~1/20th the per-message cost of Sonnet and ~1/100th of
@@ -3089,7 +3090,7 @@ export class TabController {
       userMessage: firstUser.content,
       assistantResponse: firstAssistant?.content,
       claudePath: this.plugin.settings.claudePath || undefined,
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-haiku-5-5",
       cwd: this.plugin.getVaultPath(),
     })) ?? null;
     if (generated) {
