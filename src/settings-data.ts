@@ -133,12 +133,12 @@ export const EFFORT_ORDER: EffortLevel[] = ["max", "xhigh", "high", "medium", "l
    Sonnet 5.5 (2026-09-28) keeps the full ladder too; CLI-verified with
    `--effort xhigh` on its release day. Its levels are recalibrated from
    Sonnet 5, so the same chip setting is not the same depth across the two.
-   Haiku 5.5 (2026-10-07) stays on the standard four: the CLI accepts
-   `--effort xhigh` for it, but it accepts it for Haiku 4.5 too, so that is
-   no proof of support. Its `[1m]` suffix is CLI-verified (the same suffix
-   fails on Haiku 4.5), so haiku-5-5 counts as 1M in contextWindowForModel. */
+   Haiku 5.5 (2026-10-07) gets the full ladder too: the effort docs list it
+   under xhigh and say it supports all five levels (default medium). Its
+   `[1m]` suffix is CLI-verified (the same suffix fails on Haiku 4.5), so
+   haiku-5-5 counts as 1M in contextWindowForModel. */
 export function effortLevelsForModel(model: ModelKey): EffortLevel[] {
-  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5-5" || model === "sonnet-5") return EFFORT_ORDER;
+  if (model === "fable-5-1" || model === "fable-5" || model === "opus-5-5" || model === "opus-5" || model === "opus-1m" || model === "opus-4-7-1m" || model === "opus-4-6-1m" || model === "opus-plan" || model === "sonnet-5-5" || model === "sonnet-5" || model === "haiku-5-5") return EFFORT_ORDER;
   return EFFORT_ORDER.filter(e => e !== "xhigh");
 }
 
