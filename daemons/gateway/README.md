@@ -38,7 +38,9 @@ node daemons/gateway/build.mjs --production # minified, no sourcemap
 
 Single esbuild bundle, CJS, node builtins external. It deliberately does not go
 through the repo's `esbuild.config.mjs` (that file belongs to the plugin and app
-builds).
+builds). The same run also writes the `apple-health` and `whoop-auth` CLIs
+(`dist/apple-health.js`, `dist/whoop-auth.js`, both executable with a node
+shebang) and the Apple Health worker.
 
 ## Run it by hand
 
@@ -120,6 +122,100 @@ hand-rolled WebSocket client — Node 24's built-in one fails every plaintext
 `ws://` handshake on this machine, including against a byte-identical copy of a
 public server's response it accepts over `wss://`.
 
+## WHOOP
+
+The daemon polls the WHOOP v2 API and serves a compact summary for the watch.
+
+| Route | Auth | Answer |
+|---|---|---|
+| `GET /whoop/summary` | main token **or** the WHOOP read-only token | Always 200 once authorized; `auth`, `stale` and `last_error` travel in the body |
+| `POST /whoop/poll` | main token only | Polls WHOOP now (joining a poll already running) and returns the summary |
+
+The read-only token lives at `~/.config/vault-gateway/whoop-read-token` (48 hex,
+mode 600). The daemon generates it on first start and prints
+`WHOOP READ TOKEN: ...` to the log once, like the main token. It is accepted on
+`GET /whoop/summary` and nowhere else, so a device holding it can read WHOOP
+numbers and cannot reach a Claude session. Rotate it by deleting the file and
+restarting.
+
+Summary shape (`schema: 1`): `auth` is `ok`, `not_configured`,
+`reauth_required` or `error`; `stale` is true when the last poll failed or the
+data is older than 45 minutes; `recovery`, `strain` and `sleep` are always
+objects (fields null when there is nothing to show) and `workout` is the latest
+workout or null. Every `state` is `scored`, `pending`, `unscorable` or
+`missing`. Today is the newest cycle; while its recovery is pending or absent,
+the previous cycle's recovery is shown with `is_current_cycle: false`. Bands
+follow WHOOP: green 67 and up, yellow 34 to 66, red 33 and below.
+
+History for the watch complications, always present:
+
+- `week`: up to 7 entries `{cycle_start, day, recovery, band, strain}`,
+  oldest first, the last one the current cycle. `day` is the `YYYY-MM-DD` the
+  cycle belongs to in the gateway's timezone: the date of its start, with a
+  start from noon on counting as the next day (bed at 23:10 Thursday is
+  Friday). `recovery` is that cycle's scored recovery (else null), `strain`
+  its scored day strain at 1 decimal (else null). `[]` with no data.
+- `strain_today`: `{cycle_start, wake, points}`. The daemon records the
+  current cycle's strain itself: each successful poll adds `{t, strain}` (the
+  poll time) when the strain changed at 1 decimal or there is no point yet,
+  and a new cycle starts a new series. At most 400 points, oldest dropped,
+  kept in the cache file across restarts. `wake` is the end of the cycle's
+  sleep, else null. Extend the last step to `fetched_at`, the last successful
+  poll.
+- `workouts_today`: `{sport, start, end, strain}` for the workouts that
+  started in the current cycle, oldest first. `workout` stays the latest one.
+
+Polling: every 5 minutes, 5 requests a poll (cycles, recoveries, the current
+cycle's recovery and sleep, workouts; a 6th for the previous cycle's recovery
+while today's is pending), so about 1,440 WHOOP requests a day against the
+10,000 limit, backing off from 2 minutes up to 60 after errors.
+Without credentials, or after a refused refresh (`reauth_required`), the daemon
+only stats the credentials file once a minute. Re-running `whoop-auth` takes
+effect without a restart.
+
+Tokens: only the daemon refreshes. WHOOP refresh tokens rotate and are single
+use, so every refresh happens under a lock file next to the credentials
+(`credentials.lock`, stale after 30 s), re-reads the file first and adopts a
+pair another writer already rotated, and writes the new pair to disk before
+using it. Refreshes happen 5 minutes before expiry and once on a 401. A refused
+grant (`invalid_grant`, or a 400/401 from the token endpoint) stops retries
+until the credentials change; network errors and 5xx back off.
+
+### Connecting an account: `whoop-auth`
+
+1. Create an app at https://developer-dashboard.whoop.com with every read scope
+   and the redirect URI `http://localhost:8799/whoop/callback`.
+2. Link the CLI once (optional): `ln -s ~/Developer/claude-cli-chat/daemons/gateway/dist/whoop-auth.js ~/.local/bin/whoop-auth`
+3. Run `whoop-auth`. It asks for the Client ID and Client Secret (the secret is
+   not echoed), opens the consent page, waits up to 5 minutes for the redirect
+   on 127.0.0.1 and ::1 port 8799, saves the tokens, prints who is connected,
+   and asks the running gateway to poll (`POST /whoop/poll`, using the main
+   token and the gateway's bind and port). If the gateway is not reachable the
+   tokens are still saved and the daemon picks them up on its next check.
+
+Over SSH (`$SSH_CONNECTION` set) it prints the consent URL instead of opening
+it. Your browser then fails to load the `localhost` redirect; copy the full URL
+from its address bar and paste it into the terminal.
+
+```sh
+whoop-auth                       # login (the default)
+whoop-auth --redirect-uri https://henrys-mac-mini.tail92466c.ts.net/whoop/callback
+whoop-auth status                # configured?, token expiry, last cached summary
+whoop-auth set-client            # enter a new Client ID / Secret
+whoop-auth logout                # forget the tokens, keep the client
+```
+
+`--redirect-uri` is for when WHOOP will not accept a `localhost` redirect: front
+`127.0.0.1:8799` with `tailscale serve` under an https name, register that URI
+on the WHOOP app, and pass it here. It must match the app exactly; it is stored
+and reused by later logins.
+
+Offline test (fake WHOOP server, temp files only, nothing live touched):
+
+```sh
+node daemons/gateway/test/whoop.mjs
+```
+
 ## Through `tailscale serve`
 
 WebSocket upgrade passes through cleanly (verified end to end):
@@ -148,6 +244,11 @@ fronting it this way.
 | `VAULT_GATEWAY_STATE_FILE` | `/tmp/claude_state.ios` | TC001 state mirror |
 | `VAULT_GATEWAY_PARTIAL` | on | `0` drops `--include-partial-messages` |
 | `VAULT_GATEWAY_HEALTH_DB` | `~/Library/Application Support/vault-gateway/apple-health.sqlite` | Apple Health SQLite store (outside the vault; parent dir created on first open). The `apple-health` CLI reads the same variable |
+| `VAULT_GATEWAY_WHOOP_READ_TOKEN_FILE` | `~/.config/vault-gateway/whoop-read-token` | Read-only token for `GET /whoop/summary`, mode 600 |
+| `VAULT_GATEWAY_WHOOP_CACHE` | `~/Library/Application Support/vault-gateway/whoop-cache.json` | Last good WHOOP pull, loaded at start. `whoop-auth status` reads it too |
+| `WHOOP_CREDENTIALS_FILE` | `~/.config/whoop/credentials.json` | WHOOP client and tokens; shared by the daemon and `whoop-auth` |
+| `WHOOP_API_BASE` | `https://api.prod.whoop.com` | WHOOP API origin (tests point it at a fake server) |
+| `WHOOP_OAUTH_BASE` | `$WHOOP_API_BASE/oauth/oauth2` | OAuth endpoints (`/auth`, `/token`) |
 
 ## On-disk footprint
 
@@ -162,6 +263,11 @@ fronting it this way.
 | `~/Library/Application Support/vault-gateway/apple-health.sqlite` (+ `-wal`, `-shm`) | Apple Health samples, daily stats, characteristics, ingest log (WAL). Raw health data; never in the vault |
 | `<vault>/Health/Metrics/Apple Health Feed.md` | Generated Apple Health summary note, rewritten atomically at most once per 60 s after an ingest |
 | `daemons/gateway/dist/apple-health.js` | Read-only `apple-health` CLI, symlinked as `~/.local/bin/apple-health` |
+| `~/.config/vault-gateway/whoop-read-token` | WHOOP read-only token, mode 600 |
+| `~/.config/whoop/credentials.json` | WHOOP client id/secret, redirect URI, access and refresh tokens, expiry (mode 600, directory 700). Written by temp file plus rename |
+| `~/.config/whoop/credentials.lock` | Present only while a writer holds the credentials lock; treated as stale after 30 s |
+| `~/Library/Application Support/vault-gateway/whoop-cache.json` | Last good WHOOP pull (raw records plus `fetched_at`) and the current cycle's strain series, mode 600 |
+| `daemons/gateway/dist/whoop-auth.js` | `whoop-auth` CLI (optionally symlinked as `~/.local/bin/whoop-auth`) |
 
 The store is namespaced under `apps/ios/`, disjoint from the plugin's
 `.claude-cli-chat/` and the desktop app's `.claude-cli-chat/desktop/`, so all
@@ -185,3 +291,9 @@ three run at once without contending. The daemon never writes
 | `src/usage.ts` | OAuth usage proxy (port of `bridge.py`'s `UsageFetcher`) |
 | `src/state-mirror.ts` | `/tmp/claude_state.ios` writer |
 | `src/platform-node.ts` | Node `Platform` so the shared stores have file I/O |
+| `src/whoop/credentials.ts` | WHOOP credentials file: load, atomic save, lock |
+| `src/whoop/oauth.ts` | Authorize URL, code exchange, refresh grant |
+| `src/whoop/api.ts` | WHOOP v2 reads (cycles, recoveries, a cycle's recovery and sleep, workouts, profile); 401 and 429 handling |
+| `src/whoop/summary.ts` | Pure `buildSummary`: raw records to the `/whoop/summary` body; `advanceStrainSeries` |
+| `src/whoop/service.ts` | `WhoopService`: polling, refresh, cache |
+| `src/whoop/auth-cli.ts` | `whoop-auth` |

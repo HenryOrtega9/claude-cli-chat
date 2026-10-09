@@ -8,6 +8,10 @@
      /ws/<ticket>. The ticket is single-use, expires in 60 s, and lives in the
      PATH rather than the query string so it never lands in a proxy access log
      the way `?ticket=` would.
+   - One exception: GET /whoop/summary also accepts the WHOOP read-only
+     token (a second file), so a device that only shows WHOOP numbers never
+     holds a key to Claude. It is checked ahead of the main gate for that one
+     method and path; everywhere else that token is a plain 401.
 
    One socket multiplexes every tab. `subscribe` replays each tab's frames
    above the client's cursor and then streams live, so a backgrounded phone
@@ -32,6 +36,7 @@ import { NoCapacityError, TAB_ID_RE, TabRegistry } from "./registry";
 import type { StateMirror } from "./state-mirror";
 import type { TokenStore } from "./token";
 import { UsageFetcher } from "./usage";
+import type { WhoopService } from "./whoop/service";
 import { acceptUpgrade, isWebSocketUpgrade, rejectUpgrade, traceWs, type WsConnection } from "./ws";
 
 const TICKET_TTL_MS = 60_000;
@@ -79,6 +84,10 @@ export type ServerDeps = {
      only reaches the catalog, never the children. Resolves true when the
      patterns actually changed. */
   refreshMcpDenyPatterns: () => Promise<boolean>;
+  /* Owned by main.ts, which starts it once the gateway is ready. Optional so
+     a test can build the server without one (the /whoop routes then 503). */
+  whoop?: WhoopService;
+  whoopReadToken?: TokenStore;
   log: (msg: string) => void;
 };
 
@@ -160,15 +169,16 @@ export class GatewayServer {
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.resolve(null); }
     this.waiters.clear();
     this.appleHealth.close();
+    this.deps.whoop?.stop();
     await new Promise<void>(resolve => this.http.close(() => resolve()));
   }
 
   /* ---------- auth ---------- */
 
-  private authorized(req: IncomingMessage): boolean {
+  private authorized(req: IncomingMessage, store: TokenStore = this.deps.token): boolean {
     const header = req.headers.authorization ?? "";
     if (!header.startsWith("Bearer ")) return false;
-    return this.deps.token.matches(header.slice(7).trim());
+    return store.matches(header.slice(7).trim());
   }
 
   private mintTicket(): string {
@@ -197,6 +207,11 @@ export class GatewayServer {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const path = url.pathname;
     const method = req.method ?? "GET";
+
+    /* The WHOOP read-only token: this one method and path, nothing else. */
+    if (method === "GET" && path === "/whoop/summary" && this.deps.whoopReadToken && this.authorized(req, this.deps.whoopReadToken)) {
+      return this.getWhoopSummary(res);
+    }
 
     if (!this.authorized(req)) {
       sendJson(res, 401, { error: "unauthorized" });
@@ -233,6 +248,15 @@ export class GatewayServer {
         this.deps.log(`apple-health status failed: ${String(err)}`);
         return sendJson(res, 500, { error: "health_store_error", message: String(err) });
       }
+    }
+
+    /* --- whoop ---
+       Always 200 once authorized: auth state, staleness and the last error
+       travel in the body, so the watch decodes one shape. */
+    if (method === "GET" && path === "/whoop/summary") return this.getWhoopSummary(res);
+    if (method === "POST" && path === "/whoop/poll") {
+      if (!this.deps.whoop) return sendJson(res, 503, { error: "whoop_unavailable" });
+      return sendJson(res, 200, await this.deps.whoop.pollNow());
     }
 
     /* --- permissions --- */
@@ -535,6 +559,11 @@ export class GatewayServer {
       this.deps.log(`apple-health ingest failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
       return sendJson(res, 500, { error: "health_store_error", message: String(err) });
     }
+  }
+
+  private getWhoopSummary(res: ServerResponse): void {
+    if (!this.deps.whoop) return sendJson(res, 503, { error: "whoop_unavailable" });
+    sendJson(res, 200, this.deps.whoop.summary());
   }
 
   private async getEvents(res: ServerResponse, engine: TabEngine, url: URL): Promise<void> {

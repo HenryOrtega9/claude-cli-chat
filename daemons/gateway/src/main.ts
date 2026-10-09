@@ -23,6 +23,7 @@ import { detectClaudePath } from "./catalog";
 import { TabRegistry } from "./registry";
 import { GatewayServer } from "./server";
 import { StateMirror } from "./state-mirror";
+import { WhoopService } from "./whoop/service";
 import type { Frame } from "./frames";
 
 const STORE_DIR = ".claude-cli-chat/ios";
@@ -70,6 +71,14 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
 
   const token = loadOrCreateToken(config.tokenFile, log);
+  /* The WHOOP read-only token is optional: failing to mint it costs the
+     watch its read-only access (the main token still works), never the boot. */
+  let whoopReadToken;
+  try {
+    whoopReadToken = loadOrCreateToken(config.whoopReadTokenFile, log, "WHOOP READ TOKEN", "enroll this on the watch for GET /whoop/summary");
+  } catch (err) {
+    log(`whoop read token unavailable: ${String(err)}`);
+  }
   installNodePlatform(config.vault, log);
 
   /* Persistence's quit-time flushSync path takes its fs handle by injection
@@ -82,6 +91,9 @@ async function main(): Promise<void> {
 
   const claudePath = config.claudePath || detectClaudePath();
   const mirror = new StateMirror(config.stateMirrorPath);
+  /* Constructed now (it loads its cache, so /whoop/summary answers from the
+     first request) but started only once the gateway is ready. */
+  const whoop = new WhoopService({ credentialsPath: config.whoopCredentials, cachePath: config.whoopCache, log });
 
   let ready = false;
   let server: GatewayServer;
@@ -125,6 +137,8 @@ async function main(): Promise<void> {
     version: version(),
     isReady: () => ready,
     refreshMcpDenyPatterns: loadDenyPatterns,
+    whoop,
+    whoopReadToken,
     log,
   });
 
@@ -139,6 +153,7 @@ async function main(): Promise<void> {
   mirror.set("idle");
   ready = true;
   log("state: ready");
+  whoop.start();
   /* Warm the catalog off the critical path — the first /catalog would
      otherwise pay for a `claude mcp list` spawn while the phone waits. */
   void server.catalog().then(c => log(`catalog warm (hash ${c.hash}, ${c.mcpServers.length} mcp server(s))`)).catch(() => undefined);

@@ -7,7 +7,10 @@
 
    The enrollment line is printed exactly once — on generation — so the log
    is not a standing copy of the secret. Losing it means deleting the file
-   and restarting, which is the correct rotation story anyway. */
+   and restarting, which is the correct rotation story anyway.
+
+   The same loader mints the WHOOP read-only token (a second file, accepted
+   only on GET /whoop/summary); `label` and `enroll` name it in that line. */
 
 import { chmodSync, mkdirSync, openSync, readFileSync, writeSync, closeSync } from "node:fs";
 import { dirname } from "node:path";
@@ -19,7 +22,12 @@ export type TokenStore = {
   matches(candidate: string): boolean;
 };
 
-export function loadOrCreateToken(path: string, log: (msg: string) => void): TokenStore {
+export function loadOrCreateToken(
+  path: string,
+  log: (msg: string) => void,
+  label = "VAULT GATEWAY TOKEN",
+  enroll = "enroll this once on the phone",
+): TokenStore {
   let token = "";
   try {
     token = readFileSync(path, "utf8").trim();
@@ -38,8 +46,8 @@ export function loadOrCreateToken(path: string, log: (msg: string) => void): Tok
       closeSync(fd);
       chmodSync(path, 0o600);
       token = generated;
-      log(`VAULT GATEWAY TOKEN: ${token}`);
-      log(`(generated at ${path}, mode 600 — enroll this once on the phone; it is not printed again)`);
+      log(`${label}: ${token}`);
+      log(`(generated at ${path}, mode 600 — ${enroll}; it is not printed again)`);
     } catch {
       token = readFileSync(path, "utf8").trim();
     }

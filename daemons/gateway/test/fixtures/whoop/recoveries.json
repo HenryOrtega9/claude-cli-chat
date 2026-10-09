@@ -1,0 +1,67 @@
+{
+  "records": [
+    {
+      "cycle_id": 93845,
+      "sleep_id": "ecfc6a15-4661-442f-a9a4-f160dd7afae8",
+      "user_id": 10129,
+      "created_at": "2026-10-09T13:55:00.000Z",
+      "updated_at": "2026-10-09T13:56:30.000Z",
+      "score_state": "SCORED",
+      "score": { "user_calibrating": false, "recovery_score": 72, "resting_heart_rate": 54, "hrv_rmssd_milli": 45.678, "spo2_percentage": 96.25, "skin_temp_celsius": 33.456 }
+    },
+    {
+      "cycle_id": 93844,
+      "sleep_id": "0b6b5e2c-3b8e-4c43-9a59-6a7f1f3a2f10",
+      "user_id": 10129,
+      "created_at": "2026-10-08T14:05:00.000Z",
+      "updated_at": "2026-10-08T14:06:00.000Z",
+      "score_state": "SCORED",
+      "score": { "user_calibrating": true, "recovery_score": 41.6, "resting_heart_rate": 58.4, "hrv_rmssd_milli": 31.04, "spo2_percentage": 95.1, "skin_temp_celsius": 33.9 }
+    },
+    {
+      "cycle_id": 93843,
+      "sleep_id": "5d1c1e0a-7f2b-4b8e-9c3a-2a6f0e9b1c43",
+      "user_id": 10129,
+      "created_at": "2026-10-07T13:40:00.000Z",
+      "updated_at": "2026-10-07T13:41:00.000Z",
+      "score_state": "SCORED",
+      "score": { "user_calibrating": false, "recovery_score": 66, "resting_heart_rate": 55, "hrv_rmssd_milli": 40.2, "spo2_percentage": 96.0, "skin_temp_celsius": 33.5 }
+    },
+    {
+      "cycle_id": 93842,
+      "sleep_id": "9e2a4c71-0d3f-4e5a-8b6c-7f1d2e3a4b42",
+      "user_id": 10129,
+      "created_at": "2026-10-06T15:10:00.000Z",
+      "updated_at": "2026-10-06T15:11:00.000Z",
+      "score_state": "SCORED",
+      "score": { "user_calibrating": false, "recovery_score": 34.4, "resting_heart_rate": 60, "hrv_rmssd_milli": 28.9, "spo2_percentage": 95.4, "skin_temp_celsius": 34.1 }
+    },
+    {
+      "cycle_id": 93840,
+      "sleep_id": "3b7f9d20-6a1e-4c2b-b5d8-0e4f6a8c2d40",
+      "user_id": 10129,
+      "created_at": "2026-10-04T13:20:00.000Z",
+      "updated_at": "2026-10-04T13:25:00.000Z",
+      "score_state": "UNSCORABLE"
+    },
+    {
+      "cycle_id": 93839,
+      "sleep_id": "c4e8a1b3-2d5f-4a6c-9e7b-1f3d5a7c9e39",
+      "user_id": 10129,
+      "created_at": "2026-10-03T14:00:00.000Z",
+      "updated_at": "2026-10-03T14:01:00.000Z",
+      "score_state": "SCORED",
+      "score": { "user_calibrating": false, "recovery_score": 20, "resting_heart_rate": 63, "hrv_rmssd_milli": 22.5, "spo2_percentage": 94.8, "skin_temp_celsius": 34.4 }
+    },
+    {
+      "cycle_id": 93838,
+      "sleep_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c38",
+      "user_id": 10129,
+      "created_at": "2026-10-02T13:30:00.000Z",
+      "updated_at": "2026-10-02T13:31:00.000Z",
+      "score_state": "SCORED",
+      "score": { "user_calibrating": false, "recovery_score": 88, "resting_heart_rate": 51, "hrv_rmssd_milli": 58.3, "spo2_percentage": 97.0, "skin_temp_celsius": 33.2 }
+    }
+  ],
+  "next_token": "MTIzOjk4NzY1"
+}

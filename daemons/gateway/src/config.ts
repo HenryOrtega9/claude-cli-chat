@@ -34,6 +34,9 @@ export type GatewayConfig = {
   claudePath: string;
   stateMirrorPath: string;
   healthDb: string;
+  whoopCredentials: string;
+  whoopCache: string;
+  whoopReadTokenFile: string;
 };
 
 function envInt(name: string, fallback: number): number {
@@ -52,13 +55,26 @@ export function loadConfig(): GatewayConfig {
     vault: resolve(vault),
     port: envInt("VAULT_GATEWAY_PORT", 8788),
     bind: process.env.VAULT_GATEWAY_BIND || null,
-    tokenFile: process.env.VAULT_GATEWAY_TOKEN_FILE || `${HOME}/.config/vault-gateway/token`,
+    tokenFile: gatewayTokenPath(),
     maxChildren: envInt("VAULT_GATEWAY_MAX_CHILDREN", 4),
     approvalTimeoutS: envInt("VAULT_GATEWAY_APPROVAL_TIMEOUT_S", 600),
     claudePath: process.env.VAULT_GATEWAY_CLAUDE || "",
     stateMirrorPath: process.env.VAULT_GATEWAY_STATE_FILE || "/tmp/claude_state.ios",
     healthDb: healthDbPath(),
+    whoopCredentials: whoopCredentialsPath(),
+    whoopCache: whoopCachePath(),
+    whoopReadTokenFile: expandHome(process.env.VAULT_GATEWAY_WHOOP_READ_TOKEN_FILE || `${HOME}/.config/vault-gateway/whoop-read-token`),
   };
+}
+
+function expandHome(raw: string): string {
+  return resolve(raw.startsWith("~/") ? `${HOME}${raw.slice(1)}` : raw);
+}
+
+/* The main bearer token path. Shared with `whoop-auth`, which POSTs
+   /whoop/poll with it after a login. */
+export function gatewayTokenPath(env: NodeJS.ProcessEnv = process.env): string {
+  return expandHome(env.VAULT_GATEWAY_TOKEN_FILE || `${HOME}/.config/vault-gateway/token`);
 }
 
 /* Apple Health SQLite path, shared by the daemon and the `apple-health` CLI
@@ -67,8 +83,30 @@ export function loadConfig(): GatewayConfig {
    is created by the store when it first opens, not here, so a bad path costs
    the health routes a 500 rather than the daemon its boot. */
 export function healthDbPath(env: NodeJS.ProcessEnv = process.env): string {
-  const raw = env.VAULT_GATEWAY_HEALTH_DB || `${HOME}/Library/Application Support/vault-gateway/apple-health.sqlite`;
-  return resolve(raw.startsWith("~/") ? `${HOME}${raw.slice(1)}` : raw);
+  return expandHome(env.VAULT_GATEWAY_HEALTH_DB || `${HOME}/Library/Application Support/vault-gateway/apple-health.sqlite`);
+}
+
+/* WHOOP OAuth credentials (client id/secret plus the rotating token pair),
+   shared by the daemon and `whoop-auth`. Mode 600 in a 700 directory; see
+   whoop/credentials.ts for the locking rules. */
+export function whoopCredentialsPath(env: NodeJS.ProcessEnv = process.env): string {
+  return expandHome(env.WHOOP_CREDENTIALS_FILE || `${HOME}/.config/whoop/credentials.json`);
+}
+
+/* The last good WHOOP pull, so a restart serves data before its first poll.
+   Next to the Apple Health store: health data, outside the vault. */
+export function whoopCachePath(env: NodeJS.ProcessEnv = process.env): string {
+  return expandHome(env.VAULT_GATEWAY_WHOOP_CACHE || `${HOME}/Library/Application Support/vault-gateway/whoop-cache.json`);
+}
+
+/* Where `whoop-auth` reaches the running daemon: the same bind the daemon
+   resolves, but one non-blocking attempt (a CLI must not sit through
+   resolveBind's 60 s retry loop), falling back to loopback. */
+export function localGatewayUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const rawPort = Number.parseInt(env.VAULT_GATEWAY_PORT ?? "", 10);
+  const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 8788;
+  const host = env.VAULT_GATEWAY_BIND || tailnetIpFromCli() || tailnetIpFromInterfaces() || "127.0.0.1";
+  return `http://${host.includes(":") ? `[${host}]` : host}:${port}`;
 }
 
 function tailnetIpFromInterfaces(): string | null {
