@@ -13,7 +13,7 @@
    fill instead of stroke. */
 
 import {
-  ArrowLeft, Blend, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, Circle, CircleHelp, CircleX, Copy,
+  ArrowLeft, Blend, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, ChevronUp, Circle, CircleHelp, CircleX, Copy,
   ExternalLink, File, FileEdit, FilePlus, FileSpreadsheet, FileText, Folder,
   FolderOpen, Gauge, GitBranch, Globe, History, Image, Layers, LayoutGrid,
   ListChecks, LoaderCircle, LocateFixed, Paperclip, Pause, Pin, Play, PlugZap,
@@ -42,6 +42,7 @@ const iconMap: Record<string, IconNode | undefined> = {
   "check": Check,
   "check-circle-2": CheckCircle2,
   "chevron-down": ChevronDown,
+  "chevron-right": ChevronRight,
   "chevron-up": ChevronUp,
   "circle": Circle,
   "circle-help": CircleHelp,

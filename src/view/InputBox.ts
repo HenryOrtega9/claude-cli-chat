@@ -452,7 +452,9 @@ export class InputBox {
      Visibility driven by mouseenter/leave on pill+popup with a small
      grace window so cursor travel between the two doesn't close it. */
   private costPopup: HTMLElement | null = null;
-  private costPopupHideTimer: number | null = null;
+  /* Document listeners that close the cost popup on an outside click or
+     Escape. Attached on open, removed on close. */
+  private costPopupDismiss: { mousedown: (e: MouseEvent) => void; keydown: (e: KeyboardEvent) => void } | null = null;
   /* Most-recent cost-surface payload, retained so the hover popup can
      re-render itself when shown without needing a fresh data load. */
   private costPayload: CostSurfacePayload | null = null;
@@ -817,7 +819,7 @@ export class InputBox {
       cls: "claudian-toolbar-pill claudian-cost-pill",
       attr: {
         "aria-label": "Per-turn cost surface (pinned files + MCP servers)",
-        title: "Pinned files and connected MCP servers ride on every turn. Hover for details.",
+        title: "Pinned files and connected MCP servers ride on every turn. Click for details.",
       },
     });
     this.costPillText = this.costPill.createSpan({ cls: "claudian-toolbar-pill-value" });
@@ -847,23 +849,9 @@ export class InputBox {
          first setAgentCount/setRunningAgentCount lands. */
       this.refreshAgentsPill();
     }
-    /* Popup-trigger wiring: enter shows, leave schedules a close that the
-       popup's own enter handler cancels — that handoff is what lets the
-       cursor travel from pill to popup without the popup vanishing
-       mid-flight. closeNow / scheduleClose live as instance methods so
-       the popup-side handlers can call into them too. */
-    /* Hover open/close is desktop-only. A touch tap synthesizes mouseenter
-       right before click (standard mobile ghost-mouse-event order), so on a
-       touch host wiring both would have mouseenter open the popup and the
-       click handler below immediately see it open and close it again —
-       same tap, popup never stays open. Touch gets click-to-toggle alone. */
-    if (!TOUCH_PRIMARY) {
-      this.costPill.addEventListener("mouseenter", () => this.openCostPopup());
-      this.costPill.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
-    }
-    /* Click also toggles the popup (in addition to hover, on desktop) so
-       keyboard / touch users have a stable affordance. Tapping the pill
-       while the popup is open closes it. */
+    /* Click-only: the popup used to open on hover, which flashed the whole
+       server list every time the cursor crossed the toolbar. Clicking the
+       pill toggles it; an outside click or Escape closes it. */
     this.costPill.addEventListener("click", e => {
       e.stopPropagation();
       if (this.costPopup && this.costPopup.style.display !== "none") {
@@ -1038,7 +1026,7 @@ export class InputBox {
     this.costPillText.setText(parts.join(" · "));
     this.costPill.setAttribute(
       "title",
-      `${pinCount} pinned file${pinCount === 1 ? "" : "s"} + ${mcpCount} active MCP server${mcpCount === 1 ? "" : "s"} (${toolCount} tool${toolCount === 1 ? "" : "s"}) ride on every turn. Hover for details + toggles.`
+      `${pinCount} pinned file${pinCount === 1 ? "" : "s"} + ${mcpCount} active MCP server${mcpCount === 1 ? "" : "s"} (${toolCount} tool${toolCount === 1 ? "" : "s"}) ride on every turn. Click for details + toggles.`
     );
     this.costPill.style.display = "";
     /* If the popup is currently visible, re-render its contents so the
@@ -1094,25 +1082,26 @@ export class InputBox {
 
   private openCostPopup() {
     if (!this.costPayload) return;
-    if (this.costPopupHideTimer !== null) {
-      window.clearTimeout(this.costPopupHideTimer);
-      this.costPopupHideTimer = null;
-    }
     if (!this.costPopup) {
       this.costPopup = this.wrapper.createDiv({ cls: "claudian-cost-popup" });
       /* Stop clicks inside the popup from bubbling — checkbox clicks
          shouldn't propagate to outside listeners that might close us. */
       this.costPopup.addEventListener("click", e => e.stopPropagation());
-      /* Hover handoff: cursor moving from pill onto the popup cancels
-         the scheduled close, so the user can actually click checkboxes
-         without the popup vanishing under their cursor. */
-      this.costPopup.addEventListener("mouseenter", () => {
-        if (this.costPopupHideTimer !== null) {
-          window.clearTimeout(this.costPopupHideTimer);
-          this.costPopupHideTimer = null;
-        }
-      });
-      this.costPopup.addEventListener("mouseleave", () => this.scheduleCostPopupClose());
+    }
+    if (!this.costPopupDismiss) {
+      /* Mousedown on the pill itself is left to the pill's click toggle;
+         closing here first would make that click reopen the popup. */
+      const mousedown = (e: MouseEvent) => {
+        const target = e.target as Node;
+        if (this.costPopup?.contains(target) || this.costPill.contains(target)) return;
+        this.closeCostPopupNow();
+      };
+      const keydown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") this.closeCostPopupNow();
+      };
+      this.costPopupDismiss = { mousedown, keydown };
+      document.addEventListener("mousedown", mousedown);
+      document.addEventListener("keydown", keydown);
     }
     this.renderCostPopupContent();
     this.costPopup.style.display = "";
@@ -1136,15 +1125,22 @@ export class InputBox {
     }
     this.costPopup.style.bottom = `${wrapperRect.bottom - pillRect.top + 6}px`;
     this.costPopup.style.top = "";
-    /* Cap the height to the gap between the viewport top and the popup's
-       bottom edge (which sits just above the pill). The popup grows upward
+    /* Cap the height to the gap between the popup's bottom edge (just above
+       the pill) and the top of the tab content container, which clips with
+       overflow: hidden below the header and tab bar. The popup grows upward
        from a bottom anchor, so without this a server with many tools — e.g.
-       webull's 68 — would overflow off the top of the screen with no way to
-       scroll to the hidden servers/footer. 8px keeps it off the very edge;
-       160px floor stops it collapsing to nothing in a tiny window. The inner
-       server list (.claudian-cost-popup-server-list) is the scroll region. */
-    const available = pillRect.top - 6 - 8;
-    this.costPopup.style.maxHeight = `${Math.max(160, available)}px`;
+       webull's 92 — would run under the tab bar, hiding the summary header
+       and the first server card. Measuring from the viewport top did exactly
+       that: it allowed the popup to be as tall as the header plus tab bar
+       above the clip edge. 8px keeps it off the edge; the floor only guards a
+       zero or negative measurement, and is kept small (as in
+       publishPopupHeadroom) because a floor above the real headroom brings
+       the clipping back. The inner server list
+       (.claudian-cost-popup-server-list) is the scroll region. */
+    const clip = this.wrapper.closest(".claudian-tab-content-container");
+    const clipTop = clip ? clip.getBoundingClientRect().top : 0;
+    const available = pillRect.top - 6 - clipTop - 8;
+    this.costPopup.style.maxHeight = `${Math.max(120, available)}px`;
     this.publishPopupHeadroom(
       this.costPopup,
       pillRect.top,
@@ -1152,20 +1148,11 @@ export class InputBox {
     );
   }
 
-  private scheduleCostPopupClose() {
-    if (this.costPopupHideTimer !== null) window.clearTimeout(this.costPopupHideTimer);
-    /* 250ms grace gives enough time for cursor travel between pill and
-       popup; longer feels sluggish, shorter races with normal hand
-       motion. */
-    this.costPopupHideTimer = window.setTimeout(() => {
-      this.closeCostPopupNow();
-    }, 250);
-  }
-
   private closeCostPopupNow() {
-    if (this.costPopupHideTimer !== null) {
-      window.clearTimeout(this.costPopupHideTimer);
-      this.costPopupHideTimer = null;
+    if (this.costPopupDismiss) {
+      document.removeEventListener("mousedown", this.costPopupDismiss.mousedown);
+      document.removeEventListener("keydown", this.costPopupDismiss.keydown);
+      this.costPopupDismiss = null;
     }
     if (this.costPopup) this.costPopup.style.display = "none";
   }
@@ -1252,13 +1239,9 @@ export class InputBox {
     this.destroyed = true;
     if (this.openPopup) this.closePopup();
     if (this.suggestion) this.hideSuggestion();
-    /* The cost popup's 250ms close-grace timer is not owned by closePopup/
-       hideSuggestion. Left pending, it fires after teardown and touches the
-       already-detached costPopup node. */
-    if (this.costPopupHideTimer !== null) {
-      window.clearTimeout(this.costPopupHideTimer);
-      this.costPopupHideTimer = null;
-    }
+    /* The cost popup's document listeners are not owned by closePopup/
+       hideSuggestion; left attached they outlive the tab. */
+    this.closeCostPopupNow();
     if (this.draftDebounceTimer !== null) {
       window.clearTimeout(this.draftDebounceTimer);
       this.draftDebounceTimer = null;
@@ -1520,6 +1503,10 @@ export class InputBox {
       if (wasModel) return;
     }
     const popup = this.createPopup("claudian-popup-model");
+    /* Each family folds to one row: its newest model (the first key in the
+       group). Older versions sit behind the row's chevron, in a side menu on
+       desktop or expanded in place where there is no room beside the popup
+       (see openModelFamily). */
     for (const group of MODEL_GROUPS) {
       popup.createDiv({ cls: "claudian-popup-header", text: group.header });
       if (group.note) {
@@ -1527,32 +1514,145 @@ export class InputBox {
            applying to every row in the group, not just one model. */
         popup.createDiv({ cls: "claudian-popup-header-note", text: group.note });
       }
-      for (const key of group.keys) {
-        const row = popup.createDiv({
-          cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
-        });
-        const icon = row.createSpan({ cls: "claudian-popup-row-icon" });
-        const img = icon.createEl("img");
-        img.src = CLAUDE_ASTERISK_DATA_URI;
-        img.alt = "";
-        const note = MODEL_NOTES[key];
-        if (note) {
-          /* Models with an availability caveat stack label over the note,
-             reusing the icon + labels-column shell from folder rows. */
-          const labels = row.createDiv({ cls: "claudian-popup-row-labels" });
-          labels.createDiv({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
-          labels.createDiv({ cls: "claudian-popup-row-sublabel", text: note });
-        } else {
-          row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+      const [latest, ...older] = group.keys;
+      const row = this.renderModelRow(popup, latest);
+      if (older.length === 0) {
+        if (!TOUCH_PRIMARY) {
+          row.addEventListener("mouseenter", () => this.scheduleModelFamily(popup, () => this.closeModelFamily(popup)));
         }
-        row.addEventListener("click", e => {
-          e.stopPropagation();
-          this.selectModel(key);
-          this.closePopup();
+        continue;
+      }
+      row.addClass("has-older");
+      /* The chevron lights up when the active model is one of the folded
+         older versions, so the picker still shows where the selection is. */
+      const more = row.createSpan({
+        cls: "claudian-popup-row-more" + (older.includes(this.currentModel) ? " is-active" : ""),
+        attr: { role: "button", "aria-label": `Older ${group.header.toLowerCase()} models`, title: "Older versions" },
+      });
+      platform.setIcon(more, "chevron-right");
+      more.addEventListener("click", e => {
+        e.stopPropagation();
+        this.cancelModelFamilyTimer();
+        if (this.modelFamilyOpen === group.header) this.closeModelFamily(popup);
+        else this.openModelFamily(popup, row, group.header, older);
+      });
+      /* Desktop hover opens the side menu. The short delay lets the cursor
+         cut diagonally across a neighboring row on its way into the menu
+         without swapping it out from under the pointer. */
+      if (!TOUCH_PRIMARY) {
+        row.addEventListener("mouseenter", () => {
+          if (this.modelFamilyOpen === group.header) this.cancelModelFamilyTimer();
+          else this.scheduleModelFamily(popup, () => this.openModelFamily(popup, row, group.header, older));
         });
       }
     }
+    popup.addEventListener("mouseleave", () => this.cancelModelFamilyTimer());
+    this.modelFamilyOpen = null;
     this.anchorPopup(popup, this.modelPill);
+  }
+
+  /* Header of the family whose older versions are showing, or null. */
+  private modelFamilyOpen: string | null = null;
+  private modelFamilyTimer: number | null = null;
+
+  private cancelModelFamilyTimer() {
+    if (this.modelFamilyTimer !== null) window.clearTimeout(this.modelFamilyTimer);
+    this.modelFamilyTimer = null;
+  }
+
+  /* Run a side-menu change after a short hover delay, dropped if the picker
+     closed in the meantime. */
+  private scheduleModelFamily(popup: HTMLElement, action: () => void) {
+    this.cancelModelFamilyTimer();
+    this.modelFamilyTimer = window.setTimeout(() => {
+      this.modelFamilyTimer = null;
+      if (this.openPopup?.el === popup) action();
+    }, 120);
+  }
+
+  /* One model row: asterisk icon, label, and the MODEL_NOTES caveat when the
+     model has one. Clicking selects the model and closes the picker. */
+  private renderModelRow(container: HTMLElement, key: ModelKey): HTMLElement {
+    const row = container.createDiv({
+      cls: "claudian-popup-row" + (key === this.currentModel ? " is-selected" : ""),
+    });
+    const icon = row.createSpan({ cls: "claudian-popup-row-icon" });
+    const img = icon.createEl("img");
+    img.src = CLAUDE_ASTERISK_DATA_URI;
+    img.alt = "";
+    const note = MODEL_NOTES[key];
+    if (note) {
+      /* Models with an availability caveat stack label over the note,
+         reusing the icon + labels-column shell from folder rows. */
+      const labels = row.createDiv({ cls: "claudian-popup-row-labels" });
+      labels.createDiv({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+      labels.createDiv({ cls: "claudian-popup-row-sublabel", text: note });
+    } else {
+      row.createSpan({ cls: "claudian-popup-row-label", text: MODEL_LABELS[key] });
+    }
+    row.addEventListener("click", e => {
+      e.stopPropagation();
+      this.selectModel(key);
+      this.closePopup();
+    });
+    return row;
+  }
+
+  /* Show a family's older versions. The side menu is a CHILD of the picker
+     positioned outside its box, so it is removed with the picker and clicks
+     in it count as inside for the outside-click handler. That only works
+     while the picker does not clip its children: the iOS stylesheet makes
+     popups scroll (overflow-y: auto), and a narrow window may have no room
+     on either side, so those cases expand the versions in place under the
+     row instead. */
+  private openModelFamily(popup: HTMLElement, row: HTMLElement, header: string, keys: ModelKey[]) {
+    this.closeModelFamily(popup);
+    this.modelFamilyOpen = header;
+    row.addClass("is-expanded");
+
+    const popupRect = popup.getBoundingClientRect();
+    const clips = getComputedStyle(popup).overflowY !== "visible";
+    const flyout = popup.createDiv({ cls: "claudian-popup claudian-popup-model claudian-popup-model-flyout" });
+    flyout.addEventListener("click", e => e.stopPropagation());
+    /* Reaching the menu cancels a pending swap queued by a row the cursor
+       crossed on the way in. */
+    flyout.addEventListener("mouseenter", () => this.cancelModelFamilyTimer());
+    flyout.createDiv({ cls: "claudian-popup-header", text: header });
+    for (const key of keys) this.renderModelRow(flyout, key);
+
+    /* Room is measured against the tab content container, which clips with
+       overflow: hidden, so a menu that fits the window can still be cut off
+       by a narrow sidebar. */
+    const clip = this.wrapper.closest(".claudian-tab-content-container");
+    const bounds = clip ? clip.getBoundingClientRect() : { left: 0, right: window.innerWidth };
+    const gap = 4;
+    const width = flyout.offsetWidth;
+    const roomLeft = popupRect.left - bounds.left - gap - 8 >= width;
+    const roomRight = bounds.right - popupRect.right - gap - 8 >= width;
+    if (clips || (!roomLeft && !roomRight)) {
+      flyout.remove();
+      row.addClass("is-inline");
+      const inline = createDiv({ cls: "claudian-popup-model-inline" });
+      row.insertAdjacentElement("afterend", inline);
+      for (const key of keys) this.renderModelRow(inline, key);
+      return;
+    }
+    /* The picker is pinned to the model pill at the right edge, so the menu
+       normally opens to the left; it flips right only when the left side is
+       out of room. */
+    if (roomLeft) flyout.style.right = `calc(100% + ${gap}px)`;
+    else flyout.style.left = `calc(100% + ${gap}px)`;
+    /* Line the menu's header up with the row, then nudge it up if it would
+       hang below the picker's bottom edge (which sits just above the pill). */
+    const top = row.offsetTop - flyout.firstElementChild!.getBoundingClientRect().height - 6;
+    const maxTop = popup.offsetHeight - flyout.offsetHeight;
+    flyout.style.top = `${Math.max(0, Math.min(top, maxTop))}px`;
+  }
+
+  private closeModelFamily(popup: HTMLElement) {
+    this.modelFamilyOpen = null;
+    popup.querySelectorAll(".claudian-popup-model-flyout, .claudian-popup-model-inline").forEach(el => el.remove());
+    popup.querySelectorAll(".claudian-popup-row.is-expanded").forEach(el => el.removeClass("is-expanded", "is-inline"));
   }
 
   /* Switching off Opus while X-High is selected would leave an effort the
@@ -1818,6 +1918,8 @@ export class InputBox {
   }
 
   private closePopup() {
+    this.cancelModelFamilyTimer();
+    this.modelFamilyOpen = null;
     if (!this.openPopup) return;
     document.removeEventListener("mousedown", this.openPopup.outsideHandler);
     document.removeEventListener("keydown", this.openPopup.keyHandler);
