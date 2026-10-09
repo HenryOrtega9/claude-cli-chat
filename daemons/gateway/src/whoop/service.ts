@@ -17,13 +17,16 @@
    - only this service refreshes; whoop-auth only does the first exchange;
    - one refresh in flight per process, and across processes the credentials
      lock plus a re-read that adopts tokens someone else already rotated;
-   - new tokens are written to disk before they are used;
+   - new tokens are written to disk before they are used; if that write
+     fails the pair is kept in memory (the old one is already dead) and the
+     save retried every poll;
    - refresh 5 min before expiry, and once on a 401;
    - a refused grant (invalid_grant, 400/401) is auth "reauth_required" and
      polling stops until the credentials file changes; network errors and
      5xx are transient and back off.
    Every tick compares the credentials file's identity (one stat), so
-   re-running whoop-auth takes effect without a restart. */
+   re-running whoop-auth takes effect without a restart; while auth is
+   "error" every tick re-reads the file, so a transient read failure heals. */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -81,6 +84,20 @@ function validSeries(v: unknown): StrainSeries | null {
   return { cycle_id: s.cycle_id, points };
 }
 
+const isRecord = (v: unknown) => !!v && typeof v === "object" && !Array.isArray(v);
+
+/* The shape buildSummary relies on: each single record null or an object,
+   each collection absent or an array of objects. A hand-edited or old dev
+   cache that fails this is ignored rather than crashing every summary. */
+function validRaw(v: unknown): v is WhoopRaw {
+  if (!isRecord(v)) return false;
+  const r = v as Record<string, unknown>;
+  const single = ["cycle", "previousCycle", "recovery", "previousRecovery", "sleep", "workout"];
+  const lists = ["cycles", "recoveries", "workouts"];
+  return single.every(k => r[k] == null || isRecord(r[k]))
+    && lists.every(k => r[k] === undefined || (Array.isArray(r[k]) && (r[k] as unknown[]).every(isRecord)));
+}
+
 export function readWhoopCache(path: string): { raw: WhoopRaw; fetchedAt: number; series: StrainSeries | null } | null {
   let parsed: Partial<CacheFile>;
   try {
@@ -89,7 +106,7 @@ export function readWhoopCache(path: string): { raw: WhoopRaw; fetchedAt: number
     return null;
   }
   const fetchedAt = Date.parse(parsed.fetched_at ?? "");
-  if (parsed.schema !== 1 || !parsed.raw || typeof parsed.raw !== "object" || !Number.isFinite(fetchedAt)) return null;
+  if (parsed.schema !== 1 || !validRaw(parsed.raw) || !Number.isFinite(fetchedAt)) return null;
   return { raw: parsed.raw, fetchedAt, series: validSeries(parsed.strain_series) };
 }
 
@@ -132,6 +149,9 @@ export class WhoopService {
   private timer: NodeJS.Timeout | null = null;
   private polling: Promise<void> | null = null;
   private refreshing: Promise<string> | null = null;
+  /* Set while the rotated pair in this.creds could not be written: the
+     refresh token it replaced, which is what the file still holds. */
+  private unsavedFrom: string | null = null;
   private loggedOk = false;
   private started = false;
   private stopped = false;
@@ -163,10 +183,15 @@ export class WhoopService {
     void this.pollNow();
   }
 
-  stop(): void {
+  /* Resolves once a token refresh in flight has finished (its new pair on
+     disk, or failed); no new refresh starts after this. Never rejects. The
+     daemon awaits it, bounded, before exiting, so a SIGTERM mid-refresh does
+     not throw away a pair WHOOP has already rotated. */
+  stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     this.nextPollAt = null;
+    return Promise.allSettled([this.refreshing]).then(() => undefined);
   }
 
   summary(): WhoopSummary {
@@ -198,13 +223,20 @@ export class WhoopService {
   private schedule(): void {
     if (!this.started || this.stopped) return;
     if (this.timer) clearTimeout(this.timer);
-    const s = this.summary();
+    /* Whatever the data looks like, the timer must be re-armed. */
+    let recoveryScoredToday = false;
+    try {
+      const s = this.summary();
+      recoveryScoredToday = s.recovery.state === "scored" && s.recovery.is_current_cycle;
+    } catch (err) {
+      this.opts.log(`whoop summary failed while scheduling: ${err instanceof Error ? err.message : String(err)}`);
+    }
     const delay = pollDelayMs({
       auth: this.auth,
       lastPollOk: this.lastPollOk,
       failures: this.failures,
       retryAfterMs: this.retryAfterMs,
-      recoveryScoredToday: s.recovery.state === "scored" && s.recovery.is_current_cycle,
+      recoveryScoredToday,
       now: new Date(),
     }, this.timing);
     this.nextPollAt = Date.now() + delay;
@@ -237,11 +269,15 @@ export class WhoopService {
   }
 
   /* The cheap per-tick check: one stat, and a re-read only when the file is
-     not the one last read (whoop-auth ran, logout, a hand edit). A changed
-     file also clears reauth_required, so a fresh login resumes polling. */
+     not the one last read (whoop-auth ran, logout, a hand edit) or the last
+     read failed (auth "error": an EMFILE, or a permission since fixed). A
+     changed file also clears reauth_required, so a fresh login resumes
+     polling. Skipped while a rotated pair is unsaved: the file holds the
+     dead pair it replaced. */
   private async syncCredentials(): Promise<void> {
+    if (this.unsavedFrom !== null) return;
     const sig = credentialsSignature(this.opts.credentialsPath);
-    if (sig === this.credsSig) return;
+    if (sig === this.credsSig && this.auth !== "error") return;
     this.credsSig = sig;
     const before = this.auth;
     try {
@@ -270,6 +306,8 @@ export class WhoopService {
 
   private refresh(stale: string): Promise<string> {
     if (!this.refreshing) {
+      /* A plain Error: transient, and the next daemon refreshes instead. */
+      if (this.stopped) return Promise.reject(new Error("whoop service stopping; refresh skipped"));
       const run = this.doRefresh(stale).finally(() => { if (this.refreshing === run) this.refreshing = null; });
       this.refreshing = run;
     }
@@ -279,7 +317,7 @@ export class WhoopService {
   private doRefresh(stale: string): Promise<string> {
     const path = this.opts.credentialsPath;
     return withCredentialsLock(path, async () => {
-      const disk = await loadCredentials(path);
+      const disk = this.unsavedFrom !== null ? await this.persistUnsaved() : await loadCredentials(path);
       if (!hasTokens(disk)) throw new TokenError("credentials file has no refresh token", "reauth", 0);
       /* Someone else (another process, or a fresh whoop-auth login) rotated
          the pair since this process last read it. Spending our copy of the
@@ -297,18 +335,62 @@ export class WhoopService {
         base: this.oauthBase,
       });
       const next = applyTokens(disk, tokens);
-      /* Persist before use: the old refresh token is already dead. */
-      await saveCredentials(path, next);
+      /* Persist before use: the old refresh token is already dead, which is
+         also why a failed write keeps the new pair in memory rather than
+         dropping it (see persist). */
       this.creds = next;
-      this.credsSig = credentialsSignature(path);
       this.opts.log(`whoop: token refreshed, expires ${next.expires_at}`);
+      await this.persist(next, disk.refresh_token);
       return tokens.access_token;
     });
+  }
+
+  /* Write a rotated pair. On failure (ENOSPC, EACCES) keep it in memory as
+     the only live pair and leave credsSig alone, so the stale file is never
+     re-adopted; every poll retries the write under the lock. A restart before
+     it lands means a re-login, which is still better than losing it now. */
+  private async persist(next: WhoopCredentials, replaced: string): Promise<void> {
+    const path = this.opts.credentialsPath;
+    try {
+      await saveCredentials(path, next);
+      this.credsSig = credentialsSignature(path);
+      if (this.unsavedFrom !== null) this.opts.log("whoop: rotated tokens saved");
+      this.unsavedFrom = null;
+    } catch (err) {
+      this.unsavedFrom = replaced;
+      this.opts.log(`whoop: COULD NOT SAVE the rotated tokens to ${path} (${err instanceof Error ? err.message : String(err)}); `
+        + "using them from memory and retrying every poll. A restart before the save lands needs whoop-auth.");
+    }
+  }
+
+  /* Caller holds the credentials lock. While the file still holds the pair
+     this process rotated away from, the in-memory pair is the live one: write
+     it. A file that has moved on since (a login, a logout) wins and is
+     returned for the caller to adopt. Never throws: an unreadable file keeps
+     the in-memory pair. */
+  private async persistUnsaved(): Promise<WhoopCredentials | null> {
+    const replaced = this.unsavedFrom;
+    let disk: WhoopCredentials | null;
+    try {
+      disk = await loadCredentials(this.opts.credentialsPath);
+    } catch {
+      return this.creds;
+    }
+    if (replaced !== null && hasTokens(this.creds) && disk?.refresh_token === replaced) {
+      await this.persist(this.creds, replaced);
+      return this.creds;
+    }
+    this.unsavedFrom = null;
+    return disk;
   }
 
   /* ---------- polling ---------- */
 
   private async poll(): Promise<void> {
+    if (this.unsavedFrom !== null) {
+      await withCredentialsLock(this.opts.credentialsPath, () => this.persistUnsaved())
+        .catch(err => this.opts.log(`whoop: saving the rotated tokens failed again: ${err instanceof Error ? err.message : String(err)}`));
+    }
     await this.syncCredentials();
     if (this.auth !== "ok") {
       this.lastPollOk = false;

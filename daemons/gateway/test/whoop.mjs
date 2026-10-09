@@ -25,19 +25,25 @@
         survives a new instance; fallback through the real API calls; five
         requests a poll; the strain series through real polls (append on
         change, survives a new instance via the cache, reset on a new cycle,
-        cap 400 from a full cached series)
+        cap 400 from a full cached series); regressions: a stale lock
+        reclaimed by three waiters at once never has two holders, a holder
+        only releases its own lock, a rotated pair whose save fails is kept
+        and saved on the next poll, stop() waits for a refresh in flight, a
+        429 with no X-RateLimit-Reset backs off 60 s, a permission or EMFILE
+        read error heals without a restart, a malformed cache is ignored
      4. The real GatewayServer on an ephemeral 127.0.0.1 port: the read-only
         token works on GET /whoop/summary only (401 on /health, /whoop/poll,
         /apple-health/status), the main token works on both WHOOP routes
      5. whoop-auth end to end, the test playing the browser: set-client from
         stdin, login with a wrong-state redirect rejected and the right one
         accepted, the gateway poked, status, a pasted-URL login with the
-        gateway down, a refused authorization, logout
+        gateway down, a refused authorization, Ctrl+C in a pty cancels the
+        wait for the redirect, logout
 
    Usage: node daemons/gateway/test/whoop.mjs */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, promises as fsp, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -325,7 +331,7 @@ const fakeServer = createServer(async (req, res) => {
   if (!fake.access.has((req.headers.authorization ?? "").replace(/^Bearer /, ""))) return send(401, { error: "unauthorized" });
   if (fake.rateLimit > 0) {
     fake.rateLimit--;
-    return send(429, { error: "too_many_requests" }, { "X-RateLimit-Reset": fake.rateReset });
+    return send(429, { error: "too_many_requests" }, fake.rateReset === null ? {} : { "X-RateLimit-Reset": fake.rateReset });
   }
   /* Collections honor ?limit= (WHOOP's default page is 10). */
   const limit = Number(url.searchParams.get("limit") ?? 10);
@@ -424,6 +430,77 @@ try {
     { calls: fake.refreshCalls - r0, auth: results.map(x => x.auth) });
   check(logs.some(l => /adopted tokens/.test(l)), "the losers log that they adopted the rotated tokens");
 
+  /* A stale lock (holder killed) reclaimed by three waiters at once: never
+     two holders inside, over many trials. */
+  const lockPath = H.lockPathFor(credPath);
+  let maxHolders = 0;
+  for (let trial = 0; trial < 50; trial++) {
+    writeFileSync(lockPath, "99999 dead\n");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old);
+    let holders = 0;
+    await Promise.all(Array.from({ length: 3 }, () => H.withCredentialsLock(credPath, async () => {
+      holders++;
+      maxHolders = Math.max(maxHolders, holders);
+      await sleep(20);
+      holders--;
+    })));
+  }
+  check(maxHolders === 1 && !existsSync(lockPath) && !existsSync(`${lockPath}.reclaim`),
+    "a stale lock reclaimed by three waiters at once: one holder at a time (50 trials), nothing left behind", maxHolders);
+  await H.withCredentialsLock(credPath, async () => {
+    rmSync(lockPath);
+    writeFileSync(lockPath, "someone else\n");
+  });
+  check(existsSync(lockPath) && readFileSync(lockPath, "utf8") === "someone else\n", "a holder whose lock was replaced leaves the new one alone on release");
+  rmSync(lockPath, { force: true });
+
+  /* A rotated pair whose save fails (ENOSPC) stays in use, and the next poll
+     writes it: no second refresh, so no invalid_grant. */
+  await H.saveCredentials(credPath, { ...readCreds(), expires_at: new Date(Date.now() + 60_000).toISOString() });
+  const preSave = readCreds();
+  const realWriteFile = fsp.writeFile;
+  let failedWrites = 0;
+  fsp.writeFile = async (p, ...rest) => {
+    if (typeof p === "string" && p.startsWith(`${credPath}.`) && p.endsWith(".tmp") && failedWrites === 0) {
+      failedWrites++;
+      throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+    }
+    return realWriteFile(p, ...rest);
+  };
+  r0 = fake.refreshCalls;
+  try {
+    sum = await svc.pollNow();
+  } finally {
+    fsp.writeFile = realWriteFile;
+  }
+  check(failedWrites === 1 && fake.refreshCalls - r0 === 1 && sum.auth === "ok" && !sum.stale && readCreds().refresh_token === preSave.refresh_token
+    && logs.some(l => /COULD NOT SAVE/.test(l)), "a failed save after a refresh: the new pair is used from memory, the poll succeeds",
+    { failedWrites, calls: fake.refreshCalls - r0, sum });
+  sum = await svc.pollNow();
+  check(fake.refreshCalls - r0 === 1 && sum.auth === "ok" && !sum.stale && readCreds().refresh_token === `ref-${fake.n}` && mode(credPath) === 0o600
+    && !existsSync(lockPath), "the next poll saves the kept pair, with no second token call",
+    { calls: fake.refreshCalls - r0, disk: readCreds().refresh_token, sum });
+
+  /* stop() waits for a refresh in flight, so its rotated pair reaches disk;
+     no refresh starts after it. */
+  const svcStop = service();
+  await H.saveCredentials(credPath, { ...readCreds(), expires_at: new Date(Date.now() + 60_000).toISOString() });
+  fake.tokenDelayMs = 400;
+  r0 = fake.refreshCalls;
+  const tokenPosts = fake.tokenContentTypes.length;
+  const inflight = svcStop.pollNow();
+  while (fake.tokenContentTypes.length === tokenPosts) await sleep(5);
+  await svcStop.stop();
+  check(fake.refreshCalls - r0 === 1 && readCreds().refresh_token === `ref-${fake.n}` && !existsSync(lockPath),
+    "stop() resolves only after the refresh in flight has saved its pair and released the lock", { calls: fake.refreshCalls - r0, disk: readCreds() });
+  await inflight;
+  fake.tokenDelayMs = 40;
+  await H.saveCredentials(credPath, { ...readCreds(), expires_at: new Date(Date.now() + 60_000).toISOString() });
+  r0 = fake.refreshCalls;
+  sum = await svcStop.pollNow();
+  check(fake.refreshCalls === r0 && /stopping/.test(sum.last_error ?? ""), "after stop(), no new refresh starts", { calls: fake.refreshCalls - r0, sum });
+
   /* 429: a tiny reset is waited out inline; a long one backs off. */
   fake.rateLimit = 1;
   fake.rateReset = "0.2";
@@ -436,6 +513,15 @@ try {
   sum = await svc.pollNow();
   check(sum.auth === "ok" && sum.stale === true && /rate limited/.test(sum.last_error ?? "") && sum.recovery.score === 72,
     "a 429 resetting in an hour is not waited inline: stale, cached data still served", sum);
+  for (const reset of [null, ""]) {
+    fake.rateLimit = 1;
+    fake.rateReset = reset;
+    fake.hits.length = 0;
+    sum = await svc.pollNow();
+    check(/rate limited for 60 s/.test(sum.last_error ?? "") && fake.hits.length === 1,
+      `a 429 with ${reset === null ? "no" : "an empty"} X-RateLimit-Reset assumes the 60 s window: no immediate retries`, { hits: fake.hits, err: sum.last_error });
+  }
+  fake.rateReset = "0.2";
   fake.rateLimit = 0;
 
   /* Pending / missing / unscorable through the real calls. */
@@ -535,6 +621,55 @@ try {
   const svcBad = service({ credentialsPath: badPath });
   sum = await svcBad.pollNow();
   check(sum.auth === "error" && /not valid JSON/.test(sum.last_error ?? ""), "malformed credentials: auth error with the reason", sum);
+
+  /* An unreadable file (a sudo login left it root-owned) heals once fixed:
+     chmod changes only ctime, and auth "error" re-reads every tick. */
+  const permPath = join(tmp, "perm", "credentials.json");
+  await seedCreds(permPath);
+  chmodSync(permPath, 0o000);
+  const svcPerm = service({ credentialsPath: permPath, cachePath: join(tmp, "perm", "cache.json") });
+  const permBefore = svcPerm.summary().auth;
+  chmodSync(permPath, 0o600);
+  sum = await svcPerm.pollNow();
+  check(permBefore === "error" && sum.auth === "ok" && !sum.stale, "an unreadable credentials file: auth error, then ok on the next poll after chmod 600",
+    { permBefore, sum });
+
+  /* A transient read error (EMFILE) inside the refresh heals on the next poll. */
+  await H.saveCredentials(credPath, { ...readCreds(), expires_at: new Date(Date.now() + 60_000).toISOString() });
+  const realReadFile = fsp.readFile;
+  let failedReads = 0;
+  fsp.readFile = async (p, ...rest) => {
+    if (p === credPath && existsSync(lockPath) && failedReads === 0) {
+      failedReads++;
+      throw Object.assign(new Error("EMFILE: too many open files, open"), { code: "EMFILE" });
+    }
+    return realReadFile(p, ...rest);
+  };
+  let emfile;
+  try {
+    emfile = await svc.pollNow();
+  } finally {
+    fsp.readFile = realReadFile;
+  }
+  sum = await svc.pollNow();
+  check(failedReads === 1 && emfile.auth === "error" && sum.auth === "ok" && !sum.stale && sum.last_error === null,
+    "one EMFILE reading the credentials during a refresh: the next poll recovers without a restart", { failedReads, first: emfile.auth, sum });
+
+  /* A malformed cache (an old dev build, a hand edit) is ignored, so the
+     summary and the poll loop keep working. */
+  const badCache = join(tmp, "badcache", "whoop-cache.json");
+  mkdirSync(dirname(badCache), { recursive: true });
+  writeFileSync(badCache, JSON.stringify({ schema: 1, fetched_at: new Date().toISOString(), raw: { cycle: null, recoveries: {} } }));
+  check(H.readWhoopCache(badCache) === null, "a cache whose collections are not arrays of objects is rejected");
+  const svcBadCache = service({ credentialsPath: join(tmp, "nocreds", "credentials.json"), cachePath: badCache });
+  let badThrew = null;
+  try { svcBadCache.summary(); } catch (err) { badThrew = err; }
+  svcBadCache.start();
+  await sleep(150);
+  const badNext = Date.parse(svcBadCache.summary().next_poll_at ?? "");
+  check(badThrew === null && Number.isFinite(badNext) && badNext > Date.now(), "a malformed cache: the summary answers and the next poll is scheduled",
+    { badThrew: String(badThrew), next: svcBadCache.summary().next_poll_at });
+  await svcBadCache.stop();
 
   /* start() schedules; stop() clears. */
   svc.start();
@@ -726,6 +861,28 @@ try {
     check(denied.status === 400 && code === 1 && /refused the authorization: access_denied/.test(refused.err), "error=access_denied ends the login with exit 1",
       { code, err: refused.err });
     check(readCreds(cliCred).access_token === `acc-${fake.n}`, "a refused login leaves the saved tokens alone");
+
+    /* Ctrl+C at the redirect wait, in a real pty (python3's pty module;
+       readline has the terminal in raw mode, so it arrives as a keypress):
+       the login is cancelled with exit 1, not left waiting 5 minutes. */
+    const python = await new Promise(r => spawn("python3", ["-c", "import pty"]).on("close", c => r(c === 0)).on("error", () => r(false)));
+    if (python) {
+      const child = spawn("python3", ["-c", "import pty, sys; sys.exit(pty.spawn(sys.argv[1:]) >> 8)", process.execPath, cliPath, "login"],
+        { env: cliEnv(), stdio: ["pipe", "pipe", "pipe"] });
+      let ptyOut = "";
+      child.stdout.on("data", d => { ptyOut += d; });
+      const ptyDone = new Promise(r => child.on("close", c => r(c)));
+      const end = Date.now() + 10_000;
+      while (!/Waiting for the redirect/.test(ptyOut) && Date.now() < end) await sleep(20);
+      await sleep(200);
+      child.stdin.write("\x03");
+      code = await Promise.race([ptyDone, sleep(5_000).then(() => "timeout")]);
+      if (code === "timeout") child.kill("SIGKILL");
+      check(code === 1 && /whoop-auth: cancelled/.test(ptyOut), "Ctrl+C in a pty while waiting for the redirect cancels the login (exit 1)",
+        { code, out: ptyOut.slice(-300) });
+    } else {
+      console.log("SKIP  Ctrl+C in a pty (no python3)");
+    }
 
     /* logout */
     const logout = runCli(["logout"]);

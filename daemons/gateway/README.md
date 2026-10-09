@@ -175,7 +175,7 @@ effect without a restart.
 
 Tokens: only the daemon refreshes. WHOOP refresh tokens rotate and are single
 use, so every refresh happens under a lock file next to the credentials
-(`credentials.lock`, stale after 30 s), re-reads the file first and adopts a
+(`credentials.lock`, stale after 30 s without a touch), re-reads the file first and adopts a
 pair another writer already rotated, and writes the new pair to disk before
 using it. Refreshes happen 5 minutes before expiry and once on a 401. A refused
 grant (`invalid_grant`, or a 400/401 from the token endpoint) stops retries
@@ -265,7 +265,7 @@ fronting it this way.
 | `daemons/gateway/dist/apple-health.js` | Read-only `apple-health` CLI, symlinked as `~/.local/bin/apple-health` |
 | `~/.config/vault-gateway/whoop-read-token` | WHOOP read-only token, mode 600 |
 | `~/.config/whoop/credentials.json` | WHOOP client id/secret, redirect URI, access and refresh tokens, expiry (mode 600, directory 700). Written by temp file plus rename |
-| `~/.config/whoop/credentials.lock` | Present only while a writer holds the credentials lock; treated as stale after 30 s |
+| `~/.config/whoop/credentials.lock` | Present only while a writer holds the credentials lock (the holder touches it every 10 s); treated as stale after 30 s without a touch |
 | `~/Library/Application Support/vault-gateway/whoop-cache.json` | Last good WHOOP pull (raw records plus `fetched_at`) and the current cycle's strain series, mode 600 |
 | `daemons/gateway/dist/whoop-auth.js` | `whoop-auth` CLI (optionally symlinked as `~/.local/bin/whoop-auth`) |
 

@@ -32,6 +32,10 @@ const STORE_DIR = ".claude-cli-chat/ios";
    last debounced saves, replay flush) must run well inside that window even
    if some socket keeps http.close() pending. */
 const SERVER_CLOSE_TIMEOUT_MS = 3_000;
+/* Upper bound on waiting for a WHOOP token refresh in flight at shutdown
+   (token POST up to 15 s, but WHOOP has usually rotated the pair by then).
+   Runs alongside the rest of the shutdown, so it stays inside the 20 s. */
+const WHOOP_STOP_TIMEOUT_MS = 12_000;
 
 /* SubprocessManager's TabSession (src/claude/SubprocessManager.ts) traces
    every stream event and stderr chunk through bare `console.log`/
@@ -164,6 +168,19 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log(`${signal} received; shutting down`);
     mirror.set("idle");
+    /* WHOOP refresh tokens are single use: exiting between the token
+       endpoint's answer and the save throws away the only live pair, and
+       leaves the credentials lock behind. Let a refresh in flight finish. */
+    let whoopTimer: NodeJS.Timeout | undefined;
+    const whoopSettled = Promise.race([
+      whoop.stop(),
+      new Promise<void>(resolve => {
+        whoopTimer = setTimeout(() => {
+          log(`whoop token refresh still pending after ${WHOOP_STOP_TIMEOUT_MS} ms; exiting anyway`);
+          resolve();
+        }, WHOOP_STOP_TIMEOUT_MS);
+      }),
+    ]);
     /* Bounded: a hung server.close() must never keep the registry from
        flushing before launchd's SIGKILL. */
     let closeTimer: NodeJS.Timeout | undefined;
@@ -178,6 +195,8 @@ async function main(): Promise<void> {
     ]);
     clearTimeout(closeTimer);
     try { await registry.shutdown(); } catch (err) { log(`shutdown error: ${String(err)}`); }
+    await whoopSettled;
+    clearTimeout(whoopTimer);
     process.exit(0);
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));

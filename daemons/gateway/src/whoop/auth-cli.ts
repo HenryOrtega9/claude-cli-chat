@@ -88,6 +88,9 @@ class Terminal {
   private readonly lines: string[] = [];
   private readonly waiters: ((line: string | null) => void)[] = [];
   private closed = false;
+  /* Ctrl+C in a TTY: readline has the terminal in raw mode, so it arrives
+     as a keypress (readline's SIGINT event), not as a signal. */
+  interrupted = false;
 
   constructor() {
     const gate = new Writable({
@@ -106,9 +109,13 @@ class Terminal {
       this.closed = true;
       for (const waiter of this.waiters.splice(0)) waiter(null);
     });
+    this.rl.on("SIGINT", () => {
+      this.interrupted = true;
+      this.rl.close();
+    });
   }
 
-  /* null once stdin has ended. */
+  /* null once stdin has ended or Ctrl+C was pressed (see interrupted). */
   nextLine(): Promise<string | null> {
     if (this.lines.length > 0) return Promise.resolve(this.lines.shift() as string);
     if (this.closed) return Promise.resolve(null);
@@ -121,7 +128,7 @@ class Terminal {
     const line = await this.nextLine();
     this.muted = false;
     if (hidden && process.stdin.isTTY) process.stdout.write("\n");
-    if (line === null) throw new CliError("stdin closed before an answer was given");
+    if (line === null) throw new CliError(this.interrupted ? "cancelled" : "stdin closed before an answer was given");
     return line.trim();
   }
 
@@ -214,6 +221,9 @@ function waitForCode(opts: { redirect: URL; state: string; term: Terminal }): Pr
     void (async () => {
       for (;;) {
         const line = await opts.term.nextLine();
+        /* Ctrl+C cancels the login; a plain EOF (piped stdin) leaves the
+           HTTP listener waiting. */
+        if (line === null && opts.term.interrupted) return finish(new CliError("cancelled"));
         if (line === null || done) return;
         const text = line.trim();
         if (!text) continue;

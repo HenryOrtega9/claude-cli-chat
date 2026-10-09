@@ -8,12 +8,13 @@
    - every write is a temp file plus rename, so a reader never sees a torn
      blob;
    - every read-modify-write runs under an O_EXCL lock file next to the
-     credentials (credentials.lock), stale after 30 s so a crashed holder
-     cannot wedge it;
+     credentials (credentials.lock), stale after 30 s without a touch so a
+     crashed holder cannot wedge it (a live holder touches it every 10 s);
    - the refresher re-reads the file inside the lock and adopts a token pair
      someone else already rotated instead of spending its stale one. */
 
-import { promises as fs, readFileSync, statSync } from "node:fs";
+import { promises as fs, readFileSync, statSync, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 
@@ -32,6 +33,9 @@ export type WhoopCredentials = {
 export class CredentialsError extends Error {}
 
 const LOCK_STALE_MS = 30_000;
+/* A live holder refreshes the lock's mtime this often, so a slow token POST
+   (15 s plus a retry) is never mistaken for a dead holder. */
+const LOCK_TOUCH_MS = 10_000;
 /* Longer than the stale window, so a waiter always outlives a dead holder. */
 const LOCK_WAIT_MS = 35_000;
 
@@ -106,12 +110,13 @@ export async function saveCredentials(path: string, creds: WhoopCredentials): Pr
 }
 
 /* Identity of the file on disk. Every save is a rename, so the inode changes
-   on each write; mtime and size cover an editor writing in place. null when
-   the file is absent. */
+   on each write; mtime and size cover an editor writing in place, ctime a
+   chmod or chown (fixing a file the daemon could not read). null when the
+   file is absent. */
 export function credentialsSignature(path: string): string | null {
   try {
     const st = statSync(path);
-    return `${st.ino}:${st.mtimeMs}:${st.size}`;
+    return `${st.ino}:${st.mtimeMs}:${st.size}:${st.ctimeMs}`;
   } catch {
     return null;
   }
@@ -121,36 +126,78 @@ export function lockPathFor(path: string): string {
   return `${path.replace(/\.json$/, "")}.lock`;
 }
 
+const sameFile = (a: Stats | null, b: Stats | null) => !!a && !!b && a.ino === b.ino && a.mtimeMs === b.mtimeMs;
+
+/* Remove the lock judged stale as `st`, unless it has changed since: another
+   waiter may already have reclaimed it and created a fresh lock at the same
+   path, and a stat-then-unlink by two reclaimers at once would delete that
+   fresh lock. A tiny O_EXCL guard serializes the check and the unlink. */
+async function reclaimStale(lock: string, st: Stats): Promise<void> {
+  const guard = `${lock}.reclaim`;
+  try {
+    await (await fs.open(guard, "wx", 0o600)).close();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    /* Held for microseconds; one this old was left by a reclaimer that died. */
+    const g = await fs.stat(guard).catch(() => null);
+    if (g && Date.now() - g.mtimeMs > LOCK_STALE_MS) await fs.rm(guard, { force: true }).catch(() => undefined);
+    return;
+  }
+  try {
+    if (sameFile(await fs.stat(lock).catch(() => null), st)) await fs.rm(lock, { force: true });
+  } finally {
+    await fs.rm(guard, { force: true }).catch(() => undefined);
+  }
+}
+
 export async function withCredentialsLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lock = lockPathFor(path);
   await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + LOCK_WAIT_MS;
+  let mine: Stats | null = null;
   for (;;) {
+    let handle: FileHandle | null = null;
     try {
-      const handle = await fs.open(lock, "wx", 0o600);
-      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`);
-      await handle.close();
-      break;
+      handle = await fs.open(lock, "wx", 0o600);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
+    if (handle) {
+      try {
+        mine = await handle.stat();
+        await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`);
+      } catch (err) {
+        /* Never leave a fresh lock (or the fd) behind for a holder that is
+           not going to run. */
+        await handle.close().catch(() => undefined);
+        await fs.rm(lock, { force: true }).catch(() => undefined);
+        throw err;
+      }
+      await handle.close();
+      break;
+    }
     const st = await fs.stat(lock).catch(() => null);
     if (st && Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-      /* Rename aside rather than unlink: of two waiters reclaiming the same
-         stale lock, only one rename succeeds, so the loser cannot delete the
-         fresh lock the winner is about to create. */
-      const aside = `${lock}.stale.${process.pid}.${randomBytes(3).toString("hex")}`;
-      if (await fs.rename(lock, aside).then(() => true, () => false)) await fs.rm(aside, { force: true });
+      await reclaimStale(lock, st);
       continue;
     }
     /* A plain Error, not CredentialsError: contention is transient. */
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${lock}`);
     await new Promise(r => setTimeout(r, 40 + Math.floor(Math.random() * 80)));
   }
+  const touch = setInterval(() => {
+    const now = new Date();
+    void fs.utimes(lock, now, now).catch(() => undefined);
+  }, LOCK_TOUCH_MS);
+  touch.unref();
   try {
     return await fn();
   } finally {
-    await fs.rm(lock, { force: true }).catch(() => undefined);
+    clearInterval(touch);
+    /* Only our own lock: if it was reclaimed anyway, the path is someone
+       else's now. */
+    const cur = await fs.stat(lock).catch(() => null);
+    if (cur && cur.ino === mine?.ino) await fs.rm(lock, { force: true }).catch(() => undefined);
   }
 }
 

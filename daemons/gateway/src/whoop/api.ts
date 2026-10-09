@@ -164,7 +164,10 @@ export class WhoopApi {
         continue;
       }
       if (res.status === 429) {
-        const reset = Number(res.headers.get("x-ratelimit-reset"));
+        /* Number(null) and Number("") are 0, which would read a missing
+           header as "resets now" and retry at once. */
+        const header = res.headers.get("x-ratelimit-reset");
+        const reset = header !== null && header.trim() !== "" ? Number(header) : NaN;
         const waitMs = Number.isFinite(reset) && reset >= 0 ? Math.ceil(reset * 1000) : DEFAULT_RATE_WAIT_MS;
         if (rateWaits < 2 && waitMs <= maxWait) {
           rateWaits++;

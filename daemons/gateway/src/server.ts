@@ -169,7 +169,8 @@ export class GatewayServer {
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.resolve(null); }
     this.waiters.clear();
     this.appleHealth.close();
-    this.deps.whoop?.stop();
+    /* Timers only; main awaits the in-flight token refresh, bounded. */
+    void this.deps.whoop?.stop();
     await new Promise<void>(resolve => this.http.close(() => resolve()));
   }
 
