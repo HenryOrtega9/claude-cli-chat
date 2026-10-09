@@ -1,4 +1,4 @@
-import { FileSystemAdapter, ItemView, WorkspaceLeaf } from "obsidian";
+import { Component, FileSystemAdapter, ItemView, WorkspaceLeaf } from "obsidian";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import type ClaudeChatPlugin from "../main";
@@ -291,14 +291,18 @@ export class ClaudeChatView extends ItemView {
     }
     /* Bypass per-tab saveIndex writes during the restore loop — each
        createTab + selectTab pair would otherwise trigger TWO index writes
-       per restored tab. We do one write at the very end instead. */
+       per restored tab. We do one write at the very end instead. Restored
+       tabs mount hidden and only the final pick is shown: show() starts a
+       tab's deferred history replay, so selecting each one in turn replayed
+       every conversation at load. */
     for (const entry of index.tabs) {
       const state = await this.plugin.persistence.loadTab(entry.id);
-      this.createTab(state ?? undefined, { skipSave: true });
+      this.createTab(state ?? undefined, { skipSave: true, select: false });
     }
-    if (index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)) {
-      this.selectTab(index.activeTabId, { skipSave: true });
-    }
+    const target = index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)
+      ? index.activeTabId
+      : this.tabs[this.tabs.length - 1]?.state.id;
+    if (target) this.selectTab(target, { skipSave: true });
     this.saveIndex();
   }
 
@@ -337,7 +341,11 @@ export class ClaudeChatView extends ItemView {
     /* Await every tab's destroy() so any in-flight SIGTERM → process-exit
        handshake completes before Obsidian moves on. Without the await, the
        plugin can unload while `claude --remote-control` children are still
-       in the middle of shutting down, leaking them as PPID=1 orphans. */
+       in the middle of shutting down, leaking them as PPID=1 orphans.
+       Flush each composer's draft debounce first, while the controllers'
+       onStateChange callback is still live, so the pending draft reaches
+       scheduleSaveTab ahead of the plugin's persistence flush. */
+    for (const t of this.tabs) t.flushDraft();
     await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs = [];
     /* Surrender the process-local slot first, but only if WE own it. A
@@ -355,7 +363,20 @@ export class ClaudeChatView extends ItemView {
     this.createTab();
   }
 
-  private createTab(state?: TabState, opts: { skipSave?: boolean; incognito?: boolean } = {}) {
+  /* Duck-typed hook MessageListRenderer looks for on its render lifecycle
+     (this view, threaded through TabController). Each bubble's markdown pass
+     renders into its own child Component so the embeds and post-processor
+     children MarkdownRenderer attaches can be unloaded when the bubble
+     re-renders or goes away, instead of piling up on the view. */
+  createRenderScope(): { lifecycle: Component; dispose(): void } {
+    const child = this.addChild(new Component());
+    return { lifecycle: child, dispose: () => this.removeChild(child) };
+  }
+
+  private createTab(
+    state?: TabState,
+    opts: { skipSave?: boolean; incognito?: boolean; select?: boolean } = {},
+  ) {
     const controller = new TabController(
       this.plugin,
       this.tabsContainer,
@@ -378,7 +399,8 @@ export class ClaudeChatView extends ItemView {
     controller.onForkRequest = (src, messageId) => this.forkFromMessage(src, messageId);
     controller.onIncognitoToggle = (tabId, incognito) => this.onIncognitoToggle(tabId, incognito);
     this.tabs.push(controller);
-    this.selectTab(controller.state.id, { skipSave: true });
+    if (opts.select === false) controller.hide();
+    else this.selectTab(controller.state.id, { skipSave: true });
     if (!opts.skipSave) {
       this.saveIndex();
       /* Tabs created with pre-populated history (fork, History-modal reopen)

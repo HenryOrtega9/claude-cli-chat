@@ -129,9 +129,24 @@ export class AgentDetailView {
 
     const truncated = tool.nestedTruncatedCount ?? 0;
     const events = tool.nestedEvents ?? [];
-    /* A trim shifts every index, a degraded/live flip changes the transcript's
-       whole shape, and a shrunken buffer means our cursor is meaningless —
-       all three are cheaper to handle by rebuilding than by patching. */
+    /* Once a busy agent passes NESTED_EVENTS_CAP every append also trims the
+       head of the buffer, so a pure trim is the steady state, not an edge
+       case. Drop the same number of leading rows in place instead of
+       rebuilding ~200 rows (and collapsing whatever the user expanded) on
+       every update. */
+    const trimmed = truncated - this.renderedTruncatedCount;
+    if (
+      trimmed > 0 &&
+      !this.renderedDegraded &&
+      !this.isDegraded(tool) &&
+      trimmed <= this.renderedEventCount &&
+      events.length >= this.renderedEventCount - trimmed
+    ) {
+      this.trimLeadingEvents(trimmed, truncated);
+    }
+    /* A degraded/live flip changes the transcript's whole shape, and any
+       other trim or a shrunken buffer means our cursor is meaningless —
+       those are cheaper to handle by rebuilding than by patching. */
     if (
       this.isDegraded(tool) !== this.renderedDegraded ||
       truncated !== this.renderedTruncatedCount ||
@@ -260,6 +275,33 @@ export class AgentDetailView {
     this.renderedTruncatedCount = truncated;
 
     this.syncResult(tool);
+  }
+
+  /* Removes the first `count` rendered event rows (the ones the tracker just
+     sliced off the buffer) and brings the "+N earlier events dropped" banner
+     up to date, leaving every surviving row and its expand state alone. */
+  private trimLeadingEvents(count: number, truncated: number): void {
+    const rows = this.transcriptEl.querySelectorAll<HTMLElement>(":scope > .claudian-agent-detail-event");
+    if (rows.length !== this.renderedEventCount) return;
+    for (let i = 0; i < count; i++) {
+      const row = rows[i];
+      const id = row.querySelector<HTMLElement>(".claudian-agent-detail-event-tool")?.getAttribute("data-event-id");
+      if (id && this.toolRowEls.get(id) === row) {
+        this.toolRowEls.delete(id);
+        this.toolRowKeys.delete(id);
+      }
+      row.remove();
+    }
+    let banner = this.transcriptEl.querySelector<HTMLElement>(":scope > .claudian-agent-detail-truncated");
+    if (!banner) {
+      banner = createDiv({ cls: "claudian-agent-detail-truncated" });
+      const promptEl = this.transcriptEl.querySelector(":scope > .claudian-agent-detail-prompt");
+      if (promptEl) promptEl.after(banner);
+      else this.transcriptEl.prepend(banner);
+    }
+    banner.setText(`+${truncated} earlier events dropped`);
+    this.renderedEventCount -= count;
+    this.renderedTruncatedCount = truncated;
   }
 
   private appendEvent(evt: NestedSubagentEvent): void {

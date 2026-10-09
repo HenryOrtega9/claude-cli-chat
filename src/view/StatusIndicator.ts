@@ -62,7 +62,9 @@ export class StatusIndicator {
   private wordTimer: number | null = null;
   private countdownTimer: number | null = null;
   private watchdogTimer: number | null = null;
-  private mode: "idle" | "thinking" | "retrying" | "agents" = "idle";
+  /* "stalled" = a thinking spinner the watchdog hid. Kept distinct from
+     "idle" so the next heartbeat can bring the spinner back. */
+  private mode: "idle" | "thinking" | "stalled" | "retrying" | "agents" = "idle";
 
   /* Inactivity ceiling for the thinking spinner. Each inbound CLI event kicks
      this via heartbeat(), so it measures silence-since-last-event, not total
@@ -118,6 +120,13 @@ export class StatusIndicator {
      each take 30s+ — keeps the pill alive instead of tripping the watchdog
      mid-turn. No-op unless a thinking spinner is currently showing. */
   heartbeat() {
+    /* The watchdog hid the pill, but the turn was only quiet, not wedged
+       (e.g. a build that printed nothing for 2+ minutes). Restore the
+       spinner, which re-arms the watchdog. */
+    if (this.mode === "stalled") {
+      this.setThinking();
+      return;
+    }
     if (this.mode !== "thinking") return;
     /* Throttle only while a watchdog is actually armed. With no timer
        pending (suspendWatchdog() during an approval, or a fired watchdog)
@@ -142,6 +151,10 @@ export class StatusIndicator {
       this.watchdogTimer = null;
       this.root.setAttribute("title", "(status timed out — no CLI activity in 120s)");
       this.hide();
+      /* hide() lands in idle; mark it stalled instead so heartbeat() can
+         revive the spinner. hide(), setRetrying() and setAgentsRunning()
+         all overwrite this, so turn end still ends in idle. */
+      this.mode = "stalled";
     }, StatusIndicator.WATCHDOG_MS);
   }
 

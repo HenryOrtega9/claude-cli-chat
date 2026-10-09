@@ -48,6 +48,11 @@ function resolveElectronFilePath(file: File): string {
   return "";
 }
 
+/* Model keys that are routing aliases rather than versions. The picker
+   shows them as their own rows instead of folding them behind a family's
+   "Older versions" chevron. */
+const MODEL_ALIAS_KEYS = new Set<ModelKey>(["opus-plan"]);
+
 /* True on hosts whose primary input is a finger (the iOS app), false in
    Obsidian on the desktop. Used only to decide whether a control needs a
    touch-reachable equivalent of a keyboard-only affordance; evaluated once
@@ -486,6 +491,12 @@ export class InputBox {
   private currentMode: PermissionMode;
   private busy = false;
   private attachments: Attachment[] = [];
+  /* Bumped only by submit(). The async attach paths (addFiles, handlePaste)
+     snapshot it before decoding so a file that finishes after its message
+     was sent doesn't ride on the next turn. Array identity can't serve:
+     restoreContext() also rebinds this.attachments, for a draft that is
+     still live. */
+  private attachGeneration = 0;
   /* The active editor selection captured by SelectionTracker. Lives across
      keystrokes so the user can type a question without losing context. */
   private currentSelection: ActiveSelection | null = null;
@@ -854,6 +865,10 @@ export class InputBox {
        pill toggles it; an outside click or Escape closes it. */
     this.costPill.addEventListener("click", e => {
       e.stopPropagation();
+      /* anchorPopup's outside-click handler ignores toolbar pills, so an
+         open model/effort/mode/attach popup would otherwise stay up under
+         this one. */
+      if (this.openPopup) this.closePopup();
       if (this.costPopup && this.costPopup.style.display !== "none") {
         this.closeCostPopupNow();
       } else {
@@ -1097,7 +1112,9 @@ export class InputBox {
         this.closeCostPopupNow();
       };
       const keydown = (e: KeyboardEvent) => {
-        if (e.key === "Escape") this.closeCostPopupNow();
+        /* preventDefault marks the key consumed, so the desktop shell's
+           window-level Escape handler does not also hide the panel. */
+        if (e.key === "Escape") { e.preventDefault(); this.closeCostPopupNow(); }
       };
       this.costPopupDismiss = { mousedown, keydown };
       document.addEventListener("mousedown", mousedown);
@@ -1462,6 +1479,7 @@ export class InputBox {
   }
 
   private toggleModePopup() {
+    this.closeCostPopupNow();
     if (this.openPopup) {
       const wasMode = this.openPopup.el.classList.contains("claudian-popup-mode");
       this.closePopup();
@@ -1497,6 +1515,7 @@ export class InputBox {
   }
 
   private toggleModelPopup() {
+    this.closeCostPopupNow();
     if (this.openPopup) {
       const wasModel = this.openPopup.el.classList.contains("claudian-popup-model");
       this.closePopup();
@@ -1514,8 +1533,18 @@ export class InputBox {
            applying to every row in the group, not just one model. */
         popup.createDiv({ cls: "claudian-popup-header-note", text: group.note });
       }
-      const [latest, ...older] = group.keys;
-      const row = this.renderModelRow(popup, latest);
+      /* Routing aliases (opus-plan) are not older versions, so they stay
+         visible as their own rows under the latest model. */
+      const rest = group.keys.slice(1);
+      const older = rest.filter(k => !MODEL_ALIAS_KEYS.has(k));
+      const aliases = rest.filter(k => MODEL_ALIAS_KEYS.has(k));
+      const row = this.renderModelRow(popup, group.keys[0]);
+      for (const key of aliases) {
+        const aliasRow = this.renderModelRow(popup, key);
+        if (!TOUCH_PRIMARY) {
+          aliasRow.addEventListener("mouseenter", () => this.scheduleModelFamily(popup, () => this.closeModelFamily(popup)));
+        }
+      }
       if (older.length === 0) {
         if (!TOUCH_PRIMARY) {
           row.addEventListener("mouseenter", () => this.scheduleModelFamily(popup, () => this.closeModelFamily(popup)));
@@ -1533,8 +1562,14 @@ export class InputBox {
       more.addEventListener("click", e => {
         e.stopPropagation();
         this.cancelModelFamilyTimer();
-        if (this.modelFamilyOpen === group.header) this.closeModelFamily(popup);
-        else this.openModelFamily(popup, row, group.header, older);
+        if (this.modelFamilyOpen === group.header) {
+          /* On a pointer host hovering the row already opened the menu
+             before the click lands, so a toggle here would close what the
+             user is reaching for. Hovering another family or closing the
+             picker still dismisses it; only touch hosts toggle. */
+          if (!TOUCH_PRIMARY) return;
+          this.closeModelFamily(popup);
+        } else this.openModelFamily(popup, row, group.header, older);
       });
       /* Desktop hover opens the side menu. The short delay lets the cursor
          cut diagonally across a neighboring row on its way into the menu
@@ -1671,6 +1706,7 @@ export class InputBox {
   }
 
   private toggleEffortPopup() {
+    this.closeCostPopupNow();
     if (this.openPopup) {
       const wasEffort = this.openPopup.el.classList.contains("claudian-popup-effort");
       this.closePopup();
@@ -1705,6 +1741,7 @@ export class InputBox {
      Toggling the same + click again closes the popup (true toggle, same
      contract as the toolbar pills). */
   private toggleAttachPopup() {
+    this.closeCostPopupNow();
     if (this.openPopup) {
       const wasAttach = this.openPopup.el.classList.contains("claudian-popup-attach");
       this.closePopup();
@@ -1714,6 +1751,7 @@ export class InputBox {
   }
 
   private openAttachPopup() {
+    this.closeCostPopupNow();
     if (this.openPopup) this.closePopup();
     const popup = this.createPopup("claudian-popup-attach");
 
@@ -2242,10 +2280,9 @@ export class InputBox {
     const files = imageItems
       .map(it => it.getAsFile())
       .filter((f): f is File => f !== null);
-    /* Snapshot the array identity so a submit() that lands mid-decode (which
-       rebinds this.attachments to a fresh array for the next message) doesn't
-       cause the decoded image to ride on the next turn. */
-    const target = this.attachments;
+    /* Snapshot the submit generation so a submit() that lands mid-decode
+       doesn't cause the decoded image to ride on the next turn. */
+    const generation = this.attachGeneration;
     for (const file of files) {
       /* Same cap addFiles enforces for the picker/drop paths. Without it a
          huge pasted image base64-inflates into one stream-json stdin line
@@ -2260,7 +2297,11 @@ export class InputBox {
       try {
         const buf = await file.arrayBuffer();
         const img = await toApiImage(new Uint8Array(buf), file.type);
-        if (this.destroyed || this.attachments !== target) return;
+        if (this.destroyed) return;
+        if (this.attachGeneration !== generation) {
+          platform.notify("Pasted image not attached (message already sent)");
+          return;
+        }
         this.attachments.push({ kind: "image", mediaType: img.mediaType, data: img.data });
         this.renderAttachmentChips();
       } catch (err) {
@@ -2355,7 +2396,7 @@ export class InputBox {
      the same `attachments` array, so the resulting chip and the outgoing
      ImageBlock are identical to any other attachment path. Synchronous (no
      File/Blob decode step), so — unlike addFiles/handlePaste — there is no
-     mid-decode submit() race to guard against with an array-identity
+     mid-decode submit() race to guard against with a generation
      snapshot. */
   addImageAttachments(items: { mediaType: string; dataUri: string }[]): void {
     if (this.destroyed || items.length === 0) return;
@@ -2381,27 +2422,35 @@ export class InputBox {
      inlined text. Anything that fails the size cap or can't be decoded
      surfaces a Notice and is skipped so one bad file doesn't abort the rest. */
   private async addFiles(files: File[]) {
-    /* Snapshot the array identity so a submit() that lands mid-decode (which
-       rebinds this.attachments to a fresh array for the next message) doesn't
-       cause the decoded file to ride on the next turn. */
-    const target = this.attachments;
-    for (const file of files) {
+    /* Snapshot the submit generation so a submit() that lands mid-decode
+       doesn't cause the decoded file to ride on the next turn. */
+    const generation = this.attachGeneration;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
       if (file.size > MAX_ATTACHMENT_BYTES) {
         platform.notify(`${file.name} is too large (max 10MB)`);
         continue;
       }
       try {
         const att = await this.fileToAttachment(file);
-        if (this.destroyed || this.attachments !== target) return;
+        if (this.destroyed) return;
+        if (this.attachGeneration !== generation) {
+          /* The message already went out. Say which files missed it rather
+             than dropping them silently. */
+          const names = files.slice(i).map(f => f.name).join(", ");
+          platform.notify(`Not attached (message already sent): ${names}`);
+          return;
+        }
         this.attachments.push(att);
+        /* Draw each chip as it lands so whatever a mid-batch Enter sends
+           is what the user saw. */
+        this.renderAttachmentChips();
       } catch (err) {
         console.error("claude-cli-chat: failed to attach file", file.name, err);
         const msg = err instanceof Error ? err.message : String(err);
         platform.notify(`Couldn't attach ${file.name}: ${msg}`);
       }
     }
-    if (this.destroyed) return;
-    this.renderAttachmentChips();
   }
 
   private async fileToAttachment(file: File): Promise<Attachment> {
@@ -2606,6 +2655,7 @@ export class InputBox {
     const attachments = this.attachments;
     const selection = this.currentSelection ?? undefined;
     this.attachments = [];
+    this.attachGeneration++;
     this.currentSelection = null;
     this.renderContextRow();
     this.callbacks.onSubmit({ text, attachments, selection });

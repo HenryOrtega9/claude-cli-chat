@@ -75,24 +75,33 @@ final class ShareViewController: UIViewController {
         }
 
         let group = DispatchGroup()
-        var text: String?
+        // Separate slots, keyed by provider index: X, Reddit and News hand
+        // over a caption provider AND a link provider, and both loads finish
+        // in whatever order. A single first-writer-wins slot kept one of them
+        // at random; these are joined in provider order in `notify` below.
+        var urls: [(index: Int, value: String)] = []
+        var texts: [(index: Int, value: String)] = []
         var imageDatas: [Data] = []
         let lock = NSLock()
 
-        for provider in providers {
+        for (index, provider) in providers.enumerated() {
             if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: UTType.url.identifier) { coding, _ in
-                    if let url = coding as? URL {
-                        lock.lock(); if text == nil { text = url.absoluteString }; lock.unlock()
+                    // A `file://` URL (Photos, and some apps hand back the
+                    // local file path as the "url" item rather than a web
+                    // link) is useless as composer text. Dropped here, at
+                    // collection time, so it can never displace a caption.
+                    if let url = coding as? URL, !url.isFileURL, !url.absoluteString.hasPrefix("file://") {
+                        lock.lock(); urls.append((index, url.absoluteString)); lock.unlock()
                     }
                     group.leave()
                 }
             } else if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: UTType.plainText.identifier) { coding, _ in
-                    if let s = coding as? String {
-                        lock.lock(); if text == nil { text = s }; lock.unlock()
+                    if let s = coding as? String, !s.isEmpty {
+                        lock.lock(); texts.append((index, s)); lock.unlock()
                     }
                     group.leave()
                 }
@@ -112,11 +121,13 @@ final class ShareViewController: UIViewController {
         }
 
         group.notify(queue: .main) { [weak self] in
-            // A `file://` URL leaking in from the image branch's text load
-            // (some apps hand back the local file path as the "url" item
-            // rather than a web link) is not useful composer text.
-            let cleaned = text.flatMap { $0.hasPrefix("file://") ? nil : $0 }
-            self?.write(text: cleaned, images: imageDatas)
+            // Deterministic: the plain text in provider order, then each web
+            // URL on its own line unless the text already carries it.
+            var combined = texts.sorted { $0.index < $1.index }.map(\.value).joined(separator: "\n\n")
+            for url in urls.sorted(by: { $0.index < $1.index }).map(\.value) where !combined.contains(url) {
+                combined = combined.isEmpty ? url : "\(combined)\n\(url)"
+            }
+            self?.write(text: combined.isEmpty ? nil : combined, images: imageDatas)
         }
     }
 

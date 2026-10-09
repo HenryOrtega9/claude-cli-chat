@@ -100,6 +100,21 @@ export function onSwitchTab(handler: (p: PendingTabSwitch) => void): void {
   }
 }
 
+/* A failed boot never constructs the shell, so a tap parked above would be
+   wiped by renderer.ts's boot-retry reload. The retry takes it out before
+   reloading (and stashes it in sessionStorage); the next boot parks it again
+   with restoreQueuedTabSwitch, unless a newer tap already took the slot. */
+export function takeQueuedTabSwitch(): PendingTabSwitch | null {
+  const pending = queuedTabSwitch;
+  queuedTabSwitch = null;
+  return pending;
+}
+
+export function restoreQueuedTabSwitch(pending: PendingTabSwitch): void {
+  if (switchTabHandler) switchTabHandler(pending);
+  else if (!queuedTabSwitch) queuedTabSwitch = pending;
+}
+
 export const DEV_KEYS = {
   token: "vaultgw.dev.token",
   base: "vaultgw.dev.base",
@@ -182,6 +197,31 @@ export function parseHealthStatus(raw: unknown): HealthStatus {
 }
 
 /* ---------------------------------------------------------------------------
+   Speech-idle signal
+   ------------------------------------------------------------------------ */
+
+/* Subscribers to GatewayTransport.onSpeechIdle. NativeBridge.swift dispatches
+   `speechIdle` when its synthesizer queue drains; renderer.ts routes that
+   dispatch here. */
+const speechIdleListeners = new Set<() => void>();
+/* speak() calls native has not acknowledged yet. A `speechIdle` for the
+   previous utterance can land after the page queued a new one but before
+   native received it; while any speak is in flight the signal is stale. */
+let speaksInFlight = 0;
+
+export function notifySpeechIdle(): void {
+  if (speaksInFlight > 0) return;
+  for (const cb of [...speechIdleListeners]) {
+    try { cb(); } catch (err) { console.error("[vaultgw] speechIdle listener failed", err); }
+  }
+}
+
+function subscribeSpeechIdle(cb: () => void): () => void {
+  speechIdleListeners.add(cb);
+  return () => { speechIdleListeners.delete(cb); };
+}
+
+/* ---------------------------------------------------------------------------
    Native transport
    ------------------------------------------------------------------------ */
 
@@ -236,11 +276,18 @@ class NativeTransport implements GatewayTransport, HealthApi {
   }
 
   speak(text: string): void {
-    void this.call("speak", { text }).catch(() => undefined);
+    speaksInFlight++;
+    void this.call("speak", { text })
+      .catch(() => undefined)
+      .finally(() => { speaksInFlight = Math.max(0, speaksInFlight - 1); });
   }
 
   stopSpeaking(): void {
     void this.call("speak", { stop: true }).catch(() => undefined);
+  }
+
+  onSpeechIdle(cb: () => void): () => void {
+    return subscribeSpeechIdle(cb);
   }
 
   openSettings(): void {
@@ -361,8 +408,16 @@ class BrowserTransport implements GatewayTransport, HealthApi {
   speak(text: string): void {
     try {
       const utterance = new SpeechSynthesisUtterance(text);
+      /* Fire idle only once the whole queue drained, not between utterances. */
+      const settle = () => { if (!window.speechSynthesis.speaking) notifySpeechIdle(); };
+      utterance.onend = settle;
+      utterance.onerror = settle;
       window.speechSynthesis.speak(utterance);
     } catch { /* no speech synthesis */ }
+  }
+
+  onSpeechIdle(cb: () => void): () => void {
+    return subscribeSpeechIdle(cb);
   }
 
   stopSpeaking(): void {

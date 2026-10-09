@@ -22,6 +22,8 @@
 
 import { unlinkSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { hostname } from "node:os";
+import { execFileSync } from "node:child_process";
 import { platform } from "../../../src/platform";
 import { renderHeader } from "../../../src/view/Header";
 import { TabBar, type TabBadgeState } from "../../../src/view/TabBar";
@@ -35,9 +37,12 @@ import { DesktopSnippetPicker } from "../../../src/platform/dom/snippet-picker";
 import type { DesktopHost } from "./host";
 
 /* Working-dir-relative path for the multi-window lock file. Each shell writes
-   a unique instance token (`<pid>:<uuid>`) here on mount and removes it on
-   teardown. A second window opening sees the lock, verifies the holder PID is
-   still alive, and renders an "already open" notice instead of restoring tabs.
+   a unique instance token (`<host>:<pid>:<uuid>`) here on mount and removes it
+   on teardown. A second window opening sees the lock, verifies the holder PID
+   is still alive AND is a Quick Chat process on this machine, and renders an
+   "already open" notice instead of restoring tabs. The host matters because
+   the store sits in the iCloud-synced vault: a lock from another Mac syncs
+   over, and its PID means nothing here.
    The token (rather than a bare PID) lets us tell two shells in the SAME
    process apart, so one teardown can't delete a lock another legitimately
    holds.
@@ -72,6 +77,23 @@ function makeInstanceId(): string {
   return `${Date.now()}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 }
 
+/* True when `pid` is running the Quick Chat app, or a dev build under the
+   stock Electron binary. `comm` is the full executable path on macOS, which
+   for the renderer is ".../Claude Quick Chat Helper (Renderer)". Any failure
+   (ps missing, timeout, process exited in between) reads as "not ours". */
+function isQuickChatProcess(pid: number): boolean {
+  try {
+    const comm = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+      encoding: "utf8",
+      timeout: 1000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return comm.includes("Claude Quick Chat") || comm.includes("Electron");
+  } catch {
+    return false;
+  }
+}
+
 export class DesktopChatShell {
   /* Set by renderer.ts before mount(). Absent means "no settings affordance",
      which is what keeps this class free of any modal it doesn't own. */
@@ -92,8 +114,8 @@ export class DesktopChatShell {
   /* True when this shell holds the on-disk lock. Placeholder mounts never set
      it, so their teardown is a no-op. */
   private holdingLock = false;
-  /* Unique per-shell lock payload: `<pid>:<uuid>`. */
-  private readonly instanceToken = `${process.pid}:${makeInstanceId()}`;
+  /* Unique per-shell lock payload: `<host>:<pid>:<uuid>`. */
+  private readonly instanceToken = `${hostname()}:${process.pid}:${makeInstanceId()}`;
   /* Set by whichever teardown ran first. The quit path runs destroy() over
      IPC and THEN unloads the page, so beforeunload's shutdownSync() would
      otherwise re-run the whole disposal against already-torn-down objects. */
@@ -195,29 +217,35 @@ export class DesktopChatShell {
     try {
       if (!(await platform.storage.exists(WINDOW_LOCK_PATH))) return null;
       const raw = (await platform.storage.read(WINDOW_LOCK_PATH)).trim();
-      /* Lock payload is `<pid>:<uuid>`. Parse the PID off the front; older
-         locks may be a bare PID, which parseInt still reads correctly. */
-      const pid = parseInt(raw, 10);
-      if (!Number.isFinite(pid) || pid <= 0) return null;
       /* A lock we wrote ourselves (exact token match) means this same shell is
          re-mounting — treat as no foreign holder. */
       if (raw === this.instanceToken) return null;
-      if (pid === process.pid) {
-        /* Same PID, different token: a second shell in our own process. The
-           singleton gate already blocks that path, but treat it as held here
-           too so the on-disk lock can't be silently overwritten if the gate is
-           ever bypassed. */
-        return pid;
-      }
+      /* Lock payload is `<host>:<pid>:<uuid>`. Older locks are `<pid>:<uuid>`
+         or a bare PID; neither carries a host, so they are probed locally. */
+      const parts = raw.split(":");
+      const lockHost = parts.length >= 3 ? parts.slice(0, -2).join(":") : null;
+      const pid = parseInt(parts.length >= 3 ? parts[parts.length - 2] : parts[0], 10);
+      if (!Number.isFinite(pid) || pid <= 0) return null;
+      /* Written on another Mac and synced over: PID liveness is meaningless
+         across machines, so it never blocks. */
+      if (lockHost !== null && lockHost !== hostname()) return null;
+      /* Same PID, foreign token: left behind by an earlier launch whose PID
+         this renderer happened to inherit (a reboot, a crash that skipped
+         beforeunload). A second shell in THIS process is the singleton gate's
+         job, not the disk lock's. */
+      if (pid === process.pid) return null;
       try {
         /* signal 0 doesn't deliver a signal; it tests whether the target is
            still alive and accessible. Throws ESRCH if the process is gone. */
         process.kill(pid, 0);
-        return pid;
       } catch {
         /* Stale lock from a crashed prior instance. Safe to overwrite. */
         return null;
       }
+      /* Alive, but PIDs get reused: only a Quick Chat (or dev Electron)
+         process counts as the holder. Anything else is a stale lock whose PID
+         now belongs to an unrelated process. */
+      return isQuickChatProcess(pid) ? pid : null;
     } catch {
       return null;
     }
@@ -306,14 +334,18 @@ export class DesktopChatShell {
     }
     /* Bypass per-tab saveIndex writes during the restore loop — each
        createTab + selectTab pair would otherwise trigger TWO index writes per
-       restored tab. One write at the very end instead. */
+       restored tab. One write at the very end instead. Restored tabs mount
+       hidden and only the final pick is shown: show() starts a tab's deferred
+       history replay, so selecting each one in turn replayed every
+       conversation at boot. */
     for (const entry of index.tabs) {
       const state = await this.host.persistence.loadTab(entry.id);
-      this.createTab(state ?? undefined, { skipSave: true });
+      this.createTab(state ?? undefined, { skipSave: true, select: false });
     }
-    if (index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)) {
-      this.selectTab(index.activeTabId, { skipSave: true });
-    }
+    const target = index.activeTabId && this.tabs.some(t => t.state.id === index.activeTabId)
+      ? index.activeTabId
+      : this.tabs[this.tabs.length - 1]?.state.id;
+    if (target) this.selectTab(target, { skipSave: true });
     this.saveIndex();
   }
 
@@ -342,7 +374,10 @@ export class DesktopChatShell {
     });
   }
 
-  private createTab(state?: TabState, opts: { skipSave?: boolean; incognito?: boolean } = {}): void {
+  private createTab(
+    state?: TabState,
+    opts: { skipSave?: boolean; incognito?: boolean; select?: boolean } = {},
+  ): void {
     const controller = new TabController(
       this.host,
       this.tabsContainer,
@@ -368,7 +403,10 @@ export class DesktopChatShell {
     controller.onForkRequest = (src, messageId) => this.forkFromMessage(src, messageId);
     controller.onIncognitoToggle = (tabId, incognito) => void this.onIncognitoToggle(tabId, incognito);
     this.tabs.push(controller);
-    this.selectTab(controller.state.id, { skipSave: true });
+    /* select:false is the restore path: mount hidden, and let restoreTabs show
+       the one tab that ends up active. */
+    if (opts.select === false) controller.hide();
+    else this.selectTab(controller.state.id, { skipSave: true });
     if (!opts.skipSave) {
       this.saveIndex();
       /* Tabs created with pre-populated history (fork, History-modal reopen)
@@ -652,6 +690,11 @@ export class DesktopChatShell {
   async destroy(): Promise<void> {
     if (this.torndown) return;
     this.torndown = true;
+    /* Publish any draft still inside InputBox's debounce while the controllers
+       are live: destroy() marks them destroyed first (so onStateChangeCb
+       no-ops) and then drops the pending timer, losing the last keystrokes.
+       The publish schedules a save that host.dispose() then flushes. */
+    for (const t of this.tabs) t.flushDraft();
     await Promise.all(this.tabs.map(t => t.destroy()));
     this.tabs = [];
     /* Surrender the process-local slot only if WE own it — a placeholder shell
@@ -666,6 +709,8 @@ export class DesktopChatShell {
   shutdownSync(): void {
     if (this.torndown) return;
     this.torndown = true;
+    /* Same draft drain as destroy(), ahead of the synchronous flush. */
+    for (const t of this.tabs) t.flushDraft();
     if (activeShellInstance === this) activeShellInstance = null;
     this.host.disposeSync();
     this.releaseWindowLockSync();

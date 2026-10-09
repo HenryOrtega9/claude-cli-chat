@@ -171,6 +171,8 @@ export class SearchBar {
         if (parent.tagName === "MARK") return NodeFilter.FILTER_REJECT;
         /* Skip script/style/etc. */
         if (parent.closest(".claudian-bottom-sentinel")) return NodeFilter.FILTER_REJECT;
+        /* The status pill's gerund ("Pondering…") is chrome, not transcript. */
+        if (parent.closest(".claudian-status-indicator")) return NodeFilter.FILTER_REJECT;
         return node.nodeValue && node.nodeValue.length > 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
       },
     });
@@ -228,8 +230,30 @@ export class SearchBar {
     const m = this.marks[this.activeIndex];
     if (m) {
       m.addClass("is-active");
-      if (scroll) m.scrollIntoView({ block: "center", behavior: "auto" });
+      if (scroll) {
+        this.revealFolds(m);
+        m.scrollIntoView({ block: "center", behavior: "auto" });
+      }
     }
+  }
+
+  /* Tool rows, thinking blocks and the attached-notes summary are collapsed
+     by default, and their bodies are display:none, so a match inside one
+     would be counted but never shown (scrollIntoView on an unrendered
+     element does nothing). Open whichever fold holds the active match. Class
+     flips are attribute mutations, which the observer doesn't watch, so
+     this can't trigger a refresh loop. */
+  private revealFolds(mark: HTMLElement) {
+    const toolBody = mark.closest(".claudian-tool-body");
+    const toolCall = toolBody?.parentElement;
+    if (toolCall?.hasClass("claudian-tool-call") && !toolCall.hasClass("is-expanded")) {
+      toolCall.addClass("is-expanded");
+      toolCall.querySelector(":scope > .claudian-tool-header")?.setAttribute("aria-expanded", "true");
+    }
+    const thinking = mark.closest(".claudian-thinking-body")?.closest(".claudian-thinking-block");
+    if (thinking && !thinking.hasClass("is-open")) thinking.addClass("is-open");
+    const notes = mark.closest(".claudian-attached-note-expanded")?.closest(".claudian-attached-note-flags");
+    if (notes && !notes.hasClass("is-expanded")) notes.addClass("is-expanded");
   }
 
   private updateCount() {

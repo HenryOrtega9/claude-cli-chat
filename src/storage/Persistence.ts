@@ -1,6 +1,6 @@
 import { platform, type AppHandle } from "../platform";
-import type { Attachment, ChatMessage, TabState, ToolCall } from "../view/state";
-import { truncateToolResult } from "../view/state";
+import type { Attachment, ChatMessage, NestedSubagentEvent, TabState, ToolCall } from "../view/state";
+import { MAX_TOOL_RESULT_CHARS, truncateToolResult } from "../view/state";
 import { writeJsonAtomic } from "../mcp/MCPConfig";
 
 /* Synchronous file API used by flushSync() — the quit-time path, where
@@ -125,6 +125,32 @@ const SAVE_DEBOUNCE_MS = 500;
    write landing. Streaming fires scheduleSaveTab per token, which would
    otherwise starve the trailing timer for the entire reply. */
 const SAVE_MAX_WAIT_MS = 5000;
+/* Backoff for re-arming a debounced save that failed. After the last step the
+   tab stops retrying on its own; its next state change schedules a fresh
+   attempt. */
+const SAVE_RETRY_DELAYS_MS = [500, 2000, 8000];
+
+/* Disk shape of one tool call. The top-level result was always capped; a
+   subagent's nested events carry the same kind of payloads (each nested
+   Read/Grep/Bash result, its text and thinking) under only a COUNT cap, so
+   one Explore agent could put megabytes into a single ToolCall that is then
+   rewritten on every save. Returns new objects: the snapshot shares
+   nestedEvents (and its entries) with live state. */
+function toolCallForDisk(tc: ToolCall): ToolCall {
+  if (!tc.result && !tc.nestedEvents) return tc;
+  return {
+    ...tc,
+    ...(tc.result ? { result: truncateToolResult(tc.result) } : {}),
+    ...(tc.nestedEvents ? { nestedEvents: tc.nestedEvents.map(nestedEventForDisk) } : {}),
+  };
+}
+
+function nestedEventForDisk(e: NestedSubagentEvent): NestedSubagentEvent {
+  if (e.kind === "tool_use") return e.result ? { ...e, result: truncateToolResult(e.result) } : e;
+  if (e.text.length <= MAX_TOOL_RESULT_CHARS) return e;
+  const omitted = e.text.length - MAX_TOOL_RESULT_CHARS;
+  return { ...e, text: `${e.text.slice(0, MAX_TOOL_RESULT_CHARS)}\n\n[... truncated, ${omitted} more characters omitted.]` };
+}
 
 type TabIndex = {
   activeTabId: string | null;
@@ -146,6 +172,12 @@ export class Persistence {
   /* Per-tab in-flight save promise. Used by deleteTab/flush to await a save
      that's already started before issuing remove() or returning. */
   private inflightSaves = new Map<string, Promise<void>>();
+  /* Ids deleteTab removed. A debounced save that fails while the tab is being
+     closed must not re-arm and write the files back. Cleared when the view
+     schedules that id again (the incognito-OFF path reuses an id). */
+  private deletedIds = new Set<string>();
+  /* Consecutive failed debounced saves per tab, for the retry backoff. */
+  private saveFailures = new Map<string, number>();
   /* Last index payload written to disk (serialized). saveIndex is called once
      per streaming token via onStateChange, but the index only changes on tab
      add/remove/select, a title-gen result, or a sessionId landing. Dedupe on
@@ -272,6 +304,13 @@ export class Persistence {
      payload mid-flight. Cloning at schedule time instead would clone on every
      token only to discard all but the last snapshot before a quiet period. */
   scheduleSaveTab(state: TabState): void {
+    this.deletedIds.delete(state.id);
+    /* A fresh state change earns a fresh set of retries. */
+    this.saveFailures.delete(state.id);
+    this.armSave(state, SAVE_DEBOUNCE_MS);
+  }
+
+  private armSave(state: TabState, delayMs: number): void {
     const existing = this.pendingWrites.get(state.id);
     if (existing) {
       clearTimeout(existing.handle);
@@ -291,7 +330,7 @@ export class Persistence {
     const handle = setTimeout(() => {
       this.pendingWrites.delete(state.id);
       this.dispatchSave(state);
-    }, SAVE_DEBOUNCE_MS);
+    }, delayMs);
     this.pendingWrites.set(state.id, { handle, state, firstScheduledAt });
   }
 
@@ -301,12 +340,25 @@ export class Persistence {
      fire-and-forget: an uncaught rejection here would be an unhandled
      promise rejection with zero user-visible signal, and the write is
      already off pendingWrites so flush()/flushSync() at unload wouldn't know
-     to retry it. Warn and re-arm so it isn't lost from tracking — unless a
-     newer edit already rescheduled this tab. */
+     to retry it. Warn and re-arm with backoff so it isn't lost from
+     tracking, unless a newer edit already rescheduled this tab, deleteTab
+     removed it meanwhile (a re-arm would write the closed chat back), or the
+     retries are spent (a persistent EACCES / disk-full would otherwise retry
+     every 500ms forever). */
   private dispatchSave(state: TabState): void {
-    void this.saveTab(this.snapshotState(state)).catch(err => {
+    void this.saveTab(this.snapshotState(state)).then(() => {
+      this.saveFailures.delete(state.id);
+    }, err => {
+      if (this.deletedIds.has(state.id)) return;
+      const failures = (this.saveFailures.get(state.id) ?? 0) + 1;
+      this.saveFailures.set(state.id, failures);
+      const delay = SAVE_RETRY_DELAYS_MS[failures - 1];
+      if (delay === undefined) {
+        console.warn(`[claude-cli-chat] debounced save failed for tab ${state.id}; giving up after ${failures} attempts until the next change`, err);
+        return;
+      }
       console.warn(`[claude-cli-chat] debounced save failed for tab ${state.id}`, err);
-      if (!this.pendingWrites.has(state.id)) this.scheduleSaveTab(state);
+      if (!this.pendingWrites.has(state.id)) this.armSave(state, delay);
     });
   }
 
@@ -384,7 +436,7 @@ export class Persistence {
            tool-heavy conversation would otherwise grow its persisted JSON
            unboundedly and re-rewrite the whole (growing) file on every
            debounced save. */
-        toolCalls: m.toolCalls?.map(tc => tc.result ? { ...tc, result: truncateToolResult(tc.result) } : tc),
+        toolCalls: m.toolCalls?.map(toolCallForDisk),
         durationMs: m.durationMs,
         thinking: m.thinking,
         selectionContext: m.selectionContext,
@@ -507,6 +559,8 @@ export class Persistence {
       clearTimeout(pending.handle);
       this.pendingWrites.delete(id);
     }
+    this.deletedIds.add(id);
+    this.saveFailures.delete(id);
     /* Wait for any in-flight save to finish before removing — otherwise
        the save's tmp-then-rename could resurrect the file post-delete. */
     const inflight = this.inflightSaves.get(id);

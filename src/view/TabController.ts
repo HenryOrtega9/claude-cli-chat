@@ -157,6 +157,10 @@ export class TabController {
   /* Set to true while teardownSession() is executing so re-entrant callers
      (e.g. an onExit firing mid-dispose) don't double-dispose. */
   private tearingDown = false;
+  /* The teardown that currently holds `tearingDown`, so a terminal teardown
+     (destroy/clear) that lands inside another one's SIGTERM window can wait
+     for it instead of no-oping past the incognito cleanup. */
+  private currentTeardown: Promise<void> | null = null;
 
   /* In-flight teardown started by restartSubprocess() (fire-and-forget so the
      picker callback stays sync). ensureSession() awaits this before spawning
@@ -687,7 +691,32 @@ export class TabController {
     reason: "cancel" | "restart" | "clear" | "switch" | "destroy",
     opts: { abort?: boolean } = {},
   ): Promise<void> {
-    if (this.tearingDown) return;
+    if (this.tearingDown) {
+      /* A close or /clear inside a model/effort/mode restart's SIGTERM window
+         used to return here, skipping the incognito session-file cleanup for
+         good (destroy then drops the id set with the controller) and leaving
+         the chat's ai-title residue on disk. Terminal teardowns wait for the
+         in-flight one, then run their own pass; everything else keeps the
+         old no-op. */
+      if (reason !== "destroy" && reason !== "clear") return;
+      while (this.tearingDown && this.currentTeardown) {
+        await this.currentTeardown.catch(() => {});
+      }
+      if (this.tearingDown) return;
+    }
+    const run = this.runTeardown(reason, opts);
+    this.currentTeardown = run;
+    try {
+      await run;
+    } finally {
+      if (this.currentTeardown === run) this.currentTeardown = null;
+    }
+  }
+
+  private async runTeardown(
+    reason: "cancel" | "restart" | "clear" | "switch" | "destroy",
+    opts: { abort?: boolean },
+  ): Promise<void> {
     this.tearingDown = true;
     try {
       const s = this.session;
@@ -711,6 +740,13 @@ export class TabController {
           try { detachable.detach(); } catch { /* ignore — best-effort */ }
         } else {
           try { await s.dispose(); } catch { /* ignore — already exited or never spawned */ }
+        }
+        /* The session records its init's session_id itself. Collect it here
+           too: an init that lands after a pill change already nulled
+           this.session is dropped by the listener identity guard, so its id
+           would otherwise never reach the cleanup set. */
+        if (this.state.incognito && typeof s.sessionId === "string" && s.sessionId) {
+          this.incognitoSessionIds.add(s.sessionId);
         }
       }
       if (reason === "restart") {
@@ -1297,6 +1333,15 @@ export class TabController {
       "command. Only produce audio files/commands if the user explicitly wants an audio artifact.";
     const composedAddendum =
       [vaultAddendum, snippetAddendum, trustedAddendum, voiceAddendum].filter(s => s.length > 0).join("\n\n") || undefined;
+    if (!this.state.incognito && this.state.sessionId && !this.sessionTranscriptAvailable(cwd, this.state.sessionId)) {
+      /* The transcript behind this id is gone: Claude Code's cleanupPeriodDays
+         pruned it, or the synced tab store was written on the other Mac.
+         `--resume` would exit 1 ("No conversation found with session ID") on
+         every submit, so start fresh instead. The new init records the new id. */
+      this.state.sessionId = null;
+      platform.notify("Earlier context for this chat isn't available on this machine, so a new Claude session is starting.", 8000);
+      this.onStateChangeCb();
+    }
     /* Incognito sessions are never persisted, so `--resume` would point at a
        transcript that doesn't exist. On respawn (model/effort/mode change)
        start a fresh session instead — context is lost, which is the accepted
@@ -1365,6 +1410,18 @@ export class TabController {
       });
     }
     return this.session;
+  }
+
+  /* Whether `--resume <id>` has a transcript to load. Optional host
+     capability: the node hosts stat the session file; a host without it (the
+     iOS client, whose gateway runs its own canResume check) is trusted. Any
+     doubt answers true so a stat failure never forces a fresh session. */
+  private sessionTranscriptAvailable(cwd: string, id: string): boolean {
+    try {
+      return this.plugin.sessionTranscriptExists?.(cwd, id) !== false;
+    } catch {
+      return true;
+    }
   }
 
   /* Last ~2KB of stderr from the active subprocess. Cleared on each spawn. */
@@ -1488,7 +1545,22 @@ export class TabController {
     return this.state.envSnippetId;
   }
 
-  private async submit(payload: SubmitPayload) {
+  /* Submits run one at a time. submit() awaits (Office extraction, the
+     message render, a restart teardown) before it sets busy, so a second
+     Enter inside that window used to see an idle tab and go out as a second
+     plain turn: the CLI queued it, the first turn's result cleared busy, and
+     the second turn streamed with an idle composer. Chained, the second
+     submit starts once the first has set busy and takes the steering path
+     (or the "wait for the current turn" path when steering is unsupported). */
+  private submitChain: Promise<void> = Promise.resolve();
+
+  private submit(payload: SubmitPayload): Promise<void> {
+    const run = this.submitChain.then(() => this.submitInner(payload));
+    this.submitChain = run.catch(() => {});
+    return run;
+  }
+
+  private async submitInner(payload: SubmitPayload) {
     let { text } = payload;
     const { attachments, selection } = payload;
 
@@ -1961,6 +2033,28 @@ export class TabController {
     this.onStateChangeCb();
   }
 
+  /* The CLI runs a turn this tab didn't start when a background agent
+     finishes while the parent is idle (the <task-notification> wake-up).
+     busy is otherwise only set by submit and deliverQueuedSteer, so that turn
+     streamed with an idle composer: Esc was a no-op, and a message sent
+     meanwhile went out as a plain turn the CLI queued, whose bubble landed
+     above output produced before the model saw it, and the wake-up's result
+     then cleared busy ahead of the user's own turn. Entering busy here routes
+     such a submit through the steering path; handleResult ends the turn as
+     usual. Local engine only: the gateway client gets busy from the daemon. */
+  private enterExternalTurn(): void {
+    if (this.state.busy || this.mode !== "local" || this.tearingDown || this.destroyed) return;
+    const s = this.session as (TabSessionLike & { detach?: () => void }) | null;
+    if (!s || s.isTerminal() || typeof s.detach === "function") return;
+    this.state.busy = true;
+    this.inputBox.setBusy(true);
+    this.statusIndicator.setThinking();
+    this.plugin.stateEmitter?.setState("thinking");
+    this.passStartedAt = Date.now();
+    /* The wake-up reply opens its own bubble below the previous turn. */
+    this.clearStreamingPointer();
+  }
+
   private dropQueuedSteer(uuid: string): void {
     const idx = this.queuedSteers.findIndex(q => q.uuid === uuid);
     if (idx === -1) return;
@@ -2023,10 +2117,12 @@ export class TabController {
          their `index` addresses the parent's streamingBlocks map (subagent
          indices collide with the parent's), and the assistant/tool_result
          envelopes that follow already carry the same content at the same
-         granularity the JSONL tracker produced. */
-      if (event.type !== "stream_event") {
-        this.handleNestedEvent(nestedParent, event);
-      }
+         granularity the JSONL tracker produced. Return before the
+         state-change callback too: nothing changed, and a background agent's
+         delta stream would otherwise keep the debounced save firing a full
+         tab rewrite every max-wait window while the parent sits idle. */
+      if (event.type === "stream_event") return;
+      this.handleNestedEvent(nestedParent, event);
       this.onStateChangeCb();
       return;
     }
@@ -2035,6 +2131,9 @@ export class TabController {
         const sys = event as SystemInitEvent | SystemApiRetryEvent | { type: "system"; subtype: string };
         if (sys.subtype === "init") {
           const init = sys as SystemInitEvent;
+          /* Normally busy already (submit or a held queued turn); an init on
+             an idle tab is a turn the CLI started itself. */
+          if (!this.state.busy) this.enterExternalTurn();
           if (init.session_id) {
             this.state.sessionId = init.session_id;
             /* Remember this id so teardown can delete its on-disk residue. */
@@ -2192,6 +2291,9 @@ export class TabController {
        block on a synthetic user turn rather than through its tool_result. */
     for (const block of blocks) {
       if (block.type === "text" && typeof block.text === "string" && block.text.includes("<task-notification>")) {
+        /* While the parent is idle this is the CLI's wake-up turn for a
+           finished background agent; the model replies right after it. */
+        this.enterExternalTurn();
         await this.handleTaskNotifications(block.text);
       }
     }
@@ -3078,6 +3180,9 @@ export class TabController {
        back to a user-only prompt when assistantResponse is empty. */
     const firstAssistant = this.state.messages.find(m => m.role === "assistant" && m.content.trim().length > 0);
     this.titleGenerationStarted = true;
+    /* Snapshot the placeholder/fallback title so a title the user types and
+       commits during the await below isn't replaced by the generated one. */
+    const titleBefore = this.state.title;
     /* Title generation is hard-pinned to Haiku 5.5 (Haiku 4.5 until its
        2026-10-07 release). Rationale: under the
        2026-06-15 Agent SDK credit pool, every chat turn drains a $100/mo
@@ -3103,6 +3208,7 @@ export class TabController {
          with the prior topic. */
       if (this.destroyed) return;
       if (this.state.messages.find(m => m.role === "user")?.id !== firstUser.id) return;
+      if (this.state.title !== titleBefore) return;
       this.state.title = generated;
       this.state.updatedAt = Date.now();
       this.refreshTitleBar();
@@ -3248,7 +3354,8 @@ export class TabController {
   }
 
   private onExit(code: number | null, signal?: NodeJS.Signals | null) {
-    if (this.userCancelInitiated) {
+    const cancelled = this.userCancelInitiated;
+    if (cancelled) {
       /* Esc-cancel exit. Suppress the crash error and drop a soft italic
          system note so the chat doesn't end on a half-finished bubble. */
       void this.renderCancelNote();
@@ -3268,6 +3375,16 @@ export class TabController {
         subtype: "subprocess_exit",
         message: `Claude exited (code=${code}${sigSuffix}) before completing the response.${stderrSuffix}`,
       });
+    }
+    /* A resume whose transcript is gone fails the same way on every submit.
+       Drop the dead id so the next one starts a fresh session instead of
+       looping; the host-side existence check in ensureSession normally
+       catches this first. */
+    if (!cancelled && this.lastStderr.includes("No conversation found with session ID")) {
+      this.state.sessionId = null;
+      /* lastStderr outlives the process; clear it so a later crash of the
+         fresh session can't match this line again and drop its valid id. */
+      this.lastStderr = "";
     }
     /* Crash-path reconciliation, mirroring what cancelStream and
        handleResult both do but the unexpected-exit path missed: the

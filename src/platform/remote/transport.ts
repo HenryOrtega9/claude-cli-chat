@@ -65,5 +65,10 @@ export interface GatewayTransport {
   copy(text: string): void;
   speak(text: string): void;
   stopSpeaking(): void;
+  /* Optional: fires when the synthesizer has finished everything queued (not
+     between queued utterances). RemoteSpeechController uses it to clear its
+     `speaking` flag. Returns an unsubscribe. A transport without it leaves
+     the flag set until stop(). */
+  onSpeechIdle?(cb: () => void): () => void;
   openSettings(): void;
 }

@@ -42,6 +42,16 @@ export function removeSessionFiles(cwd: string, sessionIds: string[]): Promise<v
   return Promise.all(work).then(() => undefined);
 }
 
+/* Whether the CLI transcript for `id` is on disk. Any stat failure answers
+   true so a filesystem hiccup never forces a fresh session. */
+export function sessionTranscriptExists(cwd: string, id: string): boolean {
+  try {
+    return existsSync(sessionFilePathFor(cwd, id));
+  } catch {
+    return true;
+  }
+}
+
 export function createJsonlTailer(path: string): JsonlTailerHandle {
   return new JsonlTailer(path);
 }

@@ -74,12 +74,20 @@ export type ServerDeps = {
   startedAt: number;
   version: string;
   isReady: () => boolean;
+  /* Re-read the MCP disable list into the deny patterns every spawn reads.
+     main.ts owns that list; POST /mcp/disable must refresh it or the toggle
+     only reaches the catalog, never the children. Resolves true when the
+     patterns actually changed. */
+  refreshMcpDenyPatterns: () => Promise<boolean>;
   log: (msg: string) => void;
 };
 
 export class GatewayServer {
   readonly http: Server;
   private subs = new Map<number, Subscription>();
+  /* Every accepted socket, subscribed or not. close() must reach all of
+     them: an upgraded socket left open keeps http.Server.close() pending. */
+  private conns = new Set<WsConnection>();
   private tickets = new Map<string, number>();
   private waiters = new Set<Waiter>();
   private usage: UsageFetcher;
@@ -140,7 +148,14 @@ export class GatewayServer {
 
   async close(): Promise<void> {
     if (this.catalogKeepWarm) { clearInterval(this.catalogKeepWarm); this.catalogKeepWarm = null; }
-    for (const sub of this.subs.values()) sub.conn.close(1001, "shutting_down");
+    /* Close frame first, then destroy: a peer that is unreachable would never
+       finish the close handshake, and http.close() below waits on every
+       upgraded socket (closeAllConnections() does not track them). */
+    for (const conn of Array.from(this.conns)) {
+      conn.close(1001, "shutting_down");
+      conn.destroy();
+    }
+    this.conns.clear();
     this.subs.clear();
     for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.resolve(null); }
     this.waiters.clear();
@@ -213,7 +228,7 @@ export class GatewayServer {
     if (method === "POST" && path === "/apple-health/ingest") return this.postAppleHealthIngest(req, res);
     if (method === "GET" && path === "/apple-health/status") {
       try {
-        return sendJson(res, 200, this.appleHealth.status());
+        return sendJson(res, 200, await this.appleHealth.statusAsync());
       } catch (err) {
         this.deps.log(`apple-health status failed: ${String(err)}`);
         return sendJson(res, 500, { error: "health_store_error", message: String(err) });
@@ -242,6 +257,10 @@ export class GatewayServer {
       const wanted = new Set(servers);
       for (const name of wanted) if (!current.has(name)) await store.setServerDisabled(name, true);
       for (const name of current) if (!wanted.has(name)) await store.setServerDisabled(name, false);
+      /* Spawns read the deny patterns main.ts primed at boot; refresh them
+         before answering so the next turn already runs without (or with) the
+         toggled server, and retire live children still on the old argv. */
+      if (await this.deps.refreshMcpDenyPatterns()) this.deps.registry.requestRespawnAll();
       /* The disable list feeds the catalog, so the cached one is now wrong.
          Rebuild in the background rather than nulling the cache and making
          the next reader (usually the phone, right after this toggle) pay
@@ -622,6 +641,7 @@ export class GatewayServer {
       }
       const conn = acceptUpgrade(req, socket, head);
       if (!conn) return;
+      this.conns.add(conn);
       this.deps.log(`ws ${conn.id} connected`);
       traceWs(conn.id, "upgrade accepted, registering listeners + sending hello synchronously");
 
@@ -629,6 +649,7 @@ export class GatewayServer {
          frame tells it every tab's cursor so it can ask precisely. */
       conn.onMessage(text => this.handleWsMessage(conn, text));
       conn.onClose(() => {
+        this.conns.delete(conn);
         this.subs.delete(conn.id);
         this.deps.log(`ws ${conn.id} closed`);
       });

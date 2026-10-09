@@ -48,6 +48,15 @@ export const APPROVAL_TIMEOUT_MESSAGE = "Client unreachable; denied by gateway t
    bypassPermissions is never a legal value here — see setConfig(). */
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "acceptEdits";
 
+/* The tool_result a background (async) Task/Agent answers with at launch.
+   Mirrors ASYNC_LAUNCH_ACK in src/view/TabController.ts, which is not
+   exported and drags the whole view layer in with it. */
+const ASYNC_LAUNCH_ACK = "Async agent launched successfully";
+/* A background agent whose notification we never saw (a missed event, a CLI
+   change) must not pin its child slot forever. Past this age it no longer
+   counts as outstanding work. */
+const BACKGROUND_AGENT_STALE_MS = 60 * 60_000;
+
 export type TabPatch = {
   title?: string;
   model?: string;
@@ -158,6 +167,17 @@ export class TabEngine {
      clear() and destroy(). Mirrors TabController.cleanupIncognitoSessionFiles
      on desktop. Always empty for a non-incognito tab. */
   private readonly incognitoSessionIds = new Set<string>();
+  /* Background Task/Agent tool_use ids still running inside the live child,
+     with the time each was first seen. The parent turn's `result` has
+     already cleared `busy`, so without this a tab doing real work looks idle
+     and LRU eviction or a config patch kills the agents (and their
+     notification never arrives). Settled by system/task_notification or a
+     <task-notification> user turn (Wire Format Gotchas 6 and 8). */
+  private backgroundAgents = new Map<string, number>();
+  /* Set when a <task-notification> wake-up turn starts on an idle tab: the
+     model answers it with a fresh turn that streams while `busy` is false.
+     Cleared by that turn's `result` or by the child going away. */
+  private wakeTurnAt: number | null = null;
 
   constructor(
     private deps: EngineDeps,
@@ -216,7 +236,18 @@ export class TabEngine {
   get pid(): number | undefined { return this.session?.pid; }
   get hasLiveChild(): boolean { return this.session !== null && !this.session.isTerminal(); }
   get hasPendingApprovals(): boolean { return this.pending.size > 0; }
-  get evictable(): boolean { return !this.busy && this.pending.size === 0 && this.hasLiveChild; }
+  get evictable(): boolean {
+    return !this.busy && this.pending.size === 0 && this.hasLiveChild && !this.holdsBackgroundWork;
+  }
+
+  /* True while the child is doing work no turn accounts for: background
+     agents still running, or the wake-up turn one of them triggered. */
+  private get holdsBackgroundWork(): boolean {
+    const cutoff = Date.now() - BACKGROUND_AGENT_STALE_MS;
+    if (this.wakeTurnAt !== null && this.wakeTurnAt < cutoff) this.wakeTurnAt = null;
+    for (const [id, at] of this.backgroundAgents) if (at < cutoff) this.backgroundAgents.delete(id);
+    return this.wakeTurnAt !== null || this.backgroundAgents.size > 0;
+  }
 
   snapshot() {
     return {
@@ -276,10 +307,7 @@ export class TabEngine {
        settings, and the change would silently not apply. Own it here instead
        of trusting the caller: drop the child now if the tab is idle, or at the
        start of the next turn if it is mid-turn or holding an approval. */
-    if (`${this.state.model}|${this.state.effort}|${this.state.permissionMode}` !== before && this.hasLiveChild) {
-      this.needsRespawn = true;
-      if (!this.busy && this.pending.size === 0) this.pendingTeardown = this.dropChildForRespawn();
-    }
+    if (`${this.state.model}|${this.state.effort}|${this.state.permissionMode}` !== before) this.requestRespawn();
     if (Array.isArray(p.pinnedFilePaths)) this.state.pinnedFilePaths = p.pinnedFilePaths;
     /* Draft is not engine-affecting — it never touches `before` above, so a
        draft-only patch never drops a live child. */
@@ -287,6 +315,19 @@ export class TabEngine {
     this.state.updatedAt = Date.now();
     this.save();
     this.emit("tab_status", this.statusPayload());
+  }
+
+  /* The child's argv is out of date (an engine-affecting patch, or the MCP
+     deny list changed). Drop it now if nothing is running in it; otherwise
+     the next turn that finds it idle replaces it (prepareForTurn). Never
+     takes a child that still runs background agents: killing it would kill
+     them too. */
+  requestRespawn(): void {
+    if (!this.hasLiveChild) return;
+    this.needsRespawn = true;
+    if (!this.busy && this.pending.size === 0 && !this.holdsBackgroundWork) {
+      this.pendingTeardown = this.dropChildForRespawn();
+    }
   }
 
   firstUserMessage(): string | null {
@@ -351,6 +392,36 @@ export class TabEngine {
      seq numbers. */
   async restoreFromDisk(): Promise<void> {
     this.seq = await this.ring.recoverTail();
+    this.normalizeRestored();
+  }
+
+  /* No child is live for a tab coming off disk, so nothing it persisted as
+     in flight can still be. A turn cut off by a shutdown, crash or SIGKILL
+     was saved mid-stream (a streaming bubble, RUNNING tool rows, background
+     agents on Running, busy: true) and would render that way forever. This
+     is the only point that covers SIGKILL and crashes, which never reach
+     evict(). */
+  private normalizeRestored(): void {
+    let changed = false;
+    for (const m of this.state.messages) {
+      if (m.streaming) { m.streaming = false; changed = true; }
+      if (m.thinkingStreaming) { m.thinkingStreaming = false; changed = true; }
+      for (const t of m.toolCalls ?? []) {
+        if (t.status === "running" || t.status === "pending" || t.status === "approved") {
+          t.status = "errored";
+          t.isError = true;
+          changed = true;
+        }
+        if ((t.name === "Task" || t.name === "Agent") && (t.nestedStatus === "spawning" || t.nestedStatus === "running")) {
+          t.nestedStatus = "failed";
+          t.status = "errored";
+          t.isError = true;
+          changed = true;
+        }
+      }
+    }
+    if (this.state.busy) { this.state.busy = false; changed = true; }
+    if (changed) this.save();
   }
 
   /* ---------- turns ---------- */
@@ -366,7 +437,9 @@ export class TabEngine {
     }
     /* A busy tab is about to be rejected with 409; never take its child. */
     if (this.busy) return;
-    if (this.needsRespawn && this.hasLiveChild) await this.dropChildForRespawn();
+    /* Nor one still running background agents: the turn goes to the current
+       child and the respawn stays pending until they have settled. */
+    if (this.needsRespawn && this.hasLiveChild && !this.holdsBackgroundWork) await this.dropChildForRespawn();
   }
 
   private async dropChildForRespawn(): Promise<void> {
@@ -535,6 +608,30 @@ export class TabEngine {
       this.resolveApproval(requestId, false, APPROVAL_TIMEOUT_MESSAGE, undefined, "restart");
     }
     await this.teardownSession();
+    /* teardownSession() nulls `this.session` before the child dies, so
+       handleExit never runs for this exit and cannot settle an in-flight
+       turn. Do it here, or the shutdown flush persists RUNNING tools and a
+       streaming bubble and the turn never gets its turn_done. */
+    const turn = this.currentTurn;
+    if (this.busy || turn) {
+      this.markRunningToolsErrored();
+      if (this.currentAssistant) this.currentAssistant.streaming = false;
+      this.currentAssistant = null;
+      this.currentAssistantId = null;
+      this.busy = false;
+      this.state.busy = false;
+      this.currentTurn = null;
+      /* A deleted tab is going away; nobody is left to tell. */
+      if (turn && reason !== "delete") {
+        this.emit("turn_done", {
+          turnId: turn.turnId,
+          subtype: "error_during_execution",
+          durationMs: Date.now() - turn.startedAt,
+        });
+      }
+      this.state.updatedAt = Date.now();
+      this.save();
+    }
     if (reason !== "delete") {
       this.status = "idle";
       this.emit("tab_status", this.statusPayload());
@@ -546,7 +643,10 @@ export class TabEngine {
     this.disposed = true;
     await this.evict("delete");
     if (this.incognito) await this.cleanupIncognitoSessionFiles();
-    await this.ring.destroy();
+    /* A closed tab can be reopened from History; keep its last seq so the
+       reopened tab continues the counter other devices' cursors are on.
+       Incognito tabs can never be reopened. */
+    await this.ring.destroy(this.incognito ? undefined : this.seq);
   }
 
   /* Delete every on-disk file the CLI wrote for this incognito tab's
@@ -679,6 +779,38 @@ export class TabEngine {
     this.session = null;
     if (!session) return;
     try { await session.dispose(); } catch { /* already gone */ }
+    this.failBackgroundAgents();
+  }
+
+  /* The child is gone, so every background agent inside it is too and its
+     notification can never arrive. Fail each one on the projection and send
+     clients a synthetic system/task_notification in the CLI's own shape, so
+     they settle the card through their existing path (the iOS host does not
+     fail orphaned agents by itself). */
+  private failBackgroundAgents(): void {
+    this.wakeTurnAt = null;
+    if (this.backgroundAgents.size === 0) return;
+    const ids = Array.from(this.backgroundAgents.keys());
+    this.backgroundAgents.clear();
+    for (const id of ids) {
+      const call = this.findToolCall(id);
+      if (call) {
+        call.status = "errored";
+        call.isError = true;
+        call.nestedStatus = "failed";
+      }
+      if (!this.disposed) {
+        this.emit("event", { type: "system", subtype: "task_notification", tool_use_id: id, status: "failed" });
+      }
+    }
+    this.state.updatedAt = Date.now();
+    this.save();
+  }
+
+  private findToolCall(toolUseId: string): ToolCall | undefined {
+    const msgId = this.toolToMessage.get(toolUseId);
+    const msg = msgId ? this.state.messages.find(m => m.id === msgId) : undefined;
+    return msg?.toolCalls?.find(t => t.id === toolUseId);
   }
 
   private handleEvent(event: StreamEvent): void {
@@ -700,6 +832,12 @@ export class TabEngine {
                (the ai-title residue), so only established ids need cleanup. */
             if (this.incognito) this.incognitoSessionIds.add(this._sessionId);
             this.emit("tab_status", this.statusPayload());
+          } else if ((event as { subtype?: string }).subtype === "task_notification") {
+            /* Wire gotcha #8: a background agent that stops mid-turn reports
+               only through this event. It also fires for background Bash
+               tasks, whose ids are never in the set. */
+            const toolUseId = (event as { tool_use_id?: unknown }).tool_use_id;
+            if (typeof toolUseId === "string") this.backgroundAgents.delete(toolUseId);
           }
           return;
         case "control_request":
@@ -710,6 +848,7 @@ export class TabEngine {
           return;
         case "user":
           this.projectToolResults(event as { message?: { content?: unknown } });
+          this.noteTaskNotifications(event as { message?: { content?: unknown } });
           return;
         case "result":
           this.handleResult(event as ResultEvent);
@@ -786,6 +925,9 @@ export class TabEngine {
           const call: ToolCall = { id: tu.id, name: tu.name, input: tu.input ?? {}, status: "running" };
           msg.toolCalls.push(call);
           this.toolToMessage.set(tu.id, msg.id);
+          if ((tu.name === "Task" || tu.name === "Agent") && (tu.input as { run_in_background?: unknown } | undefined)?.run_in_background === true) {
+            this.backgroundAgents.set(tu.id, Date.now());
+          }
         }
       }
     }
@@ -813,6 +955,16 @@ export class TabEngine {
       call.result = typeof block.content === "string"
         ? block.content
         : JSON.stringify(block.content ?? "");
+      /* A background agent answers its tool_use at once with the launch ack
+         and keeps running; any other result means it is done (or never
+         launched). */
+      if (call.name === "Task" || call.name === "Agent") {
+        if (!block.is_error && toolResultText(block.content).trimStart().startsWith(ASYNC_LAUNCH_ACK)) {
+          if (!this.backgroundAgents.has(call.id)) this.backgroundAgents.set(call.id, Date.now());
+        } else {
+          this.backgroundAgents.delete(call.id);
+        }
+      }
       touched = true;
     }
     if (touched) {
@@ -821,8 +973,30 @@ export class TabEngine {
     }
   }
 
+  /* A finished background agent's <task-notification> on a synthetic user
+     turn. Wire gotcha #6: that content is often a plain string, so normalize
+     it to one text block before looking. On an idle tab it also starts the
+     wake-up turn the model runs in answer. */
+  private noteTaskNotifications(event: { message?: { content?: unknown } }): void {
+    const raw = event.message?.content;
+    const blocks: unknown[] = typeof raw === "string" ? [{ type: "text", text: raw }] : Array.isArray(raw) ? raw : [];
+    let sawNotification = false;
+    for (const b of blocks) {
+      const block = b as { type?: string; text?: unknown };
+      if (block.type !== "text" || typeof block.text !== "string" || !block.text.includes("<task-notification>")) continue;
+      sawNotification = true;
+      const re = /<task-notification>([\s\S]*?)<\/task-notification>/gi;
+      for (let m = re.exec(block.text); m !== null; m = re.exec(block.text)) {
+        const id = /<tool-use-id>([\s\S]*?)<\/tool-use-id>/i.exec(m[1])?.[1].trim();
+        if (id) this.backgroundAgents.delete(id);
+      }
+    }
+    if (sawNotification && !this.busy) this.wakeTurnAt = Date.now();
+  }
+
   private handleResult(event: ResultEvent): void {
     const turn = this.currentTurn;
+    this.wakeTurnAt = null;
     this.busy = false;
     this.state.busy = false;
     this.status = "ready";
@@ -878,6 +1052,7 @@ export class TabEngine {
     for (const requestId of Array.from(this.pending.keys())) {
       this.resolveApproval(requestId, false, "Subprocess exited", undefined, "restart");
     }
+    this.failBackgroundAgents();
     this.markRunningToolsErrored();
     const turn = this.currentTurn;
     if (this.busy && turn) {
@@ -897,13 +1072,33 @@ export class TabEngine {
     this.save();
   }
 
+  /* The child failed to spawn. For EMFILE/EAGAIN Node emits only 'error',
+     never 'exit', so this is the turn's only ending: settle it the way
+     handleExit would, or a backgrounded phone parked on /wait never hears
+     the turn finished. If a 'close' does follow (ENOENT), handleExit finds
+     busy and currentTurn already cleared and emits no second turn_done. */
   private handleFatal(message: string): void {
+    const turn = this.currentTurn;
+    for (const requestId of Array.from(this.pending.keys())) {
+      this.resolveApproval(requestId, false, "Subprocess failed", undefined, "restart");
+    }
+    this.markRunningToolsErrored();
+    if (this.currentAssistant) this.currentAssistant.streaming = false;
     this.status = "error";
     this.busy = false;
     this.state.busy = false;
     this.currentTurn = null;
     this.deps.log(`tab ${this.id}: ${message}`);
+    if (turn) {
+      this.emit("turn_done", {
+        turnId: turn.turnId,
+        subtype: "error_during_execution",
+        durationMs: Date.now() - turn.startedAt,
+      });
+    }
     this.emit("tab_status", { ...this.statusPayload(), error: message });
+    this.state.updatedAt = Date.now();
+    this.save();
   }
 
   private markRunningToolsErrored(): void {
@@ -931,6 +1126,18 @@ export class TabEngine {
     this.currentAssistant = msg;
     return msg;
   }
+}
+
+/* Plain text of a tool_result's content: a string, or the text blocks of a
+   block array. */
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map(b => (b && typeof b === "object" && (b as { type?: unknown }).type === "text" && typeof (b as { text?: unknown }).text === "string")
+      ? (b as { text: string }).text
+      : "")
+    .join("");
 }
 
 export class BusyError extends Error {

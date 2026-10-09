@@ -33,6 +33,7 @@ import {
   createSubagentTracker as createSubagentTrackerImpl,
   openPathExternally as openPathExternallyImpl,
   removeSessionFiles as removeSessionFilesImpl,
+  sessionTranscriptExists as sessionTranscriptExistsImpl,
   writeSubagentFile as writeSubagentFileImpl,
 } from "../../../src/platform/node-capabilities";
 import { generateTitle as generateTitleImpl } from "../../../src/claude/TitleGenerator";
@@ -94,6 +95,11 @@ export class DesktopHost implements PluginHost {
      single child process. */
   private mcpServerListCache: ParsedMcpServer[] | null = null;
   private mcpServerListInflight: Promise<ParsedMcpServer[]> | null = null;
+  /* When the last `claude mcp list` failed. A non-forced caller inside the
+     cooldown gets a rejection instead of another child process, so a broken
+     CLI or MCP config does not respawn the list on every turn. Explicit
+     refreshes (force) always retry. */
+  private mcpServerListFailedAt = 0;
 
   /* Absolute working directory. Stands in for the vault root everywhere the
      shared code asks for one (spawn cwd, skill/subagent discovery roots,
@@ -144,9 +150,15 @@ export class DesktopHost implements PluginHost {
   async getMcpServers(force = false): Promise<ParsedMcpServer[]> {
     if (!force && this.mcpServerListCache) return this.mcpServerListCache;
     if (!force && this.mcpServerListInflight) return this.mcpServerListInflight;
+    if (!force && Date.now() - this.mcpServerListFailedAt < 5 * 60_000) {
+      throw new Error("claude mcp list failed recently; use Refresh to retry");
+    }
     const claudePath = this.settings.claudePath || autodetectClaudePath() || "claude";
     const job = listMcpServersViaCli(claudePath)
-      .then(list => { this.mcpServerListCache = list; return list; })
+      .then(
+        list => { this.mcpServerListCache = list; this.mcpServerListFailedAt = 0; return list; },
+        err => { this.mcpServerListFailedAt = Date.now(); throw err; },
+      )
       .finally(() => { if (this.mcpServerListInflight === job) this.mcpServerListInflight = null; });
     this.mcpServerListInflight = job;
     return job;
@@ -223,6 +235,7 @@ export class DesktopHost implements PluginHost {
      verbatim with the other host — keep the two wirings identical. */
   stateEmitter = StateEmitter;
   removeSessionFiles = removeSessionFilesImpl;
+  sessionTranscriptExists = sessionTranscriptExistsImpl;
   createJsonlTailer = createJsonlTailerImpl;
   createRemoteControlSession = createRemoteControlSessionImpl;
   generateTitle = generateTitleImpl;

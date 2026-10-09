@@ -10,6 +10,11 @@ export type MessageActionCallbacks = {
   onFork: (messageId: string) => void;
 };
 
+/* Optional hook a RenderLifecycle owner can expose (ClaudeChatView does) to
+   hand out a disposable child lifecycle for one bubble's markdown. */
+export type RenderScope = { lifecycle: RenderLifecycle; dispose(): void };
+type RenderScopeFactory = { createRenderScope?: () => RenderScope };
+
 /* Task ≤ CLI 2.1.141, Agent 2.1.143+ — both are subagent spawns. */
 function isSpawnTool(tool: ToolCall): boolean {
   return tool.name === "Task" || tool.name === "Agent";
@@ -92,6 +97,16 @@ export class MessageListRenderer {
      and the bubble already exists. Cleared in reset(), dropped per id in
      removeMessage(). */
   private contentSig = new Map<string, string>();
+  /* Per-message markdown render scope, keyed by msg.id. MarkdownRenderer
+     attaches every embed (`![[Note]]`) and every post-processor ctx.addChild
+     to the lifecycle it is handed, and el.empty() removes only the DOM — so
+     rendering straight into the long-lived view leaked one loaded child per
+     streaming/typewriter pass until the view closed. Each pass now renders
+     into a fresh child scope and disposes the previous one. Hosts whose
+     lifecycle owner lacks createRenderScope (desktop/iOS shells) keep
+     rendering into `component` directly. Disposed in removeMessage(),
+     reset() and destroy(). */
+  private renderScopes = new Map<string, RenderScope>();
   /* Per-tool body signature, keyed by tool.id: the `input` object reference
      (the controller REPLACES tool.input on update rather than mutating it),
      the result string, and name/status/isError. upsertTool skips the
@@ -264,6 +279,20 @@ export class MessageListRenderer {
        the teardown path never reaches it. */
     this.scrollBottomBtn?.detach();
     this.scrollBottomBtn = null;
+    this.disposeAllRenderScopes();
+  }
+
+  private disposeRenderScope(id: string) {
+    const scope = this.renderScopes.get(id);
+    if (!scope) return;
+    this.renderScopes.delete(id);
+    scope.dispose();
+  }
+
+  private disposeAllRenderScopes() {
+    const scopes = Array.from(this.renderScopes.values());
+    this.renderScopes.clear();
+    for (const scope of scopes) scope.dispose();
   }
 
   setActionCallbacks(cb: MessageActionCallbacks) {
@@ -304,6 +333,7 @@ export class MessageListRenderer {
     this.removeEpoch.clear();
     this.thinkingOpenOverride.clear();
     this.contentSig.clear();
+    this.disposeAllRenderScopes();
     this.toolBodySig.clear();
     this.agentGroups.reset();
     /* Clear render chains too: a doUpsert queued behind an in-flight
@@ -599,6 +629,7 @@ export class MessageListRenderer {
     this.liveEls.delete(id);
     this.thinkingOpenOverride.delete(id);
     this.contentSig.delete(id);
+    this.disposeRenderScope(id);
     this.renderChains.delete(id);
     this.reveal.delete(id);
     /* Same gap as reset()'s: a pending trailing render for this id would
@@ -1120,7 +1151,13 @@ export class MessageListRenderer {
          already lives with. */
       const text = this.visibleContent(msg);
       if (text.trim().length > 0) {
-        await platform.renderMarkdown(text, block, "", this.component);
+        /* Swap this bubble's render scope right before re-rendering. Passes
+           for one id are serialized by renderChains, so the dispose can't
+           land on a sibling pass still awaiting the renderer. */
+        this.disposeRenderScope(msg.id);
+        const scope = (this.component as RenderScopeFactory | null)?.createRenderScope?.();
+        if (scope) this.renderScopes.set(msg.id, scope);
+        await platform.renderMarkdown(text, block, "", scope ? scope.lifecycle : this.component);
         this.wireInternalLinks(block);
       }
       /* Hold the footer until the reveal has run out, or "Thought for Ns"

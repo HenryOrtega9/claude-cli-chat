@@ -26,6 +26,11 @@ import { StateMirror } from "./state-mirror";
 import type { Frame } from "./frames";
 
 const STORE_DIR = ".claude-cli-chat/ios";
+/* Upper bound on waiting for the HTTP server to close at shutdown. launchd
+   SIGKILLs 20 s after SIGTERM; registry.shutdown() (children's stdin EOF, the
+   last debounced saves, replay flush) must run well inside that window even
+   if some socket keeps http.close() pending. */
+const SERVER_CLOSE_TIMEOUT_MS = 3_000;
 
 /* SubprocessManager's TabSession (src/claude/SubprocessManager.ts) traces
    every stream event and stderr chunk through bare `console.log`/
@@ -81,6 +86,21 @@ async function main(): Promise<void> {
   let ready = false;
   let server: GatewayServer;
   let denyPatterns: string[] = [];
+  /* Re-read on boot and on every POST /mcp/disable. On failure the previous
+     list stays in force. Returns whether the list changed. */
+  const loadDenyPatterns = async (): Promise<boolean> => {
+    try {
+      const { MCPConfigStore } = await import("../../../src/mcp/MCPConfig");
+      const next = await new MCPConfigStore(null).getDenyPatterns();
+      const changed = next.join("\n") !== denyPatterns.join("\n");
+      denyPatterns = next;
+      if (changed) log(`mcp deny patterns: ${denyPatterns.length > 0 ? denyPatterns.join(", ") : "(none)"}`);
+      return changed;
+    } catch (err) {
+      log(`mcp deny pattern load failed: ${String(err)}`);
+      return false;
+    }
+  };
 
   const registry = new TabRegistry({
     vault: config.vault,
@@ -104,6 +124,7 @@ async function main(): Promise<void> {
     startedAt,
     version: version(),
     isReady: () => ready,
+    refreshMcpDenyPatterns: loadDenyPatterns,
     log,
   });
 
@@ -113,13 +134,7 @@ async function main(): Promise<void> {
   log(`claude: ${claudePath} | maxChildren: ${config.maxChildren} | approval timeout: ${config.approvalTimeoutS}s`);
 
   /* --- async warm-up; /health reports `starting` until this lands --- */
-  try {
-    const { MCPConfigStore } = await import("../../../src/mcp/MCPConfig");
-    denyPatterns = await new MCPConfigStore(null).getDenyPatterns();
-    if (denyPatterns.length > 0) log(`mcp deny patterns: ${denyPatterns.join(", ")}`);
-  } catch (err) {
-    log(`mcp deny pattern prime failed: ${String(err)}`);
-  }
+  await loadDenyPatterns();
   await registry.restore();
   mirror.set("idle");
   ready = true;
@@ -134,7 +149,19 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log(`${signal} received; shutting down`);
     mirror.set("idle");
-    try { await server.close(); } catch { /* already closing */ }
+    /* Bounded: a hung server.close() must never keep the registry from
+       flushing before launchd's SIGKILL. */
+    let closeTimer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      server.close().catch(() => undefined),
+      new Promise<void>(resolve => {
+        closeTimer = setTimeout(() => {
+          log(`server close still pending after ${SERVER_CLOSE_TIMEOUT_MS} ms; continuing shutdown`);
+          resolve();
+        }, SERVER_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(closeTimer);
     try { await registry.shutdown(); } catch (err) { log(`shutdown error: ${String(err)}`); }
     process.exit(0);
   };

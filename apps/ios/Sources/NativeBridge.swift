@@ -346,9 +346,18 @@ final class NativeBridge: NSObject, ObservableObject, WKScriptMessageHandlerWith
 extension NativeBridge: AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         deactivateAudioSessionIfIdle()
+        notifySpeechIdleIfDrained()
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
         deactivateAudioSessionIfIdle()
+        notifySpeechIdleIfDrained()
+    }
+
+    /// Tells the page the queue drained, so RemoteSpeechController clears its
+    /// `speaking` flag and the "Claude is speaking" bars stop with the audio.
+    /// Not sent between queued utterances.
+    private func notifySpeechIdleIfDrained() {
+        if !synthesizer.isSpeaking { dispatch("speechIdle") }
     }
 }

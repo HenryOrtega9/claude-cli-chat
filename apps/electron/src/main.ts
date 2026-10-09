@@ -234,6 +234,12 @@ function onReady(): void {
       persistOpacityTimer = null;
       writeConfiguredOpacity(panelOpacity);
     }
+    /* Same for a drag or resize just before quit: the pin is still pending. */
+    if (persistBoundsTimer) {
+      clearTimeout(persistBoundsTimer);
+      persistBoundsTimer = null;
+      writeConfiguredBounds(userBounds);
+    }
   });
 }
 

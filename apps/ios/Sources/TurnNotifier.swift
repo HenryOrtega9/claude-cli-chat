@@ -17,8 +17,10 @@ final class TurnNotifier: NSObject {
     static let approvalCategory = "VG_APPROVAL"
     private static let allowAction = "VG_APPROVE_ALLOW"
     private static let denyAction = "VG_APPROVE_DENY"
-    /// Matches the gateway's default approval deadline; one wait spans a whole
-    /// turn, so there is no re-arm logic.
+    /// Matches the gateway's default approval deadline. One wait does NOT span
+    /// a whole turn: an `approval_request` resolves it too, and the server
+    /// clamps the timeout to 300 s, so `didFinishDownloadingTo` re-arms after
+    /// both.
     private static let waitSeconds = 600
 
     private var session: URLSession?
@@ -118,8 +120,9 @@ final class TurnNotifier: NSObject {
         armFromPersistedState()
     }
 
-    /// Arm a wait for the most recently busy tab recorded by `setState`.
-    /// No-op when nothing is busy or no token is enrolled.
+    /// Arm one wait per busy tab recorded by `setState`, the active tab
+    /// first. Watching only one tab left every other busy tab's completion
+    /// or approval silent. No-op when nothing is busy or no token is enrolled.
     @discardableResult
     func armFromPersistedState() -> Bool {
         let suite = GatewayConfig.suite
@@ -129,11 +132,25 @@ final class TurnNotifier: NSObject {
             return false
         }
         let active = suite.string(forKey: GatewayConfig.Key.activeTabId) ?? ""
-        let tab = busy.contains(active) ? active : (busy.last ?? "")
-        guard !tab.isEmpty else { return false }
-        let seq = (suite.dictionary(forKey: GatewayConfig.Key.lastSeq)?[tab] as? Int) ?? 0
-        arm(tab: tab, since: seq)
+        let others = busy.filter { !$0.isEmpty && $0 != active }
+        let tabs = (busy.contains(active) && !active.isEmpty ? [active] : []) + others
+        guard !tabs.isEmpty else { return false }
+        let seqs = suite.dictionary(forKey: GatewayConfig.Key.lastSeq)
+        for tab in tabs {
+            arm(tab: tab, since: (seqs?[tab] as? Int) ?? 0)
+        }
         return true
+    }
+
+    /// Drops a tab from the persisted busy list once its turn is done, so a
+    /// later arm from persisted state (the page never flushed) does not watch
+    /// a tab that has already finished.
+    private func markTabIdle(_ tab: String) {
+        guard !tab.isEmpty else { return }
+        let suite = GatewayConfig.suite
+        let busy = suite.stringArray(forKey: GatewayConfig.Key.busyTabs) ?? []
+        guard busy.contains(tab) else { return }
+        suite.set(busy.filter { $0 != tab }, forKey: GatewayConfig.Key.busyTabs)
     }
 
     func arm(tab: String, since seq: Int) {
@@ -148,9 +165,23 @@ final class TurnNotifier: NSObject {
         task.taskDescription = tab
         task.resume()
         Self.log.info("armed /wait tab=\(tab, privacy: .public) since=\(seq, privacy: .public)")
+        // Replace only this tab's older wait; other busy tabs keep theirs.
+        // `cancelAll()` on `.active` is still the global reset.
         session.getAllTasks { tasks in
-            tasks.filter { $0.taskIdentifier != task.taskIdentifier }.forEach { $0.cancel() }
+            tasks
+                .filter { $0.taskIdentifier != task.taskIdentifier && $0.taskDescription == tab }
+                .forEach { $0.cancel() }
         }
+    }
+
+    /// Drops a deferred arm from `armWhenBackgrounded()` that has not fired
+    /// yet. Called first on `.active`: `cancelAll()` only cancels tasks that
+    /// already exist, so without this a late fallback (or a late `setState`
+    /// via `armIfPending()`) armed a /wait while the app was on screen.
+    func cancelPendingArm() {
+        armPending = false
+        armPendingFallback?.cancel()
+        armPendingFallback = nil
     }
 
     func cancelAll() {
@@ -321,8 +352,21 @@ extension TurnNotifier: URLSessionDownloadDelegate {
         let tab = downloadTask.taskDescription ?? ""
         Self.log.info("wait delivered t=\(frame["t"] as? String ?? "?", privacy: .public) tab=\(tab, privacy: .public)")
         switch frame["t"] as? String {
-        case "turn_done", "approval_request":
+        case "turn_done":
             notify(frame: frame, tabHint: tab)
+            markTabIdle(frame["tab"] as? String ?? tab)
+        case "approval_request":
+            notify(frame: frame, tabHint: tab)
+            /* An approval resolves the wait mid-turn. Without a re-arm the
+               rest of the turn (its `turn_done`, or a second approval the
+               daemon would otherwise auto-deny at its deadline) was never
+               notified. Start past this frame: the server matches
+               `seq >= since`, so `since = seq` would hand the same approval
+               straight back. */
+            guard !tab.isEmpty else { return }
+            let seq = (frame["seq"] as? Int) ?? (body["lastSeq"] as? Int) ?? 0
+            Self.log.info("wait re-arming after approval tab=\(tab, privacy: .public) since=\(seq + 1, privacy: .public)")
+            arm(tab: tab, since: seq + 1)
         default:
             /* The server clamps `timeout` to WAIT_MAX_S (300 s; see
                daemons/gateway/src/server.ts) regardless of the 600 s this

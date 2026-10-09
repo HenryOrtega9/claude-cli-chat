@@ -3,8 +3,11 @@
 
 Injected into the bridge's claude session via --settings hooks.Stop. Reads the
 hook payload from stdin and atomically writes it (plus a wall-clock timestamp)
-to /tmp/watch-bridge/stop_signal.json. The bridge only consumes the file's
-mtime as an end-of-turn signal, so payload schema drift is harmless.
+to /tmp/watch-bridge/stop_signal.json. The bridge treats a fresh mtime as an
+end-of-turn signal, and uses the payload's session_id plus _signal_epoch only
+to reject a Stop that belongs to another session or to an earlier turn; a
+payload missing those fields falls back to the mtime alone, so schema drift
+stays harmless.
 
 Must always exit 0: a hook failure must never affect the claude turn.
 """

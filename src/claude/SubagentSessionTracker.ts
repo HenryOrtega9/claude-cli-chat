@@ -26,7 +26,7 @@
    which tears down the watcher and tailer and releases the session-file
    claim. */
 
-import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { JsonlTailer } from "./JsonlTailer";
 import { projectDirFor } from "./RemoteControlSession";
@@ -197,11 +197,23 @@ export class SubagentSessionTracker {
       return "match";
     }
     const readSize = Math.min(size, MAX_FIRST_RECORD_READ);
+    /* Read only the head. readFileSync(...).slice() read and decoded the
+       whole (growing, possibly multi-MB) transcript on every 250ms poll, so
+       the cap bounded nothing. A UTF-8 sequence cut at the end lands in the
+       dropped partial last line below, so the byte cut is harmless. */
     let buf: string;
+    let fd: number | null = null;
     try {
-      buf = readFileSync(path, { encoding: "utf8", flag: "r" }).slice(0, readSize);
+      fd = openSync(path, "r");
+      const bytes = Buffer.alloc(readSize);
+      const bytesRead = readSync(fd, bytes, 0, readSize, 0);
+      buf = bytes.subarray(0, bytesRead).toString("utf8");
     } catch {
       return "inconclusive";
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
     }
     const lines = buf.split("\n");
     /* The matched record is taken from safeLines; when lines.length > 1 that

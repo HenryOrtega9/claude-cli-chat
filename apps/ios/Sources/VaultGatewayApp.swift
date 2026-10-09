@@ -166,6 +166,9 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
+                // First: a deferred arm that has not fired yet would
+                // otherwise arm a /wait while the app is on screen.
+                TurnNotifier.shared.cancelPendingArm()
                 armedForBackground = false
                 TurnNotifier.shared.cancelAll()
                 TurnNotifier.shared.clearDeliveredNotifications()

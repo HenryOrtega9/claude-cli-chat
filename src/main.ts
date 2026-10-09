@@ -22,6 +22,7 @@ import {
   createSubagentTracker as createSubagentTrackerImpl,
   openPathExternally as openPathExternallyImpl,
   removeSessionFiles as removeSessionFilesImpl,
+  sessionTranscriptExists as sessionTranscriptExistsImpl,
   writeSubagentFile as writeSubagentFileImpl,
 } from "./platform/node-capabilities";
 import { generateTitle as generateTitleImpl } from "./claude/TitleGenerator";
@@ -97,6 +98,11 @@ export default class ClaudeChatPlugin extends Plugin {
      cost-surface refreshes) onto a single child process. */
   private mcpServerListCache: ParsedMcpServer[] | null = null;
   private mcpServerListInflight: Promise<ParsedMcpServer[]> | null = null;
+  /* When the last `claude mcp list` failed. A non-forced caller inside the
+     cooldown gets a rejection instead of another child process, so a broken
+     CLI or MCP config does not respawn the list on every turn. Explicit
+     refreshes (force) always retry. */
+  private mcpServerListFailedAt = 0;
 
   async onload() {
     /* Install the platform abstraction FIRST — before settings, stores,
@@ -287,6 +293,7 @@ export default class ClaudeChatPlugin extends Plugin {
      verbatim with the other host — keep the two wirings identical. */
   stateEmitter = StateEmitter;
   removeSessionFiles = removeSessionFilesImpl;
+  sessionTranscriptExists = sessionTranscriptExistsImpl;
   createJsonlTailer = createJsonlTailerImpl;
   createRemoteControlSession = createRemoteControlSessionImpl;
   generateTitle = generateTitleImpl;
@@ -327,9 +334,15 @@ export default class ClaudeChatPlugin extends Plugin {
        (the MCP manager opening, which wants a fresh list) must not be handed a
        stale in-flight non-forced result, so it starts its own fetch. */
     if (!force && this.mcpServerListInflight) return this.mcpServerListInflight;
+    if (!force && Date.now() - this.mcpServerListFailedAt < 5 * 60_000) {
+      throw new Error("claude mcp list failed recently; use Refresh to retry");
+    }
     const claudePath = this.settings.claudePath || autodetectClaudePath() || "claude";
     const job = listMcpServersViaCli(claudePath)
-      .then(list => { this.mcpServerListCache = list; return list; })
+      .then(
+        list => { this.mcpServerListCache = list; this.mcpServerListFailedAt = 0; return list; },
+        err => { this.mcpServerListFailedAt = Date.now(); throw err; },
+      )
       .finally(() => { if (this.mcpServerListInflight === job) this.mcpServerListInflight = null; });
     this.mcpServerListInflight = job;
     return job;

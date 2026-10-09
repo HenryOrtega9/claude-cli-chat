@@ -138,6 +138,14 @@ function wireKeyboard(shell: DesktopChatShell): void {
     }
 
     if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+      /* With a modal, suggest popup or menu up, the tab strip behind it is out
+         of reach: Cmd+W there would delete the active conversation unseen, and
+         Cmd+T would pull focus to a composer hidden behind the backdrop. Live
+         query is fine here, since nothing tears an overlay down on Cmd+T/W. */
+      if (overlayOpen()) {
+        if (e.key === "w" || e.key === "t") e.preventDefault();
+        return;
+      }
       /* Cmd+W closes the TAB, never the window: the panel is resident and only
          the tray's Quit ends the process. */
       if (e.key === "t") {

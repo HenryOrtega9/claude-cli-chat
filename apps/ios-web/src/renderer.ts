@@ -42,7 +42,7 @@ import { RemoteFileStorage, IOS_STORE_DIR } from "../../../src/platform/remote/R
 import { RemoteHost } from "../../../src/platform/remote/RemoteHost";
 import { DEFAULT_SETTINGS, type ModelKey } from "../../../src/settings-data";
 import type { GatewayConfig } from "../../../src/platform/remote/transport";
-import { nativeTransport } from "./native";
+import { nativeTransport, notifySpeechIdle, restoreQueuedTabSwitch, takeQueuedTabSwitch, type PendingTabSwitch } from "./native";
 import { IosPlatform } from "./platform";
 import { RemoteVaultFeatures } from "./vault";
 import { IosChatShell, type ConnectivityPayload, type SharePayload } from "./shell";
@@ -73,7 +73,8 @@ function applyIosDefaultModel(host: RemoteHost): void {
 }
 
 type DispatchName =
-  | "suspend" | "resume" | "connectivity" | "theme" | "safeArea" | "share" | "hardwareKeyboard" | "healthSync";
+  | "suspend" | "resume" | "connectivity" | "theme" | "safeArea" | "share" | "hardwareKeyboard" | "healthSync"
+  | "speechIdle";
 type DispatchPayload = Record<string, unknown>;
 type Handler = (name: DispatchName, payload: DispatchPayload) => void;
 
@@ -186,22 +187,32 @@ function renderBootError(mount: HTMLElement, title: string, detail: string): voi
   mount.append(wrap);
 }
 
-/* A boot that failed because the Mac was unreachable is not permanent: the
-   daemon comes back, the tunnel comes back, and the phone should follow
-   without the user force-quitting the app. Watch both signals, native's
-   /health probe (dispatched as `connectivity`) and our own poll for the case
-   where the page is running without a native banner, then reload once the
-   gateway answers. Installed only on the failure paths, which return
-   immediately after, so it can never race the real handler. */
+/* A boot that failed because the Mac was unreachable (or rejected the token)
+   is not permanent: the daemon comes back, the tunnel comes back, the token
+   gets fixed in Settings, and the phone should follow without the user
+   force-quitting the app. Watch both signals, native's /health probe
+   (dispatched as `connectivity`) and our own poll for the case where the
+   page is running without a native banner, then reload once the gateway
+   answers. Installed only on the failure paths, which return immediately
+   after, so it can never race the real handler.
+
+   A `share` that lands here (or sits in `queued`, which installHandler
+   flushes into this handler) has already been deleted from ShareInbox on the
+   native side, and a notification tap parked in native.ts has no shell to
+   reach; reload() would wipe both. They go to sessionStorage, which survives
+   a reload of the same WKWebView, and boot() replays them once the shell
+   exists. */
 function armBootRetry(probe: () => Promise<boolean>): void {
   let reloading = false;
   const retry = async () => {
     if (reloading) return;
     if (!(await probe())) return;
     reloading = true;
+    stashTabSwitch(takeQueuedTabSwitch());
     window.location.reload();
   };
   installHandler((name, payload) => {
+    if (name === "share") stashShare(payload);
     if (name === "connectivity" && payload.state === "ok") void retry();
     if (name === "resume") void retry();
   });
@@ -209,6 +220,54 @@ function armBootRetry(probe: () => Promise<boolean>): void {
 }
 
 const BOOT_RETRY_MS = 10_000;
+
+const PENDING_SHARES_KEY = "vaultgw.pendingShares";
+const PENDING_SWITCH_KEY = "vaultgw.pendingSwitchTab";
+
+function stashShare(payload: DispatchPayload): void {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SHARES_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    const list = Array.isArray(parsed) ? parsed : [];
+    list.push(payload);
+    window.sessionStorage.setItem(PENDING_SHARES_KEY, JSON.stringify(list));
+  } catch (err) {
+    console.error("[vaultgw] could not keep a share across the boot retry", err);
+  }
+}
+
+/* Removed before it is replayed, so a replay that throws cannot loop. */
+function takeStashedShares(): DispatchPayload[] {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SHARES_KEY);
+    if (!raw) return [];
+    window.sessionStorage.removeItem(PENDING_SHARES_KEY);
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((p): p is DispatchPayload => !!p && typeof p === "object" && !Array.isArray(p));
+  } catch {
+    return [];
+  }
+}
+
+/* Latest tap wins, matching native.ts: a null take leaves an older stash. */
+function stashTabSwitch(pending: PendingTabSwitch | null): void {
+  if (!pending) return;
+  try { window.sessionStorage.setItem(PENDING_SWITCH_KEY, JSON.stringify(pending)); } catch { /* best effort */ }
+}
+
+function takeStashedTabSwitch(): PendingTabSwitch | null {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SWITCH_KEY);
+    if (!raw) return null;
+    window.sessionStorage.removeItem(PENDING_SWITCH_KEY);
+    const p = JSON.parse(raw) as { tabId?: unknown; requestId?: unknown } | null;
+    if (typeof p?.tabId !== "string" || !p.tabId) return null;
+    return { tabId: p.tabId, requestId: typeof p.requestId === "string" ? p.requestId : undefined };
+  } catch {
+    return null;
+  }
+}
 
 /* ShareInbox.swift (iOS Share Extension, via NativeBridge.dispatch("share", …))
    and DebugLaunchEnvironment's VAULTGW_AUTOSEND both send this shape. Narrows
@@ -273,6 +332,10 @@ async function boot(): Promise<void> {
         ? "Re-enter the bearer token in Settings, then reopen this screen."
         : "Set localStorage['vaultgw.dev.token'] to the contents of ~/.config/vault-gateway/token and reload.",
     );
+    /* Fixing the token in native Settings dispatches `connectivity: ok`;
+       without a handler here it only piled up in `queued` and the page
+       stayed on this error until a force-quit. */
+    armBootRetry(async () => (await conn.rpc("GET", "/health")).status === 200);
     return;
   }
   if (health.status === 0) {
@@ -310,7 +373,15 @@ async function boot(): Promise<void> {
   vaultFeatures.start();
 
   const persistence = new Persistence(null, IOS_STORE_DIR);
+  /* Before the shell exists, so its constructor's onSwitchTab picks the tap
+     up, and a newer tap queued during this boot keeps the slot. */
+  const stashedSwitch = takeStashedTabSwitch();
+  if (stashedSwitch) restoreQueuedTabSwitch(stashedSwitch);
   const shell = new IosChatShell(app as HTMLElement, host, conn, persistence, storage, transport);
+  /* Shares a failed boot kept across its retry reload (see armBootRetry).
+     handleShare buffers until mount(), and these replay ahead of anything
+     still in `queued`, so arrival order holds. */
+  for (const stashed of takeStashedShares()) shell.handleShare(parseSharePayload(stashed));
 
   installHandler((name, payload) => {
     switch (name) {
@@ -337,6 +408,12 @@ async function boot(): Promise<void> {
         return;
       case "connectivity":
         shell.setConnectivity(payload as ConnectivityPayload);
+        /* A 401 mid-session parks the socket in "unauthorized", which only
+           resume() leaves. Native reports `ok` once the token is fixed in
+           Settings; without this the socket stayed dead until the app was
+           backgrounded and foregrounded. Only "unauthorized": a socket put
+           in "suspended" by `suspend` must stay down. */
+        if (payload.state === "ok" && conn.linkState === "unauthorized") conn.resume();
         return;
       case "theme": {
         const theme = payload.theme;
@@ -368,6 +445,11 @@ async function boot(): Promise<void> {
            Only the settings sheet shows it; with the sheet closed this is a
            no-op and the next open asks for a fresh healthStatus. */
         applyHealthSyncStatus(payload);
+        return;
+      case "speechIdle":
+        /* NativeBridge.swift: the synthesizer queue drained. Clears the
+           speech controller's `speaking` flag (GatewayTransport.onSpeechIdle). */
+        notifySpeechIdle();
         return;
       default:
         return;

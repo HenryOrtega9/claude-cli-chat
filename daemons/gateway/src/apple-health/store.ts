@@ -454,9 +454,10 @@ function str(v: SqlValue | undefined): string | null {
 }
 
 /* Shared by GET /apple-health/status and `apple-health status`. The per-type
-   aggregate walks the (type, kind, start_ms) index rather than the table. */
+   aggregate walks the (type, kind, start_ms) index rather than the table.
+   The sample total is the sum of its per-type counts: a separate COUNT(*)
+   was a second full scan of the same rows. */
 export function readStatus(db: DatabaseSync, dbPath: string): HealthStatus {
-  const samples = num(db.prepare("SELECT COUNT(*) AS n FROM samples").get()?.n);
   const daily = num(db.prepare("SELECT COUNT(*) AS n FROM daily_stats").get()?.n);
   const last: Row | undefined = db.prepare("SELECT batch_id, at, samples, deleted, daily FROM ingest_log ORDER BY id DESC LIMIT 1").get();
   const types = db.prepare(
@@ -468,6 +469,7 @@ export function readStatus(db: DatabaseSync, dbPath: string): HealthStatus {
     first: r.first === null ? null : new Date(num(r.first)).toISOString(),
     last: r.last === null ? null : new Date(num(r.last)).toISOString(),
   }));
+  const samples = types.reduce((n, t) => n + t.count, 0);
   return {
     dbPath,
     samples,

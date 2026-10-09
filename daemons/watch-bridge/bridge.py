@@ -22,6 +22,10 @@ API (all routes require `Authorization: Bearer <token>`):
                  (same shape as /last). 202 {partial:true} on timeout. Used by
                  the watch app's background URLSession to fire a local
                  notification when a turn finishes after the app is closed.
+                 Preferred key: &after_seq=N&boot=<boot_id> matches the first
+                 completion with turn_seq > N (skew-proof); `since` is the
+                 fallback when boot differs (daemon restarted). Every /chat,
+                 /last and /wait payload carries turn_seq and boot_id.
   GET  /suggest?after_seq=N&timeout=<s> -> long-poll for the suggested next
                  user message generated after each completed turn. Blocks (default
                  25s, clamp 1..60) until a suggestion exists whose turn_seq > N,
@@ -92,6 +96,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------- config
@@ -108,8 +113,23 @@ BIND = os.environ.get("WATCH_BRIDGE_BIND", "")
 VAULT = os.environ.get("WATCH_BRIDGE_VAULT", "")
 REPLY_BUDGET_S = float(os.environ.get("WATCH_BRIDGE_REPLY_BUDGET_S", "90"))
 IDLE_FALLBACK_S = 15.0
+# Once the Stop hook has fired for the current child it is known to work, so
+# transcript silence after a text block almost always means the model is
+# streaming a long tool_use or thinking block (each block is written only
+# once complete), not that the turn ended. Keep the idle fallback only as a
+# last resort then.
+IDLE_FALLBACK_AFTER_STOP_S = 120.0
 JSONL_AUTO_RESET_BYTES = 4 * 1024 * 1024
+# How long /chat (and, shorter, /command, which the watch calls on an 8s
+# budget) waits out a sticky /model + /effort replay holding the turn lock.
+STICKY_REPLAY_WAIT_S = 15.0
+STICKY_REPLAY_WAIT_COMMAND_S = 4.0
 SETTLE_S = 3.0
+# Session-file discovery: how long to wait for the authoritative
+# ~/.claude/sessions/<pid>.json index before falling back to the birthtime
+# heuristic, and how long to keep checking a heuristic adoption against it.
+INDEX_GRACE_S = 30.0
+INDEX_VERIFY_S = 600.0
 
 SUGGEST_ENABLED = os.environ.get("WATCH_BRIDGE_SUGGEST", "1") != "0"
 SUGGEST_MODEL = "claude-haiku-5-5"
@@ -140,6 +160,11 @@ BYPASS_PROMPT_RE = re.compile(r"Bypass\s*Permissions\s*mode", re.I)
 # option 1. The cached-history warning is the shared, reliable marker.
 SWITCH_PROMPT_RE = re.compile(r"history\s*gets?\s*re-?read", re.I)
 SWITCH_ACCEPT_RE = re.compile(r"1\.\s*Yes", re.I)
+# How long after spawn the trust/bypass matchers stay armed (they also disarm
+# at the first send), and how long a /model or /effort send arms the switch
+# matcher. Outside these windows no PTY text can trigger an auto-answer.
+STARTUP_DIALOG_WINDOW_S = 30.0
+SWITCH_ARM_S = 30.0
 
 
 def log(msg):
@@ -150,6 +175,33 @@ def strip_ansi(s):
     for r in ANSI_RES:
         s = r.sub("", s)
     return s.replace("\r", "")
+
+
+def _write_all(fd, data, deadline_s=5.0):
+    """Write every byte of `data` to the non-blocking PTY master. The macOS
+    PTY input queue takes at most ~1 KB per write even while the child is
+    reading, so a single os.write silently truncates a long paste (and drops
+    its closing bracketed-paste marker). Loop from the unwritten offset,
+    waiting for writability between short writes; OSError on deadline."""
+    view = memoryview(data)
+    off = 0
+    deadline = time.time() + deadline_s
+    while off < len(view):
+        try:
+            n = os.write(fd, view[off:])
+            if n > 0:
+                off += n
+                continue
+        except BlockingIOError:
+            pass
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise OSError(f"pty write timed out ({off}/{len(view)} bytes written)")
+        try:
+            select.select([], [fd], [], min(0.5, remaining))
+        except ValueError as e:
+            raise OSError(f"pty write failed: {e}")
+    return off
 
 
 def enriched_path():
@@ -238,6 +290,39 @@ def session_index_for(pid):
     return data if data.get("pid") == pid else None
 
 
+def _has_conversation(path, head_bytes=262144):
+    """True if the JSONL's head holds a real user/assistant record. A
+    --print side pass with --no-session-persistence still writes a file with
+    only an ai-title record (wire-format gotcha #7), which must never be
+    adopted as the bridge's transcript."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(head_bytes).decode("utf-8", "replace")
+    except OSError:
+        return False
+    for line in head.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("type") in ("user", "assistant"):
+            return True
+    return False
+
+
+def _iso_epoch(value):
+    """Epoch seconds for a transcript ISO 8601 timestamp, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def project_dir_for(cwd):
     slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
     return f"{HOME}/.claude/projects/{slug}"
@@ -278,6 +363,11 @@ class ClaudeSession:
         self._trust_confirmed = False
         self._bypass_confirmed = False
         self._switch_accept_epoch = 0.0  # debounce model-switch dialog redraws
+        # The switch-dialog matcher only runs inside a window opened by a
+        # /model or /effort send (see arm_switch_dialog), so rendered reply
+        # text that happens to quote the dialog can never type "1"+CR.
+        self._switch_armed_until = 0.0
+        self._switch_arm_next_send = False
         self._gen = 0  # respawn generation, lets stale reader threads exit
 
     def spawn(self):
@@ -290,6 +380,8 @@ class ClaudeSession:
             self.first_send_epoch = None
             self._trust_confirmed = False
             self._bypass_confirmed = False
+            self._switch_armed_until = 0.0
+            self._switch_arm_next_send = False
             self.spawn_epoch = time.time()
 
             settings = json.dumps({
@@ -399,6 +491,14 @@ class ClaudeSession:
         self.stdout_tail += strip_ansi(chunk)
         if len(self.stdout_tail) > 98304:
             self.stdout_tail = self.stdout_tail[-65536:]
+        # Both startup dialogs render before the TUI accepts input, so disarm
+        # their matchers once the first message is sent or the startup window
+        # has passed. Both are usually accepted persistently and never show,
+        # and an always-armed matcher would fire on rendered reply text that
+        # merely quotes them (e.g. a vault note about this bridge).
+        if time.time() - self.spawn_epoch > STARTUP_DIALOG_WINDOW_S:
+            self._bypass_confirmed = True
+            self._trust_confirmed = True
         if not self._bypass_confirmed and BYPASS_PROMPT_RE.search(self.stdout_tail):
             # the dialog defaults to "1. No, exit"; select "2. Yes, I accept"
             self._bypass_confirmed = True
@@ -411,10 +511,12 @@ class ClaudeSession:
                 pass
         # The dialog clears as soon as we answer, but the screen redraws a few
         # times while it's up; debounce so we send a single "1" per dialog.
-        if (SWITCH_PROMPT_RE.search(self.stdout_tail[-1500:])
+        if (time.time() < self._switch_armed_until
+                and SWITCH_PROMPT_RE.search(self.stdout_tail[-1500:])
                 and SWITCH_ACCEPT_RE.search(self.stdout_tail[-1500:])
                 and time.time() - self._switch_accept_epoch > 3):
             self._switch_accept_epoch = time.time()
+            self._switch_armed_until = 0.0  # one acceptance per arming
             log("auto-accepting model-switch confirmation")
             try:
                 os.write(fd, b"1")
@@ -472,6 +574,15 @@ class ClaudeSession:
                 # rather than falling through to the heuristic.
                 time.sleep(0.5)
                 continue
+            # The pid index can take several seconds to appear after spawn
+            # (10s on the 2026-10-07 boot). Guessing during that window
+            # adopted whatever JSONL was born in the slug meanwhile (a plugin
+            # chat, a --print side pass's ai-title file), and an adoption is
+            # final, so hold off the heuristic until the index has had a fair
+            # chance to show up.
+            if time.time() - self.spawn_epoch < INDEX_GRACE_S:
+                time.sleep(0.5)
+                continue
             floor = (
                 self.first_send_epoch - 0.5
                 if self.first_send_epoch is not None
@@ -492,15 +603,46 @@ class ClaudeSession:
                     if birth < floor:
                         continue
                     if best is None or birth > best[1]:
+                        if not _has_conversation(full):
+                            continue  # ai-title/summary-only side-pass file
                         best = (full, birth)
                 if best:
                     if not self.session_id:
                         log("session file via mtime fallback (no banner id)")
                     self._adopt(best[0])
+                    self._verify_heuristic_adoption(gen, proj)
                     return
             except OSError:
                 pass
             time.sleep(0.5)
+
+    def _verify_heuristic_adoption(self, gen, proj):
+        """A birthtime guess is only a guess: keep watching the authoritative
+        pid index (slow cadence, bounded) and switch to its session file if
+        it names a different one. The tailer resets itself when
+        session_file changes."""
+        deadline = time.time() + INDEX_VERIFY_S
+        while gen == self._gen and time.time() < deadline:
+            time.sleep(2.0)
+            pid = self.pid
+            if pid <= 0:
+                continue
+            idx = session_index_for(pid)
+            sid = idx.get("sessionId") if idx else None
+            if not sid:
+                continue
+            candidate = os.path.join(proj, f"{sid}.jsonl")
+            if candidate == self.session_file:
+                return  # the guess was right
+            if not os.path.exists(candidate):
+                continue
+            if gen != self._gen:
+                return
+            log(f"session index names {sid}; replacing heuristic adoption "
+                f"{self.session_file}")
+            self.session_id = sid
+            self._adopt(candidate)
+            return
 
     def _adopt(self, path):
         self.session_file = path
@@ -529,6 +671,15 @@ class ClaudeSession:
             raise RuntimeError("session not ready")
         if self.first_send_epoch is None:
             self.first_send_epoch = time.time()
+        # Startup dialogs are over once input is accepted (see _handle_output).
+        self._bypass_confirmed = True
+        self._trust_confirmed = True
+        # A model/effort switch's confirmation can show on the next message
+        # rather than on the command itself, so keep the matcher armed
+        # through the first plain message after a switch.
+        if self._switch_arm_next_send and not text.startswith("/"):
+            self._switch_arm_next_send = False
+            self._switch_armed_until = max(self._switch_armed_until, time.time() + SWITCH_ARM_S)
         # Snapshot fd+generation together under the lock (respawn() swaps
         # self.fd under this same lock). Re-check the generation before the
         # submit CR so a respawn during the 0.2s settle can't land the CR in a
@@ -540,12 +691,28 @@ class ClaudeSession:
         # replay) can interleave its own paste between this paste and this
         # CR, and the single CR then submits the concatenation as one turn.
         with self.write_lock:
-            os.write(fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
+            try:
+                _write_all(fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
+            except OSError:
+                # Never leave the composer stuck in paste mode: the next
+                # submit CR (or the next /chat) would land inside it.
+                try:
+                    _write_all(fd, b"\x1b[201~", deadline_s=1.0)
+                except OSError:
+                    pass
+                raise
             time.sleep(0.2)
             with self.lock:
                 if self._gen != gen:
                     return  # respawned mid-send; don't submit into the new child
-            os.write(fd, b"\r")
+            _write_all(fd, b"\r")
+
+    def arm_switch_dialog(self):
+        """Call right before sending /model or /effort (live or sticky
+        replay): opens the window in which the switch-confirmation dialog may
+        be auto-accepted, and keeps it open for the next plain message."""
+        self._switch_armed_until = time.time() + SWITCH_ARM_S
+        self._switch_arm_next_send = True
 
     def nudge_submit(self, expected_gen=None):
         """Extra CR a moment after a send: a TUI mid-redraw can eat the
@@ -562,14 +729,13 @@ class ClaudeSession:
             return
         with self.write_lock:
             try:
-                os.write(fd, b"\r")
+                _write_all(fd, b"\r")
             except OSError:
                 pass
 
     def respawn(self):
         with self.lock:
             pid = self.pid
-            old_fd = self.fd  # capture so cleanup doesn't race the stale reader
             if self.alive and pid > 0:
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -585,14 +751,12 @@ class ClaudeSession:
                 pass
             time.sleep(0.2)
         self.spawn()
-        # Defense-in-depth: free the old child's fd + reap it even if its reader
-        # thread is wedged. spawn() returns a fresh fd (different int), so guard
-        # against double-closing the new fd before touching the old one.
-        if old_fd >= 0 and old_fd != self.fd:
-            try:
-                os.close(old_fd)
-            except OSError:
-                pass
+        # The old fd is NOT closed here: its reader thread is the sole owner
+        # and always closes it within ~1s of the gen bump (select timeout,
+        # gen check, unconditional close). A second close from here could hit
+        # a descriptor number the kernel already recycled for an HTTP socket,
+        # a tailer open() or a subprocess pipe. Reaping is idempotent, so it
+        # stays as a belt-and-braces step.
         if pid > 0:
             try:
                 os.waitpid(pid, os.WNOHANG)
@@ -619,7 +783,10 @@ class TranscriptTailer:
         self.offset = 0
         self.partial = ""
         self.seen_uuids = set()
-        self.records = []  # (index, kind, text) kind: "assistant_text"|"other"
+        # (index, kind, text, ts) kind: "assistant_text"|"other"; ts is the
+        # record's own creation time (its "timestamp" field), falling back
+        # to ingestion time.
+        self.records = []
         self.last_activity = 0.0
 
     def _loop(self):
@@ -688,7 +855,17 @@ class TranscriptTailer:
                 ]
                 if parts:
                     kind, text = "assistant_text", "\n".join(parts)
-        self.records.append((len(self.records), kind, text))
+        elif rec.get("type") == "user" and not rec.get("isMeta"):
+            # A typed prompt (string content or text blocks), as opposed to
+            # a synthetic tool_result carrier. Anchors Stop-signal matching.
+            content = (rec.get("message") or {}).get("content")
+            if isinstance(content, str) or (
+                isinstance(content, list)
+                and not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+            ):
+                kind = "user_prompt"
+        ts = _iso_epoch(rec.get("timestamp")) or time.time()
+        self.records.append((len(self.records), kind, text, ts))
 
     def mark(self):
         with self.lock:
@@ -696,14 +873,14 @@ class TranscriptTailer:
 
     def assistant_since(self, mark):
         with self.lock:
-            return any(k == "assistant_text" for (_, k, _) in self.records[mark:])
+            return any(r[1] == "assistant_text" for r in self.records[mark:])
 
     def reply_since(self, mark):
         """Text of the LAST assistant text message after the mark (skips
         tool-call wrapper messages and thinking, which never produce text
         blocks here)."""
         with self.lock:
-            texts = [t for (i, k, t) in self.records[mark:] if k == "assistant_text"]
+            texts = [r[2] for r in self.records[mark:] if r[1] == "assistant_text"]
         return texts[-1] if texts else None
 
     def caught_up(self):
@@ -719,13 +896,28 @@ class TranscriptTailer:
         except OSError:
             return True
 
-    def idle_complete(self, mark):
+    def turn_anchor_ts(self, mark):
+        """Creation time of this turn's first user prompt record after the
+        mark (falling back to the first record of any kind), or None if
+        nothing has landed yet. A previous turn that ran on past an early
+        completion can still write tool records after the mark, so the
+        prompt record is the better marker of where this turn began."""
+        with self.lock:
+            tail = self.records[mark:]
+            if not tail:
+                return None
+            for r in tail:
+                if r[1] == "user_prompt":
+                    return r[3]
+            return tail[0][3]
+
+    def idle_complete(self, mark, idle_s=IDLE_FALLBACK_S):
         with self.lock:
             if not self.records[mark:]:
                 return False
             silent = time.time() - self.last_activity
             last_kind = self.records[-1][1]
-        return silent >= IDLE_FALLBACK_S and last_kind == "assistant_text"
+        return silent >= idle_s and last_kind == "assistant_text"
 
 
 # ---------------------------------------------------------------- suggestions
@@ -865,6 +1057,10 @@ class TurnManager:
         self.last_session_id = None
         self.last_completed_at = 0.0  # bridge clock, deprecated GET /wait fallback
         self.turn_seq = 0  # monotonic completion counter; the reliable GET /wait key
+        # Child generation in which a valid Stop signal was last observed;
+        # selects the idle-fallback threshold (see IDLE_FALLBACK_AFTER_STOP_S).
+        self._stop_seen_gen = None
+        self.sticky = None  # StickyCommands, wired up in main()
         # Suggested next user message for the most recent good reply:
         # {"turn_seq": int, "suggestion": str|None}. Generated off-turn by a
         # Haiku side pass, so it lags the reply by a second or two and may
@@ -878,13 +1074,20 @@ class TurnManager:
         """Returns (status_code, payload). 409 if a turn is in flight; 202 with
         a partial if the budget expires (the turn keeps running and lands in
         last_reply for GET /last)."""
-        if not self.busy.acquire(blocking=False):
+        if not self.acquire_busy(STICKY_REPLAY_WAIT_S):
             return 409, {"error": "turn_in_flight"}
         try:
             if not self.session.ready():
                 self.busy.release()
                 return 503, {"error": "session_not_ready"}
             self._maybe_auto_reset()
+            # A fresh child (auto-reset just now, or /reset / watchdog before
+            # the sticky loop got to it) must have the picked model/effort
+            # applied BEFORE this message is pasted, never typed into a
+            # TUI that is already mid-turn.
+            if self.sticky is not None:
+                self.sticky.ensure_replayed()
+            base_seq = self.turn_seq
             self._drop_suggestion()
             try:
                 os.remove(SIGNAL_PATH)
@@ -913,7 +1116,14 @@ class TurnManager:
                     nudged = False
                     aborted_reason = None
                     while True:
-                        if self._stop_signaled(start) or self.tailer.idle_complete(mark):
+                        if self._stop_signaled(start, mark):
+                            self._stop_seen_gen = turn_gen
+                            break
+                        idle_s = (IDLE_FALLBACK_AFTER_STOP_S
+                                  if self._stop_seen_gen == turn_gen
+                                  else IDLE_FALLBACK_S)
+                        if self.tailer.idle_complete(mark, idle_s):
+                            log(f"turn: completed by {int(idle_s)}s idle fallback (no Stop signal)")
                             break
                         if not self.session.alive:
                             aborted_reason = "session_dead"
@@ -985,6 +1195,10 @@ class TurnManager:
                 "session_id": self.session.session_id,
                 "elapsed_ms": int((time.time() - start) * 1000),
                 "partial": True,
+                # The counter BEFORE this turn: GET /wait?after_seq=<this>
+                # matches exactly this turn's completion, whatever the
+                # watch/Mac clock skew.
+                "turn_seq": base_seq,
             }
         except Exception:
             try:
@@ -992,6 +1206,17 @@ class TurnManager:
             except RuntimeError:
                 pass
             raise
+
+    def acquire_busy(self, wait_s):
+        """Non-blocking busy acquire, except that a sticky replay in progress
+        (which holds busy for a few seconds after a respawn) is waited out
+        for up to wait_s instead of being reported as a turn in flight."""
+        if self.busy.acquire(blocking=False):
+            return True
+        sticky = self.sticky
+        if sticky is not None and sticky.replaying:
+            return self.busy.acquire(timeout=wait_s)
+        return False
 
     # ---- suggestions
 
@@ -1043,11 +1268,34 @@ class TurnManager:
             return snap.get("suggestion")
         return None
 
-    def _stop_signaled(self, turn_start):
+    def _stop_signaled(self, turn_start, mark):
+        """True only for a Stop that belongs to THIS turn. A fresh mtime is
+        not enough: when a turn ended early (idle fallback), its real Stop
+        fires after the next turn has started and would end that turn at
+        once with the wrong reply. A stale or foreign signal is ignored, not
+        deleted, so a matching one can still replace it."""
         try:
-            return os.stat(SIGNAL_PATH).st_mtime >= turn_start
+            if os.stat(SIGNAL_PATH).st_mtime < turn_start:
+                return False
+            with open(SIGNAL_PATH) as f:
+                sig = json.load(f)
         except OSError:
             return False
+        except ValueError:
+            return True  # unreadable payload: fall back to the mtime alone
+        if not isinstance(sig, dict):
+            return True
+        sid = sig.get("session_id")
+        current = self.session.session_id
+        if isinstance(sid, str) and sid and current and sid != current:
+            return False  # another session's (e.g. the previous child's) Stop
+        anchor = self.tailer.turn_anchor_ts(mark)
+        if anchor is None:
+            return False  # nothing of this turn has landed yet
+        epoch = sig.get("_signal_epoch")
+        if isinstance(epoch, (int, float)) and epoch < anchor:
+            return False  # fired before this turn's prompt was recorded
+        return True
 
     def _maybe_auto_reset(self):
         """Between turns only: respawn if the transcript has grown too large."""
@@ -1063,7 +1311,7 @@ class TurnManager:
             pass
 
     def reset(self):
-        if not self.busy.acquire(blocking=False):
+        if not self.acquire_busy(STICKY_REPLAY_WAIT_COMMAND_S):
             return 409, {"error": "turn_in_flight"}
         try:
             self.session.respawn()
@@ -1462,6 +1710,9 @@ def _https_context():
     return ssl.create_default_context()
 
 
+REFRESH_USER_AGENT = "watch-bridge/1.0 (+claude-cli-chat)"
+
+
 class UsageFetcher:
     """Proxies Anthropic's OAuth usage endpoint for the watch, reusing the
     ClaudeUsageBar credentials file (and keeping it fresh for both apps, since
@@ -1509,7 +1760,7 @@ class UsageFetcher:
                     self._last_error = payload
                     self._last_error_at = time.time()
                     if self._cached is not None:
-                        return 200, dict(self._cached, stale=True)
+                        return 200, self._stale_locked()
                 return code, payload
 
     def _fresh_hit_locked(self):
@@ -1519,9 +1770,15 @@ class UsageFetcher:
             return 200, self._cached
         if self._last_error is not None and time.time() - self._last_error_at < self.FAIL_CACHE_S:
             if self._cached is not None:
-                return 200, dict(self._cached, stale=True)
+                return 200, self._stale_locked()
             return 503, self._last_error
         return None
+
+    def _stale_locked(self):
+        """Called with self.lock held: the last good reading, flagged stale
+        and stamped with when it was actually fetched (epoch seconds), so a
+        client can show its real age instead of treating it as fresh."""
+        return dict(self._cached, stale=True, cached_at=int(self._cached_at))
 
     def _do_fetch(self):
         creds = self._load_creds()
@@ -1597,13 +1854,29 @@ class UsageFetcher:
         req = urllib.request.Request(
             self.TOKEN_URL,
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            # The Cloudflare edge in front of the token endpoint rejects
+            # urllib's default "Python-urllib/x.y" User-Agent with a 403
+            # (error code 1010) before the OAuth server ever sees the body.
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": REFRESH_USER_AGENT,
+            },
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=15, context=self._ctx) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
         except (OSError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+            if isinstance(e, urllib.error.HTTPError):
+                # Keep the start of the body: it tells an edge block
+                # ("error code: 1010") apart from a real OAuth error.
+                try:
+                    detail = e.read(200).decode("utf-8", "replace")
+                except OSError:
+                    detail = ""
+                if detail:
+                    e = f"{e} {detail!r}"
             if quiet:
                 now = time.time()
                 if now - self._last_refresh_fail_log > 3600:
@@ -1733,13 +2006,21 @@ class SettingsGuard:
 
 class StickyCommands:
     """Last /model and /effort sent, replayed into each fresh claude child so
-    the watch's picker choice survives respawns (auto-reset, watchdog, /reset)."""
+    the watch's picker choice survives respawns (auto-reset, watchdog, /reset).
 
-    def __init__(self, session, guard):
+    Replay always runs with turns.busy held, so no /chat or /command can paste
+    into the composer between a sticky command and its submit, and
+    TurnManager.run_turn replays synchronously (ensure_replayed) before its
+    own paste, so the first turn after a respawn runs on the picked model."""
+
+    def __init__(self, session, guard, busy):
         self.session = session
         self.guard = guard
+        self.busy = busy  # TurnManager.busy
         self.lock = threading.Lock()
+        self.replay_lock = threading.Lock()
         self.commands = {}  # "/model" -> full command string
+        self.replaying = False
         self._replayed_gen = session._gen
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -1747,32 +2028,59 @@ class StickyCommands:
         with self.lock:
             self.commands[command.split()[0]] = command
 
+    def ensure_replayed(self):
+        """Caller must hold turns.busy. Replays into the current child if it
+        has not been replayed yet; a no-op otherwise."""
+        if self.session.ready():
+            self._replay(self.session.current_gen())
+
     def _loop(self):
         while True:
             time.sleep(1)
-            gen = self.session._gen
+            gen = self.session.current_gen()
             if gen == self._replayed_gen or not self.session.ready():
                 continue
-            self._replayed_gen = gen
+            # Busy means a turn or command owns the composer; that path
+            # replays itself before pasting, or we retry next tick.
+            if not self.busy.acquire(blocking=False):
+                continue
+            try:
+                self.replaying = True
+                self._replay(gen)
+            finally:
+                self.replaying = False
+                self.busy.release()
+
+    def _replay(self, gen):
+        with self.replay_lock:
+            if gen == self._replayed_gen:
+                return
             with self.lock:
                 pending = list(self.commands.values())
-            if not pending:
-                continue
-            # The TUI right after ready() is the riskiest redraw window; give
-            # it a moment, and confirm each command's submit CR before typing
-            # the next one so two commands can never concatenate in the
-            # composer ("/model sonnet[1m]/effort high").
-            time.sleep(2.0)
-            for cmd in pending:
-                self.guard.guard()
-                try:
-                    self.session.send(cmd)
-                    log(f"replayed sticky command: {cmd}")
-                    time.sleep(0.8)
-                    self.session.nudge_submit(gen)
-                    time.sleep(1.5)
-                except (OSError, RuntimeError) as e:
-                    log(f"sticky replay failed for {cmd}: {e}")
+            try:
+                if not pending:
+                    return
+                # The TUI right after ready() is the riskiest redraw window;
+                # give it a moment, and confirm each command's submit CR
+                # before typing the next one so two commands can never
+                # concatenate in the composer ("/model sonnet[1m]/effort high").
+                time.sleep(2.0)
+                for cmd in pending:
+                    if self.session.current_gen() != gen:
+                        return  # respawned again; the new child gets its own replay
+                    self.guard.guard()
+                    try:
+                        self.session.arm_switch_dialog()
+                        self.session.send(cmd)
+                        log(f"replayed sticky command: {cmd}")
+                        time.sleep(0.8)
+                        self.session.nudge_submit(gen)
+                        time.sleep(1.5)
+                    except (OSError, RuntimeError) as e:
+                        log(f"sticky replay failed for {cmd}: {e}")
+            finally:
+                if self.session.current_gen() == gen:
+                    self._replayed_gen = gen
 
 
 SESSION_MESSAGES_RE = re.compile(r"^/sessions/([A-Za-z0-9._-]+)/messages(?:\?(.*))?$")
@@ -1780,6 +2088,9 @@ SESSION_SEND_RE = re.compile(r"^/sessions/([A-Za-z0-9._-]+)/send$")
 
 
 def make_handler(token, session, turns, sticky, guard, directory, usage, started_at):
+    # Identifies this daemon process; turn_seq is only comparable within one.
+    boot_id = str(int(started_at * 1000))
+
     class Handler(BaseHTTPRequestHandler):
         # Keep-alive: every response sets an accurate Content-Length (see
         # _send below, the sole response path), so HTTP/1.1 is safe here and
@@ -1825,6 +2136,7 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
             the chip without a second round trip to /suggest."""
             payload = dict(turns.last_reply)
             payload["suggestion"] = turns.suggestion_for(payload.get("turn_seq"))
+            payload["boot_id"] = boot_id
             return payload
 
         def do_GET(self):
@@ -1869,6 +2181,11 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                         after_seq = int(qs["after_seq"])
                     except ValueError:
                         after_seq = None
+                # turn_seq restarts at 0 with the daemon, so a counter the
+                # watch saw under a different boot_id is meaningless here:
+                # fall back to `since` for it.
+                if qs.get("boot") and qs["boot"] != boot_id:
+                    after_seq = None
                 try:
                     hold = max(1.0, min(float(qs.get("timeout", "600")), 1500.0))
                 except ValueError:
@@ -1893,7 +2210,13 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                             return  # client disconnected; free the thread quietly
                     except OSError:
                         return
-                return self._send(202, {"reply": None, "partial": True, "error": "wait_timeout"})
+                return self._send(202, {
+                    "reply": None,
+                    "partial": True,
+                    "error": "wait_timeout",
+                    "turn_seq": turns.turn_seq,
+                    "boot_id": boot_id,
+                })
             if self.path == "/suggest" or self.path.startswith("/suggest?"):
                 qs = self._query()
                 try:
@@ -1958,7 +2281,15 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     return self._send(400, {"error": "bad_json"})
                 if not isinstance(message, str) or not message.strip():
                     return self._send(400, {"error": "empty_message"})
-                return self._send(*turns.run_turn(message.strip(), REPLY_BUDGET_S))
+                code, payload = turns.run_turn(message.strip(), REPLY_BUDGET_S)
+                # Every /chat answer carries the completion counter (the
+                # turn's own on 200, the pre-turn value on 202, the current
+                # one otherwise) plus this daemon's boot id, so the watch can
+                # long-poll /wait by after_seq instead of a skew-prone clock.
+                payload = dict(payload)
+                payload.setdefault("turn_seq", turns.turn_seq)
+                payload["boot_id"] = boot_id
+                return self._send(code, payload)
             if self.path == "/command":
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -1978,12 +2309,14 @@ def make_handler(token, session, turns, sticky, guard, directory, usage, started
                     return self._send(400, {"error": "command_not_allowed"})
                 # A real non-blocking acquire (not a TOCTOU .locked() peek) so
                 # a concurrent POST /chat can't slip in between the check and
-                # the send and interleave its paste into this composer.
-                if not turns.busy.acquire(blocking=False):
+                # the send and interleave its paste into this composer. Only a
+                # sticky replay in progress is briefly waited out.
+                if not turns.acquire_busy(STICKY_REPLAY_WAIT_COMMAND_S):
                     return self._send(409, {"error": "turn_in_flight"})
                 try:
                     guard.guard()
                     try:
+                        session.arm_switch_dialog()
                         session.send(command)
                     except (OSError, RuntimeError) as e:
                         return self._send(503, {"error": f"send_failed: {e}"})
@@ -2061,7 +2394,8 @@ def main():
     tailer = TranscriptTailer(session)
     turns = TurnManager(session, tailer)
     guard = SettingsGuard()
-    sticky = StickyCommands(session, guard)
+    sticky = StickyCommands(session, guard, turns.busy)
+    turns.sticky = sticky
     directory = SessionDirectory(session, turns)
     usage = UsageFetcher()
     threading.Thread(target=watchdog, args=(session, turns), daemon=True).start()

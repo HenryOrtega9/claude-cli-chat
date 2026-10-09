@@ -17,7 +17,7 @@
    inside one line. */
 
 import { createReadStream } from "node:fs";
-import { mkdir, open, rm, stat, type FileHandle } from "node:fs/promises";
+import { mkdir, open, readFile, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createInterface } from "node:readline";
 import type { Frame } from "./frames";
@@ -41,8 +41,16 @@ export class ReplayRing {
      turn. Null whenever nothing has been written yet, or right after a
      rotation/reset/destroy. */
   private handle: FileHandle | null = null;
+  /* `<id>.seq` beside the ndjson: the last seq a closed tab reached, written
+     by destroy() so a reopen resumes the counter instead of restarting at 0
+     (see recoverTail()). Removed by the first append after that, once the
+     ndjson itself carries the seq again. */
+  private readonly seqPath: string;
+  private seqSidecarLive = false;
 
-  constructor(private readonly filePath: string) {}
+  constructor(private readonly filePath: string) {
+    this.seqPath = `${filePath.replace(/\.ndjson$/, "")}.seq`;
+  }
 
   /* Restores what a fresh `new ReplayRing()` can't know about a file that
      already existed before this process started: the byte count (so the 64
@@ -54,8 +62,32 @@ export class ReplayRing {
      colliding with frames already sitting under those same seq numbers.
      Only ever meaningful before the first push() of this process's
      lifetime; call it once, right after construction, for a restored or
-     reopened tab. */
+     reopened tab.
+
+     A tab closed through destroy() has no ndjson left, only its `.seq`
+     sidecar. Its seq resumes from there, and the floor moves just above it:
+     a device still holding an older cursor gets `evicted` and resyncs instead
+     of being handed the new frames as if nothing were missing. */
   async recoverTail(): Promise<number> {
+    let sidecarSeq = 0;
+    try {
+      const n = Number((await readFile(this.seqPath, "utf8")).trim());
+      if (Number.isSafeInteger(n) && n > 0) {
+        sidecarSeq = n;
+        this.seqSidecarLive = true;
+      }
+    } catch {
+      /* No sidecar: the tab was never closed. */
+    }
+    const fileSeq = await this.recoverFileTail();
+    if (sidecarSeq > fileSeq) {
+      this.floor = sidecarSeq + 1;
+      return sidecarSeq;
+    }
+    return fileSeq;
+  }
+
+  private async recoverFileTail(): Promise<number> {
     let size: number;
     try {
       size = (await stat(this.filePath)).size;
@@ -88,25 +120,42 @@ export class ReplayRing {
     this.ring.push(frame);
     if (this.ring.length > RING_MAX) this.ring.splice(0, this.ring.length - RING_MAX);
     const line = `${JSON.stringify(frame)}\n`;
-    this.bytes += Buffer.byteLength(line);
-    const shouldRotate = this.bytes > FILE_MAX_BYTES;
+    const len = Buffer.byteLength(line);
+    /* Rotation is decided here, synchronously, never inside the queued step:
+       resetting `bytes` only once the step ran made every frame pushed before
+       it (a whole stdout chunk) rotate again, deleting the file several
+       times. The floor describes the FILE only (the ring branch of since() is
+       checked first), and after rotation the file starts at this frame. A
+       floor taken from the ring's oldest frame pointed below the file's
+       start, so a cursor in that gap read the file and silently skipped the
+       frames between. */
+    let rotate = false;
+    if (this.bytes + len > FILE_MAX_BYTES) {
+      rotate = true;
+      this.bytes = len;
+      this.floor = frame.seq;
+    } else {
+      this.bytes += len;
+    }
     this.writeChain = this.writeChain
       .then(async () => {
         if (!this.dirReady) {
           await mkdir(dirname(this.filePath), { recursive: true });
           this.dirReady = true;
         }
-        if (shouldRotate) {
+        if (rotate) {
           /* Drop the file entirely rather than rewriting a tail: the
              in-memory ring still covers the recent past, and anything older
              is what `resync` exists for. */
           await this.closeHandle();
           await rm(this.filePath, { force: true });
-          this.bytes = Buffer.byteLength(line);
-          this.floor = this.ring[0]?.seq ?? frame.seq;
         }
         if (!this.handle) this.handle = await open(this.filePath, "a");
         await this.handle.appendFile(line, "utf8");
+        if (this.seqSidecarLive) {
+          this.seqSidecarLive = false;
+          await rm(this.seqPath, { force: true }).catch(() => undefined);
+        }
       })
       .catch(err => {
         console.error(`[vault-gateway] replay spill failed for ${this.filePath}:`, err);
@@ -181,10 +230,22 @@ export class ReplayRing {
     await rm(this.filePath, { force: true }).catch(() => undefined);
   }
 
-  async destroy(): Promise<void> {
+  /* `lastSeq` (a closed tab that can be reopened) is kept in the `.seq`
+     sidecar so the reopened tab's seq stays monotonic for devices that still
+     hold a cursor. Omitted for a tab that can never come back (incognito). */
+  async destroy(lastSeq?: number): Promise<void> {
     await this.writeChain;
     await this.closeHandle();
     this.ring = [];
     await rm(this.filePath, { force: true }).catch(() => undefined);
+    if (lastSeq !== undefined && lastSeq > 0) {
+      this.seqSidecarLive = false;
+      try {
+        await mkdir(dirname(this.seqPath), { recursive: true });
+        await writeFile(this.seqPath, `${lastSeq}\n`, "utf8");
+      } catch (err) {
+        console.error(`[vault-gateway] seq sidecar write failed for ${this.seqPath}:`, err);
+      }
+    }
   }
 }

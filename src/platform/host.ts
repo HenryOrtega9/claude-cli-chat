@@ -158,6 +158,12 @@ export interface PluginHost {
      (a remote engine cleans up its own disk). */
   removeSessionFiles?(cwd: string, sessionIds: string[]): Promise<void>;
 
+  /* Whether `<projectDir>/<id>.jsonl` exists, so `--resume <id>` has a
+     transcript to load (it may have been pruned by cleanupPeriodDays or
+     written on another Mac). Absent => trusted: a remote engine (the iOS
+     gateway) runs its own canResume check. */
+  sessionTranscriptExists?(cwd: string, sessionId: string): boolean;
+
   /* Remote Control mode: tails the session JSONL the interactive CLI writes.
      Absent => Remote Control surfaces no conversation events. */
   createJsonlTailer?(path: string): JsonlTailerHandle;

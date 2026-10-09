@@ -19,7 +19,7 @@ import { Persistence } from "../../../src/storage/Persistence";
 import type { TabState } from "../../../src/view/state";
 
 import { DEFAULT_PERMISSION_MODE, TabEngine, type EngineDeps } from "./engine";
-import type { Frame } from "./frames";
+import { makeFrame, type Frame } from "./frames";
 
 export class NoCapacityError extends Error {
   constructor() {
@@ -167,6 +167,11 @@ export class TabRegistry {
     await engine.destroy();
     await this.saveIndex();
     this.deps.onStateChange();
+    /* Tell every other connected device the tab is gone now, rather than
+       only on its next subscribe: a device that stays connected would keep
+       its cursor and, after a reopen, drop the tab's frames as stale. Same
+       frame handleSubscribe sends; seq 0 and never pushed into a ring. */
+    this.deps.emit(makeFrame("resync", id, 0, { reason: "gone" }));
     return true;
   }
 
@@ -197,6 +202,12 @@ export class TabRegistry {
     await this.saveIndex();
     this.deps.onStateChange();
     return engine;
+  }
+
+  /* The MCP deny list changed: every live child is on the old argv. Each
+     engine drops its child now if idle, otherwise on its next turn. */
+  requestRespawnAll(): void {
+    for (const engine of this.list()) engine.requestRespawn();
   }
 
   liveChildren(): number {

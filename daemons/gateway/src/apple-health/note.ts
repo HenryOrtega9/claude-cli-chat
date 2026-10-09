@@ -164,6 +164,9 @@ export type NoteWriterOptions = {
   vault: string;
   dbPath: string;
   db: () => DatabaseSync;
+  /* Renders the note off the main thread (see offload.ts). Absent, the note
+     renders inline against db(). */
+  render?: () => Promise<string>;
   log: (msg: string) => void;
   intervalMs?: number;
 };
@@ -193,7 +196,9 @@ export class HealthNoteWriter {
     this.lastRunAt = Date.now();
     this.running = (async () => {
       try {
-        const content = renderHealthNote(this.opts.db(), { dbPath: this.opts.dbPath });
+        const content = this.opts.render
+          ? await this.opts.render()
+          : renderHealthNote(this.opts.db(), { dbPath: this.opts.dbPath });
         const target = await writeNoteAtomic(this.opts.vault, content);
         this.opts.log(`apple-health note written: ${target}`);
       } catch (err) {

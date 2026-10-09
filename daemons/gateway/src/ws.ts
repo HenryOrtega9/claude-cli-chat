@@ -51,10 +51,19 @@ const MAX_QUEUED_BYTES = 4 * 1024 * 1024;
    it on every ping/pong/frame in either direction and never gets close. */
 const IDLE_TIMEOUT_MS = 90_000;
 
+/* How long close() lets the close frame and our FIN drain before destroying
+   the socket outright. A peer that is gone (radio off, app killed) never
+   acknowledges either, and an upgraded socket that is merely end()ed stays
+   open in Node, which also keeps http.Server.close() from ever resolving. */
+const CLOSE_GRACE_MS = 1_000;
+
 export type WsConnection = {
   readonly id: number;
   send(text: string): void;
   close(code?: number, reason?: string): void;
+  /* Hard stop: tear down and destroy the socket without waiting on the peer.
+     Shutdown uses it so no upgraded socket can hold http.Server.close(). */
+  destroy(): void;
   onMessage(cb: (text: string) => void): void;
   onClose(cb: () => void): void;
   readonly closed: boolean;
@@ -127,10 +136,14 @@ export function acceptUpgrade(req: IncomingMessage, socket: Duplex, head?: Buffe
      an upgraded socket. `setTimeout`'s callback becomes a 'timeout' listener,
      so it can fire more than once if the peer stays idle past a first grace
      period that didn't get cleaned up for some other reason -- conn.close()
-     is idempotent (checks `this.closed`), so that's harmless. */
+     is idempotent (checks `this.closed`), so that's harmless. close() returns
+     early on a connection that is already torn down (a peer FIN with no WS
+     close frame, say), so destroy() follows unconditionally: an idle socket
+     must always be reaped, never left in CLOSE_WAIT. */
   (socket as Duplex & { setTimeout?: (ms: number, cb: () => void) => void }).setTimeout?.(IDLE_TIMEOUT_MS, () => {
     traceWs(conn.id, `idle timeout after ${IDLE_TIMEOUT_MS}ms with no activity; closing`);
     conn.close(1008, "idle_timeout");
+    conn.destroy();
   });
   return conn;
 }
@@ -169,7 +182,16 @@ class Connection implements WsConnection {
     socket.on("data", chunk => this.onInboundData(chunk));
     socket.on("error", err => { traceWs(this.id, `socket error: ${String(err)}`); this.teardown(); });
     socket.on("close", () => { traceWs(this.id, "socket close"); this.teardown(); });
-    socket.on("end", () => { traceWs(this.id, "socket end"); this.teardown(); });
+    /* http.Server sockets are allowHalfOpen, so Node does NOT close our side
+       when the peer sends a FIN without a WS close frame (app killed,
+       WebContent torn down). Only teardown() here left the fd in CLOSE_WAIT
+       forever, and kept http.Server.close() pending at shutdown. end() our
+       half too, which completes the close. */
+    socket.on("end", () => {
+      traceWs(this.id, "socket end");
+      this.teardown();
+      try { this.socket.end(); } catch { /* already gone */ }
+    });
     /* See acceptUpgrade's comment on `head`. Deferred to a microtask: the
        caller (server.ts's handleUpgrade) is fully synchronous and calls
        `conn.onMessage(...)` immediately after `acceptUpgrade()` returns with
@@ -253,6 +275,14 @@ class Connection implements WsConnection {
     } catch { /* peer already gone */ }
     this.teardown();
     try { this.socket.end(); } catch { /* ignore */ }
+    /* end() only queues our FIN behind the close frame; a peer that is gone
+       never drains either, and the socket would stay open. */
+    setTimeout(() => { try { this.socket.destroy(); } catch { /* already gone */ } }, CLOSE_GRACE_MS).unref();
+  }
+
+  destroy(): void {
+    this.teardown();
+    try { this.socket.destroy(); } catch { /* already gone */ }
   }
 
   private teardown(): void {

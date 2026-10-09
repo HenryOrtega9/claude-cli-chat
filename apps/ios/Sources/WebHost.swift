@@ -102,6 +102,17 @@ struct WebHost: UIViewRepresentable {
         weak var bridge: NativeBridge?
         var onPageLoad: () -> Void = {}
 
+        /// Any navigation, including the page's own `location.reload()` from
+        /// renderer.ts's boot retry, replaces the document. From commit on
+        /// the old `window.__vaultgw` is gone and the new one does not exist
+        /// until the module script runs, so dispatches must queue until the
+        /// `didFinish` below flushes them. Commit, not
+        /// `didStartProvisionalNavigation`: a provisional load that fails
+        /// leaves the old page live and would strand `pageReady` at false.
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            bridge?.markPageNotReady()
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Before onPageLoad: it dispatches `connectivity` (and the DEBUG
             // autosend hook dispatches `share`), both of which must land on a

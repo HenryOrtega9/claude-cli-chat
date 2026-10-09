@@ -19,7 +19,9 @@
    Streaming still narrates incrementally: `updateStream` speaks each completed
    sentence as it lands, tracking a per-message offset so an interrupted reply
    never re-narrates what was already spoken — the same monotonic-offset rule
-   the real controller documents. */
+   the real controller documents. Fenced code follows the real controller's
+   rule too: a fence opens only at a true line start, an unterminated fence
+   holds narration until its close arrives, and the block is never read. */
 
 import type { ClaudeChatSettings } from "../../settings-data";
 import type { GatewayTransport } from "./transport";
@@ -51,13 +53,20 @@ export class RemoteSpeechController {
   private readonly spokenTo = new Map<string, number>();
   private speaking = false;
 
+  private readonly unsubIdle: (() => void) | null;
+
   constructor(
     private readonly transport: GatewayTransport,
     private readonly settings: () => ClaudeChatSettings,
-  ) {}
+  ) {
+    /* Optional: a transport that can tell when the synthesizer drained clears
+       `speaking`, so the "Claude is speaking" bars stop with the audio. */
+    this.unsubIdle = transport.onSpeechIdle?.(() => this.markIdle()) ?? null;
+  }
 
   destroy(): void {
     this.stop();
+    this.unsubIdle?.();
     this.listeners.clear();
   }
 
@@ -80,29 +89,71 @@ export class RemoteSpeechController {
   }
 
   updateStream(_channel: string, messageId: string, fullText: string): void {
-    const offset = this.spokenTo.get(messageId) ?? 0;
-    if (fullText.length <= offset) return;
-    const pending = fullText.slice(offset);
-    /* Only speak up to the last sentence boundary; a half sentence read aloud
-       and then continued reads as a stutter. */
-    const boundary = Math.max(
-      pending.lastIndexOf(". "),
-      pending.lastIndexOf("! "),
-      pending.lastIndexOf("? "),
-      pending.lastIndexOf("\n"),
-    );
-    if (boundary < 0) return;
-    const chunk = pending.slice(0, boundary + 1);
-    this.spokenTo.set(messageId, offset + chunk.length);
-    this.emit(chunk);
+    this.drain(messageId, fullText, false);
   }
 
   finalizeStream(_channel: string, messageId: string, fullText: string): void {
-    const offset = this.spokenTo.get(messageId) ?? 0;
-    if (fullText.length > offset) {
-      this.spokenTo.set(messageId, fullText.length);
-      this.emit(fullText.slice(offset));
+    this.drain(messageId, fullText, true);
+  }
+
+  /* Speak everything complete past the message's offset. Streaming chunks
+     split a fence pair, so a per-chunk strip never sees both fences and the
+     code gets read aloud; this walks fences across chunks instead, as
+     SpeechController.nextChunk does on the desktop. */
+  private drain(messageId: string, fullText: string, final: boolean): void {
+    let offset = this.spokenTo.get(messageId) ?? 0;
+    const parts: string[] = [];
+    while (offset < fullText.length) {
+      const rest = fullText.slice(offset);
+      /* A fence only opens at a true line start; a chunk that begins mid-line
+         with ``` is prose that mentions backticks. */
+      const atLineStart = offset === 0 || fullText[offset - 1] === "\n";
+      const open = atLineStart ? rest.match(/^(`{3,}|~{3,})/) : null;
+      if (open) {
+        const marker = open[1];
+        /* Close: a line of at least as many of the same character. Mid-stream
+           it must be newline-terminated, since a bare ``` at the buffer's
+           edge could still grow into an info string. */
+        const closePattern = final
+          ? `\\n${marker[0]}{${marker.length},}[ \\t]*(\\n|$)`
+          : `\\n${marker[0]}{${marker.length},}[ \\t]*\\n`;
+        const cm = rest.slice(marker.length).match(new RegExp(closePattern));
+        if (!cm || cm.index === undefined) {
+          /* Wait for the close; a stream that ended mid-fence drops it. */
+          if (final) offset = fullText.length;
+          break;
+        }
+        offset += marker.length + cm.index + cm[0].length;
+        parts.push(" code block ");
+        continue;
+      }
+      /* Prose runs up to the next line-start fence candidate. The newline
+         before the fence stays with the prose, leaving the next pass at a
+         true line start. */
+      const nextFence = rest.match(/\n(`{3,}|~{3,})/);
+      const proseEnd = nextFence && nextFence.index !== undefined ? nextFence.index + 1 : rest.length;
+      const prose = rest.slice(0, proseEnd);
+      if (nextFence || final) {
+        offset += proseEnd;
+        parts.push(prose);
+        continue;
+      }
+      /* Only speak up to the last sentence boundary; a half sentence read
+         aloud and then continued reads as a stutter. */
+      const boundary = Math.max(
+        prose.lastIndexOf(". "),
+        prose.lastIndexOf("! "),
+        prose.lastIndexOf("? "),
+        prose.lastIndexOf("\n"),
+      );
+      if (boundary >= 0) {
+        offset += boundary + 1;
+        parts.push(prose.slice(0, boundary + 1));
+      }
+      break;
     }
+    this.spokenTo.set(messageId, offset);
+    if (parts.length > 0) this.emit(parts.join(""));
   }
 
   forgetChannel(_channel: string): void {
@@ -118,6 +169,14 @@ export class RemoteSpeechController {
     if (!this.speaking) return;
     this.speaking = false;
     try { this.transport.stopSpeaking(); } catch { /* bridge unavailable */ }
+    this.notify();
+  }
+
+  /* The synthesizer drained on its own. Unlike stop(), nothing to silence:
+     only the indicator state is stale. */
+  markIdle(): void {
+    if (!this.speaking) return;
+    this.speaking = false;
     this.notify();
   }
 
