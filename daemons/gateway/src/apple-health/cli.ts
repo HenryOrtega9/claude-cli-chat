@@ -14,7 +14,7 @@ import { addDays, daySpan, isIsoDate, localToday } from "./dates";
 import {
   dailyCells, DAILY_COLUMNS, dailyMetrics, lastCompletedWeek, mdTable, plainCsv, weekBounds, weeklyCsv,
 } from "./derive";
-import { openDatabase, type DatabaseSync, type Row, type SqlValue } from "./sqlite";
+import { jsonableRow, openDatabase, readQueryProblem, type DatabaseSync, type Row, type SqlValue } from "./sqlite";
 import { readStatus } from "./store";
 
 const USAGE = `apple-health: read-only queries over the Apple Health store
@@ -98,11 +98,7 @@ function cell(v: SqlValue | undefined): string {
   return String(v);
 }
 
-function jsonable(row: Row): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(row)) out[k] = typeof v === "bigint" ? Number(v) : v instanceof Uint8Array ? `<${v.length} bytes>` : v;
-  return out;
-}
+const jsonable = jsonableRow;
 
 function printRows(columns: string[], rows: Row[], format: "csv" | "json" | "md"): string {
   if (format === "json") return `${JSON.stringify(rows.map(jsonable), null, 2)}\n`;
@@ -127,13 +123,10 @@ function resolveType(db: DatabaseSync, wanted: string): string {
   throw new CliError(`"${wanted}" is ambiguous: ${(bySuffix.length ? bySuffix : partial).join(", ")}`);
 }
 
-/* Strip leading comments and whitespace, then demand SELECT or WITH, and a
-   single statement (prepare() would silently ignore anything after the first). */
+/* SELECT or WITH only, one statement (see readQueryProblem). */
 function checkReadQuery(sql: string): void {
-  const body = sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, "");
-  if (!/^(select|with)\b/i.test(body)) throw new CliError("sql: only SELECT and WITH queries are allowed");
-  const unquoted = body.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"/g, "''");
-  if (/;\s*\S/.test(unquoted.replace(/--[^\n]*/g, ""))) throw new CliError("sql: one statement at a time");
+  const problem = readQueryProblem(sql);
+  if (problem) throw new CliError(`sql: ${problem}`);
 }
 
 function run(argv: string[]): string {

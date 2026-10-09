@@ -195,16 +195,41 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-/* The calendar day a cycle belongs to, YYYY-MM-DD in the gateway's timezone.
-   A cycle starts when the main sleep does, so a start from noon on counts as
-   the next day: bed at 23:10 Thursday opens Friday's cycle, and bed at 00:40
-   Friday does too. The plain start date would label the first Thursday and
-   could give two cycles the same day. */
-export function cycleDay(start: string): string | null {
-  const ms = Date.parse(start);
+/* WHOOP's timezone_offset ("-07:00", "+0530", "Z") in ms east of UTC, or
+   null when absent or unreadable. */
+function offsetMs(offset: string | null | undefined): number | null {
+  if (!offset) return null;
+  if (offset === "Z") return 0;
+  const m = /^([+-])(\d{2}):?(\d{2})$/.exec(offset);
+  if (!m) return null;
+  const ms = (Number(m[2]) * 60 + Number(m[3])) * 60_000;
+  return m[1] === "-" ? -ms : ms;
+}
+
+/* The local calendar date (YYYY-MM-DD) of an instant, shifted by `shiftMs`:
+   in the record's own timezone_offset when it has one (a night logged while
+   travelling keeps its local date), else in the gateway's timezone. */
+export function localDay(instant: string, timezoneOffset?: string | null, shiftMs = 0): string | null {
+  const ms = Date.parse(instant);
   if (!Number.isFinite(ms)) return null;
-  const d = new Date(ms + 12 * MS_PER_HOUR);
+  const offset = offsetMs(timezoneOffset);
+  if (offset !== null) {
+    const d = new Date(ms + shiftMs + offset);
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  }
+  const d = new Date(ms + shiftMs);
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/* The calendar day a cycle belongs to, YYYY-MM-DD in the cycle's own
+   timezone_offset (the gateway's timezone when it has none). A cycle starts
+   when the main sleep does, so a start from noon on counts as the next day:
+   bed at 23:10 Thursday opens Friday's cycle, and bed at 00:40 Friday does
+   too. The plain start date would label the first Thursday and could give
+   two cycles the same day. This is the one day rule: the watch's `week`, the
+   history store and the `whoop` CLI all go through it. */
+export function cycleDay(start: string, timezoneOffset?: string | null): string | null {
+  return localDay(start, timezoneOffset, 12 * MS_PER_HOUR);
 }
 
 /* A cycle's strain as the watch shows it (1 dp), only once WHOOP scored it. */
@@ -236,7 +261,7 @@ function buildWeek(r: WhoopRaw): WeekDay[] {
   const recoveryByCycle = new Map((r.recoveries ?? []).map(x => [x.cycle_id, x]));
   const week: WeekDay[] = [];
   for (const c of (r.cycles ?? []).slice(0, WEEK_DAYS).reverse()) {
-    const day = cycleDay(c.start);
+    const day = cycleDay(c.start, c.timezone_offset);
     if (day === null) continue;
     const rec = recoveryByCycle.get(c.id);
     const score = recordState(rec) === "scored" ? round(rec?.score?.recovery_score) : null;

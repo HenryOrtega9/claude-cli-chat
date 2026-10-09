@@ -1,7 +1,9 @@
 /* The slice of the WHOOP v2 REST API the gateway reads.
 
-   Collections answer `{ records, next_token }`; only the newest page is ever
-   needed here. A cycle with no recovery or sleep yet answers 404, which
+   Collections answer `{ records, next_token }`, newest first. The poller only
+   reads the newest page; the history backfill (backfill.ts) walks every page
+   through collectionPage, passing each next_token back as ?nextToken= until
+   WHOOP stops sending one. A cycle with no recovery or sleep yet answers 404, which
    becomes null ("missing"), not an error. A 401 asks the caller for a fresh
    token exactly once per request; a 429 waits out X-RateLimit-Reset (seconds
    until the window resets) when that is short, and otherwise surfaces as a
@@ -15,6 +17,7 @@ export type WhoopCycle = {
   id: number;
   start: string;
   end?: string | null;
+  timezone_offset?: string;
   updated_at?: string;
   score_state?: ScoreState;
   score?: { strain?: number; kilojoule?: number; average_heart_rate?: number; max_heart_rate?: number };
@@ -40,6 +43,7 @@ export type WhoopSleep = {
   cycle_id?: number;
   start: string;
   end: string;
+  timezone_offset?: string;
   nap?: boolean;
   updated_at?: string;
   score_state?: ScoreState;
@@ -69,15 +73,53 @@ export type WhoopWorkout = {
   id: string;
   start: string;
   end: string;
+  timezone_offset?: string;
   sport_name?: string;
   updated_at?: string;
   score_state?: ScoreState;
-  score?: { strain?: number; kilojoule?: number; average_heart_rate?: number; max_heart_rate?: number };
+  score?: {
+    strain?: number;
+    kilojoule?: number;
+    average_heart_rate?: number;
+    max_heart_rate?: number;
+    distance_meter?: number;
+    altitude_gain_meter?: number;
+    zone_durations?: {
+      zone_zero_milli?: number;
+      zone_one_milli?: number;
+      zone_two_milli?: number;
+      zone_three_milli?: number;
+      zone_four_milli?: number;
+      zone_five_milli?: number;
+    };
+  };
 };
 
 export type WhoopProfile = { user_id?: number; email?: string; first_name?: string; last_name?: string };
 
 type Page<T> = { records?: T[]; next_token?: string | null };
+
+/* The four collections the history store mirrors, by their v2 path. */
+export const COLLECTION_PATHS = {
+  cycle: "/developer/v2/cycle",
+  recovery: "/developer/v2/recovery",
+  sleep: "/developer/v2/activity/sleep",
+  workout: "/developer/v2/activity/workout",
+} as const;
+
+export type WhoopCollection = keyof typeof COLLECTION_PATHS;
+
+export type CollectionRecord = {
+  cycle: WhoopCycle;
+  recovery: WhoopRecovery;
+  sleep: WhoopSleep;
+  workout: WhoopWorkout;
+};
+
+export type CollectionPage<C extends WhoopCollection> = { records: CollectionRecord[C][]; next_token: string | null };
+
+/* WHOOP's largest page. */
+export const MAX_PAGE_LIMIT = 25;
 
 export class WhoopApiError extends Error {
   constructor(message: string, readonly status: number, readonly retryAfterMs: number | null = null) {
@@ -134,6 +176,24 @@ export class WhoopApi {
   async latestWorkouts(limit = 10): Promise<WhoopWorkout[]> {
     const page = await this.get<Page<WhoopWorkout>>(`/developer/v2/activity/workout?limit=${limit}`, false);
     return page?.records ?? [];
+  }
+
+  /* Newest first, sleeps and naps alike. */
+  async latestSleeps(limit = 10): Promise<WhoopSleep[]> {
+    const page = await this.get<Page<WhoopSleep>>(`/developer/v2/activity/sleep?limit=${limit}`, false);
+    return page?.records ?? [];
+  }
+
+  /* One page of a collection, newest first. `nextToken` null is the first
+     (newest) page; the answer's next_token is null on the last one (WHOOP
+     omits it or sends ""). */
+  async collectionPage<C extends WhoopCollection>(collection: C, nextToken: string | null, limit = MAX_PAGE_LIMIT): Promise<CollectionPage<C>> {
+    const query = new URLSearchParams({ limit: String(Math.min(Math.max(1, limit), MAX_PAGE_LIMIT)) });
+    if (nextToken) query.set("nextToken", nextToken);
+    const page = await this.get<Page<CollectionRecord[C]>>(`${COLLECTION_PATHS[collection]}?${query.toString()}`, false);
+    const records = Array.isArray(page?.records) ? page.records : [];
+    const next = typeof page?.next_token === "string" && page.next_token !== "" ? page.next_token : null;
+    return { records, next_token: next };
   }
 
   async profile(): Promise<WhoopProfile> {

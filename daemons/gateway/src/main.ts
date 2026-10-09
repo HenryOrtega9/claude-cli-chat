@@ -97,7 +97,7 @@ async function main(): Promise<void> {
   const mirror = new StateMirror(config.stateMirrorPath);
   /* Constructed now (it loads its cache, so /whoop/summary answers from the
      first request) but started only once the gateway is ready. */
-  const whoop = new WhoopService({ credentialsPath: config.whoopCredentials, cachePath: config.whoopCache, log });
+  const whoop = new WhoopService({ credentialsPath: config.whoopCredentials, cachePath: config.whoopCache, historyPath: config.whoopDb, log });
 
   let ready = false;
   let server: GatewayServer;

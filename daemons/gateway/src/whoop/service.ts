@@ -26,18 +26,30 @@
      5xx are transient and back off.
    Every tick compares the credentials file's identity (one stat), so
    re-running whoop-auth takes effect without a restart; while auth is
-   "error" every tick re-reads the file, so a transient read failure heals. */
+   "error" every tick re-reads the file, so a transient read failure heals.
+
+   History (when `historyPath` is set; see store.ts): every successful poll
+   also upserts what it fetched into the SQLite store, and a write that
+   fails is logged (once per distinct error) and never fails the poll. The
+   per-cycle sleep endpoint only answers the main sleep, so once an hour
+   (`sleepTopUpMs`) the newest sleep page (limit 10) is fetched in the
+   background as well, which is how naps and rescored nights reach the store:
+   about 24 extra requests a day. After a good poll the backfill
+   (backfill.ts) starts in the background whenever the store's history is not
+   complete yet. */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 
 import { WhoopApi, WhoopApiError } from "./api";
+import { WhoopBackfill, type BackfillRequest } from "./backfill";
 import {
   CredentialsError, credentialsSignature, hasTokens, loadCredentials, loadCredentialsSync, saveCredentials,
   withCredentialsLock, type WhoopCredentials,
 } from "./credentials";
 import { applyTokens, refreshTokens, TokenError, whoopApiBase, whoopOAuthBase } from "./oauth";
+import { WhoopStore, type WhoopStoreStatus } from "./store";
 import {
   advanceStrainSeries, buildSummary, needsFallback, summaryLine, type AuthState, type StrainSeries, type WhoopRaw, type WhoopSummary,
 } from "./summary";
@@ -51,6 +63,11 @@ export type WhoopTiming = {
   maxBackoffMs: number;
   refreshMarginMs: number;
   maxRateWaitMs: number;
+  /* History backfill: pause between pages, first retry after an error. */
+  backfillPageMs: number;
+  backfillRetryMs: number;
+  /* How often the newest sleep page is fetched for the history store. */
+  sleepTopUpMs: number;
 };
 
 export const DEFAULT_TIMING: WhoopTiming = {
@@ -61,6 +78,9 @@ export const DEFAULT_TIMING: WhoopTiming = {
   maxBackoffMs: 60 * 60_000,
   refreshMarginMs: 5 * 60_000,
   maxRateWaitMs: 60_000,
+  backfillPageMs: 2_000,
+  backfillRetryMs: 5 * 60_000,
+  sleepTopUpMs: 60 * 60_000,
 };
 
 const MORNING_START_HOUR = 5;
@@ -69,6 +89,8 @@ const MORNING_END_HOUR = 11;
 export type WhoopServiceOptions = {
   credentialsPath: string;
   cachePath: string;
+  /* The WHOOP history SQLite file; absent, the service keeps no history. */
+  historyPath?: string | null;
   log: (msg: string) => void;
   apiBase?: string;
   oauthBase?: string;
@@ -109,6 +131,10 @@ export function readWhoopCache(path: string): { raw: WhoopRaw; fetchedAt: number
   if (parsed.schema !== 1 || !validRaw(parsed.raw) || !Number.isFinite(fetchedAt)) return null;
   return { raw: parsed.raw, fetchedAt, series: validSeries(parsed.strain_series) };
 }
+
+export type BackfillAnswer =
+  | { status: 200; body: { backfill: BackfillRequest; running: boolean; history: WhoopStoreStatus } }
+  | { status: 409 | 500 | 503; body: { error: string; auth?: AuthState; message?: string } };
 
 export type PollDelayInput = {
   auth: AuthState;
@@ -155,6 +181,12 @@ export class WhoopService {
   private loggedOk = false;
   private started = false;
   private stopped = false;
+  private store: WhoopStore | null = null;
+  /* The last history write error logged, so a persistent one logs once. */
+  private historyError: string | null = null;
+  private readonly backfill: WhoopBackfill;
+  private lastSleepTopUp = 0;
+  private toppingUp = false;
 
   constructor(private readonly opts: WhoopServiceOptions) {
     this.timing = { ...DEFAULT_TIMING, ...opts.timing };
@@ -174,6 +206,14 @@ export class WhoopService {
     } catch (err) {
       this.setCredentialsError(err);
     }
+    this.backfill = new WhoopBackfill({
+      store: () => this.history(),
+      api: () => this.api(),
+      canRun: () => this.auth === "ok" && !this.stopped,
+      onAuthFailure: err => { this.authFailure(err); },
+      log: opts.log,
+      timing: { pageDelayMs: this.timing.backfillPageMs, retryMs: this.timing.backfillRetryMs, maxBackoffMs: this.timing.maxBackoffMs },
+    });
   }
 
   start(): void {
@@ -191,7 +231,10 @@ export class WhoopService {
     this.stopped = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     this.nextPollAt = null;
-    return Promise.allSettled([this.refreshing]).then(() => undefined);
+    return Promise.allSettled([this.refreshing, this.backfill.stop()]).then(() => {
+      this.store?.close();
+      this.store = null;
+    });
   }
 
   summary(): WhoopSummary {
@@ -202,6 +245,20 @@ export class WhoopService {
       nextPollAt: this.nextPollAt,
       lastError: this.lastError,
     }, this.series);
+  }
+
+  /* POST /whoop/backfill: forget the backfill markers and page through the
+     whole history again (a pass already running restarts). Records stay;
+     the new pass upserts over them. */
+  requestBackfill(): BackfillAnswer {
+    if (!this.opts.historyPath) return { status: 503, body: { error: "whoop_history_disabled" } };
+    if (this.auth !== "ok") return { status: 409, body: { error: "whoop_not_connected", auth: this.auth } };
+    try {
+      const backfill = this.backfill.start(true);
+      return { status: 200, body: { backfill, running: this.backfill.active, history: this.history().status() } };
+    } catch (err) {
+      return { status: 500, body: { error: "whoop_history_error", message: err instanceof Error ? err.message : String(err) } };
+    }
   }
 
   /* Poll now, joining one already in flight, then reschedule. Never rejects;
@@ -411,33 +468,99 @@ export class WhoopService {
         this.loggedOk = true;
         this.opts.log(`whoop poll ok: ${summaryLine(this.summary())}`);
       }
+      this.recordHistory(raw);
+      this.afterGoodPoll();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.lastPollOk = false;
       this.lastError = message;
-      if (err instanceof TokenError && err.kind === "reauth") {
-        this.auth = "reauth_required";
-        this.opts.log(`whoop: re-auth required (${message}); run whoop-auth`);
-        return;
-      }
-      if (err instanceof CredentialsError) {
-        this.auth = "error";
-        this.opts.log(`whoop: credentials error: ${message}`);
-        return;
-      }
+      if (this.authFailure(err)) return;
       this.failures++;
       this.retryAfterMs = err instanceof WhoopApiError ? err.retryAfterMs : null;
       this.opts.log(`whoop poll failed (${this.failures} in a row): ${message}`);
     }
   }
 
-  private async fetchRaw(): Promise<WhoopRaw> {
-    const api = new WhoopApi({
+  /* A refused refresh or a credentials error, from a poll or the backfill:
+     sets the auth state and returns true; anything else returns false. */
+  private authFailure(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof TokenError && err.kind === "reauth") {
+      if (this.auth !== "reauth_required") this.opts.log(`whoop: re-auth required (${message}); run whoop-auth`);
+      this.auth = "reauth_required";
+      return true;
+    }
+    if (err instanceof CredentialsError) {
+      this.auth = "error";
+      this.opts.log(`whoop: credentials error: ${message}`);
+      return true;
+    }
+    return false;
+  }
+
+  private api(): WhoopApi {
+    return new WhoopApi({
       base: this.apiBase,
       token: () => this.accessToken(),
       refresh: rejected => this.refreshAfter401(rejected),
       maxRateWaitMs: this.timing.maxRateWaitMs,
     });
+  }
+
+  /* ---------- history ---------- */
+
+  /* Opened on first use: a problem with node:sqlite or the directory costs
+     only the history, and the poller carries on. A failed open is retried on
+     the next use. */
+  private history(): WhoopStore {
+    const path = this.opts.historyPath;
+    if (!path) throw new Error("whoop history is not configured");
+    if (!this.store) {
+      this.store = new WhoopStore(path);
+      this.opts.log(`whoop history store opened: ${path}`);
+    }
+    return this.store;
+  }
+
+  private historyFailed(what: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message !== this.historyError) this.opts.log(`whoop history ${what} failed (polling continues): ${message}`);
+    this.historyError = message;
+  }
+
+  /* Never throws: the poll it follows has already succeeded. */
+  private recordHistory(raw: WhoopRaw): void {
+    if (!this.opts.historyPath) return;
+    try {
+      this.history().writePoll(raw);
+      if (this.historyError !== null) this.opts.log("whoop history writes recovered");
+      this.historyError = null;
+    } catch (err) {
+      this.historyFailed("write", err);
+    }
+  }
+
+  /* Background work a good poll unlocks: the backfill while the history is
+     incomplete, else the hourly sleep top-up. Neither is awaited. */
+  private afterGoodPoll(): void {
+    if (!this.opts.historyPath || this.stopped) return;
+    try {
+      this.backfill.start();
+    } catch (err) {
+      this.historyFailed("backfill start", err);
+      return;
+    }
+    if (this.backfill.active || this.toppingUp || Date.now() - this.lastSleepTopUp < this.timing.sleepTopUpMs) return;
+    this.lastSleepTopUp = Date.now();
+    this.toppingUp = true;
+    void this.api().latestSleeps(10)
+      .then(sleeps => { this.history().write({ sleeps }); })
+      .catch(err => { if (!this.authFailure(err)) this.historyFailed("sleep top-up", err); })
+      .finally(() => { this.toppingUp = false; });
+  }
+
+  private async fetchRaw(): Promise<WhoopRaw> {
+    const api = this.api();
     const cycles = await api.latestCycles(8);
     const [cycle = null, previousCycle = null] = cycles;
     const [recovery, sleep, workouts, recoveries] = await Promise.all([

@@ -36,6 +36,9 @@ export type GatewayConfig = {
   healthDb: string;
   whoopCredentials: string;
   whoopCache: string;
+  /* Optional so a config built by hand (the tests) may leave it out: the
+     daemon then keeps no WHOOP history. */
+  whoopDb?: string;
   whoopReadTokenFile: string;
 };
 
@@ -63,6 +66,7 @@ export function loadConfig(): GatewayConfig {
     healthDb: healthDbPath(),
     whoopCredentials: whoopCredentialsPath(),
     whoopCache: whoopCachePath(),
+    whoopDb: whoopDbPath(),
     whoopReadTokenFile: expandHome(process.env.VAULT_GATEWAY_WHOOP_READ_TOKEN_FILE || `${HOME}/.config/vault-gateway/whoop-read-token`),
   };
 }
@@ -99,9 +103,18 @@ export function whoopCachePath(env: NodeJS.ProcessEnv = process.env): string {
   return expandHome(env.VAULT_GATEWAY_WHOOP_CACHE || `${HOME}/Library/Application Support/vault-gateway/whoop-cache.json`);
 }
 
-/* Where `whoop-auth` reaches the running daemon: the same bind the daemon
-   resolves, but one non-blocking attempt (a CLI must not sit through
-   resolveBind's 60 s retry loop), falling back to loopback. */
+/* The WHOOP history store (every cycle, recovery, sleep and workout the
+   daemon has fetched), shared by the daemon and the read-only `whoop` CLI.
+   Next to the Apple Health store and for the same reason: raw health data,
+   never in the vault. Like that store, its directory is created on first
+   open, so a bad path costs only the history and the daemon still boots. */
+export function whoopDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  return expandHome(env.VAULT_GATEWAY_WHOOP_DB || `${HOME}/Library/Application Support/vault-gateway/whoop.sqlite`);
+}
+
+/* Where `whoop-auth` and `whoop backfill` reach the running daemon: the same
+   bind the daemon resolves, but one non-blocking attempt (a CLI must not sit
+   through resolveBind's 60 s retry loop), falling back to loopback. */
 export function localGatewayUrl(env: NodeJS.ProcessEnv = process.env): string {
   const rawPort = Number.parseInt(env.VAULT_GATEWAY_PORT ?? "", 10);
   const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 8788;

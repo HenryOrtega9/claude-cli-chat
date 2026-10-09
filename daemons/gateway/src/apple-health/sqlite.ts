@@ -1,4 +1,4 @@
-/* node:sqlite loader for the Apple Health store and CLI.
+/* node:sqlite loader for the Apple Health and WHOOP stores and their CLIs.
 
    Two reasons this is a module of its own rather than a top-level import:
 
@@ -58,4 +58,24 @@ function loadSqlite(): SqliteModule {
 export function openDatabase(path: string, options: { readOnly?: boolean } = {}): DatabaseSync {
   const { DatabaseSync } = loadSqlite();
   return new DatabaseSync(path, options);
+}
+
+/* The `sql` subcommand's guard, shared by both CLIs: strip leading comments
+   and whitespace, then demand SELECT or WITH, and a single statement
+   (prepare() would silently ignore anything after the first). Returns the
+   reason a query is refused, or null. The read-only connection is the real
+   guarantee; this only fails early with a clear message. */
+export function readQueryProblem(sql: string): string | null {
+  const body = sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, "");
+  if (!/^(select|with)\b/i.test(body)) return "only SELECT and WITH queries are allowed";
+  const unquoted = body.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"/g, "''");
+  if (/;\s*\S/.test(unquoted.replace(/--[^\n]*/g, ""))) return "one statement at a time";
+  return null;
+}
+
+/* A row as JSON can carry it: bigints as numbers, blobs as a size note. */
+export function jsonableRow(row: Row): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row)) out[k] = typeof v === "bigint" ? Number(v) : v instanceof Uint8Array ? `<${v.length} bytes>` : v;
+  return out;
 }

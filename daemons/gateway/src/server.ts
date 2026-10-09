@@ -259,6 +259,13 @@ export class GatewayServer {
       if (!this.deps.whoop) return sendJson(res, 503, { error: "whoop_unavailable" });
       return sendJson(res, 200, await this.deps.whoop.pollNow());
     }
+    /* (Re)start the history backfill (`whoop backfill`). Main token only:
+       it spends WHOOP request budget. 409 while not connected. */
+    if (method === "POST" && path === "/whoop/backfill") {
+      if (!this.deps.whoop) return sendJson(res, 503, { error: "whoop_unavailable" });
+      const answer = this.deps.whoop.requestBackfill();
+      return sendJson(res, answer.status, answer.body);
+    }
 
     /* --- permissions --- */
     if (method === "GET" && path === "/permissions") {
